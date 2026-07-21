@@ -1,0 +1,31 @@
+# AI assistant config
+CLAUDE.md
+AGENTS.md
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# environment
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# internal docs — not published
+docs/
