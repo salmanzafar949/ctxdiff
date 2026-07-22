@@ -1,4 +1,5 @@
 import time
+import pytest
 from ctxdiff import trace
 from ctxdiff.store.ctrace import CTrace
 
@@ -70,6 +71,49 @@ def test_tag_overrides_label_on_next_call(tmp_path):
     ct = CTrace.open(str(tmp_path / "r.ctrace"))
     blocks = ct.get_call_blocks(ct.get_calls()[0].id)
     assert blocks[0].label == "rag" and blocks[0].label_source == "tagged"
+    ct.close()
+
+
+class BoomError(Exception):
+    """A distinctive host-side exception, distinguishable from any exception
+    ctxdiff itself might raise, so the test can prove it is the host's own
+    error being re-raised unchanged (not swallowed or replaced)."""
+
+
+class _BoomingCompletions:
+    """Stand-in for client.chat.completions whose create() always raises
+    BoomError, simulating the underlying LLM call itself failing."""
+    def create(self, **kwargs):
+        raise BoomError("the host's own LLM error")
+
+
+class _BoomingChat:
+    def __init__(self): self.completions = _BoomingCompletions()
+
+
+class _BoomingOpenAI:
+    """Duck-typed OpenAI client whose completion call always fails."""
+    __module__ = "openai"
+    def __init__(self): self.chat = _BoomingChat()
+
+
+def test_wrap_reraises_host_error_and_records_it(tmp_path):
+    """On a host-side LLM error, the interceptor must (1) re-raise the host's
+    own exception unchanged — never swallow or wrap it — and (2) still record
+    the call, with `error` set to the exception's type name and `usage` None
+    (there was no response to extract usage from)."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    wrapped = t.wrap(_BoomingOpenAI())
+    with pytest.raises(BoomError):
+        wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    assert calls[0].usage is None
     ct.close()
 
 

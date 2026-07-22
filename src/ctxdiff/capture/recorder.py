@@ -21,6 +21,11 @@ class Recorder:
 
     def __init__(self, ctrace: CTrace, adapter: Adapter,
                  redact: Callable[[Block], Block] | None):
+        """Wire the three collaborators `record()` needs: the store to write
+        to, the provider-specific adapter that knows how to pull blocks/
+        params/usage out of raw request/response objects, and an optional
+        redaction hook. How: just stores the references; no I/O happens
+        until `record()` is called."""
         self._ct = ctrace
         self._adapter = adapter
         self._redact = redact

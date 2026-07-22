@@ -44,6 +44,11 @@ class CTrace:
     `open()` (existing run); never call the initializer directly."""
 
     def __init__(self, conn: sqlite3.Connection, run_id: str):
+        """Wrap an already-open, already-initialized connection for one run.
+        How: just stores the two handles this class needs for every query —
+        the live connection and the id of the single run it operates against
+        — trusting `create()`/`open()` to have done all setup/validation
+        already, per the class docstring's "never call directly" contract."""
         self._conn = conn
         self._run_id = run_id
 
@@ -56,15 +61,21 @@ class CTrace:
         single run row. Foreign keys are enabled so referential integrity holds.
         `started_at` defaults to empty (the tracer supplies a real timestamp)."""
         conn = sqlite3.connect(path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.executescript(DDL)
-        run_id = uuid.uuid4().hex
-        conn.execute(
-            "INSERT INTO run VALUES (?,?,?,?,?,?,?)",
-            (run_id, project, started_at, provider,
-             json.dumps([model]), __version__, SCHEMA_VERSION),
-        )
-        conn.commit()
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.executescript(DDL)
+            run_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO run VALUES (?,?,?,?,?,?,?)",
+                (run_id, project, started_at, provider,
+                 json.dumps([model]), __version__, SCHEMA_VERSION),
+            )
+            conn.commit()
+        except Exception:
+            # DDL/insert failed after the connection was opened; close it so
+            # we don't leak a file handle/lock on the way out.
+            conn.close()
+            raise
         return cls(conn, run_id)
 
     @classmethod
@@ -73,15 +84,21 @@ class CTrace:
         schema_version does not match this build, with a clear ValueError rather
         than letting a mismatched read fail obscurely later."""
         conn = sqlite3.connect(path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        row = conn.execute(
-            "SELECT id, schema_version FROM run LIMIT 1").fetchone()
-        if row is None:
-            raise ValueError(f"{path}: not a ctrace file (no run row)")
-        run_id, version = row
-        if version != SCHEMA_VERSION:
-            raise ValueError(
-                f"{path}: schema version {version} != supported {SCHEMA_VERSION}")
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            row = conn.execute(
+                "SELECT id, schema_version FROM run LIMIT 1").fetchone()
+            if row is None:
+                raise ValueError(f"{path}: not a ctrace file (no run row)")
+            run_id, version = row
+            if version != SCHEMA_VERSION:
+                raise ValueError(
+                    f"{path}: schema version {version} != supported {SCHEMA_VERSION}")
+        except Exception:
+            # Reject-and-abort paths (bad file, schema mismatch) and any read
+            # error alike must not leak the connection on the way out.
+            conn.close()
+            raise
         return cls(conn, run_id)
 
     # --- writing -----------------------------------------------------------

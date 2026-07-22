@@ -50,6 +50,10 @@ class Tracer:
 
     def __init__(self, project: str, redact: Callable[[Block], Block] | None,
                  path: str):
+        """Store the run's static config and initialize empty-run state. How:
+        the store/recorder are NOT created here — they need the provider,
+        which is only known once `wrap()` is called — so `_ct`/`_recorder`
+        start as None and `_seq`/`_pending_tags` start at their zero values."""
         self.path = path
         self._project = project
         self._redact = redact
@@ -119,7 +123,13 @@ class _ClientProxy:
 
     def __init__(self, target: object, path: tuple[str, ...],
                  tracer: "Tracer", create_path: tuple[str, ...]):
-        # Stored under name-mangled attrs so they never shadow real client attrs.
+        """Store this proxy's bookkeeping: the wrapped object, how far along
+        the path to the completion method this proxy sits, the owning
+        tracer, and that target path. How: stored via `object.__setattr__`
+        under `_ctx_`-prefixed names (a plain naming convention — NOT Python
+        name-mangling, which only applies to `__dunder`-style names) so that
+        `__getattr__` forwarding below can't accidentally shadow or recurse
+        into real client attributes of the same name."""
         object.__setattr__(self, "_ctx_target", target)
         object.__setattr__(self, "_ctx_path", path)
         object.__setattr__(self, "_ctx_tracer", tracer)
@@ -152,6 +162,15 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer") -> Callable:
     then hand the (kwargs, response) to the tracer. On host error, record the
     failed call and re-raise the host's exception unchanged."""
     def interceptor(*args, **kwargs):
+        """Stand in for the provider's completion method. What: times and
+        forwards the call unchanged, reports it to the tracer, and returns
+        (or re-raises) exactly what the real call produced. How: `real_create`
+        is invoked first with the caller's own args/kwargs so the host request
+        is never delayed, inspected, or altered; on success the response and
+        latency are handed to `tracer._on_create` before returning it; on
+        failure the call is still reported (with `error` set, no response)
+        and the original exception is re-raised unchanged so the host sees
+        its own error, not a ctxdiff one."""
         start = time.perf_counter()
         try:
             response = real_create(*args, **kwargs)
