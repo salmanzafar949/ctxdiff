@@ -29,3 +29,6 @@ htmlcov/
 
 # internal docs — not published
 docs/
+
+# SDD scratch (progress ledger)
+.superpowers/
