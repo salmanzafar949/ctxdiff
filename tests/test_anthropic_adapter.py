@@ -44,3 +44,26 @@ def test_extract_usage_maps_anthropic_fields():
         usage = Usage()
     u = AnthropicAdapter().extract_usage(Resp())
     assert u["input_tokens"] == 20 and u["output_tokens"] == 5
+
+
+def test_extract_usage_falls_back_to_parse_for_raw_response():
+    """A raw-response wrapper (e.g. from `with_raw_response.create()`) has no
+    `.usage` directly — only its parsed body does. extract_usage falls back
+    to calling `.parse()` and reading `.usage` off the parsed result."""
+    class Usage:
+        input_tokens = 20; output_tokens = 5
+    class Parsed:
+        usage = Usage()
+    class RawResponse:
+        def parse(self): return Parsed()
+
+    u = AnthropicAdapter().extract_usage(RawResponse())
+    assert u == {"input_tokens": 20, "output_tokens": 5}
+
+
+def test_extract_usage_parse_fallback_failure_degrades_to_none():
+    """If `.parse()` exists but raises, extract_usage must degrade to None
+    rather than propagate."""
+    class BoomRawResponse:
+        def parse(self): raise RuntimeError("boom")
+    assert AnthropicAdapter().extract_usage(BoomRawResponse()) is None

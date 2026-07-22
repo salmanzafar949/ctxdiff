@@ -51,8 +51,26 @@ class OpenAIAdapter:
     def extract_usage(self, response: object) -> dict | None:
         """Pull provider-reported usage off `response.usage` (duck-typed) into a
         plain dict. Returns None when the response carries no usage (e.g. an
-        error path), so downstream code can treat usage as optional."""
+        error path), so downstream code can treat usage as optional.
+
+        Fallback: a raw-response wrapper (what `with_raw_response.create()`
+        returns — the hop LangChain's `ChatOpenAI` takes, see trace.py's
+        `_TRANSPARENT_HOPS`) has no `.usage` of its own; only its parsed body
+        does. If `.usage` isn't directly present but a callable `.parse()`
+        is, call it and read `.usage` off the parsed result instead. openai's
+        raw-response `.parse()` is memoized, so calling it here does not
+        consume the body or interfere with a caller (e.g. LangChain) parsing
+        it again later. Any failure during this fallback is swallowed —
+        extract_usage runs inside the fail-open recorder, but stays
+        defensive here too rather than relying solely on that outer guard."""
         usage = getattr(response, "usage", None)
+        if usage is None:
+            parse = getattr(response, "parse", None)
+            if callable(parse):
+                try:
+                    usage = getattr(parse(), "usage", None)
+                except Exception:  # noqa: BLE001 — defensive; never raise from here
+                    usage = None
         if usage is None:
             return None
         return {

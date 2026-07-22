@@ -1,9 +1,15 @@
 """Encodes TODAY'S ground truth for LangChain's `ChatOpenAI` as regression
-tests (spike §4). Unlike every other file in this suite, these tests assert
-the DOCUMENTED LIMITATION, not a happy path — they exist to fail loudly if the
-gap is ever silently fixed or silently worsened, so a future contributor who
-changes `_ClientProxy` or the interceptor has to consciously update this file
-rather than accidentally gaining/losing capability unnoticed."""
+tests (spike §4). The default (non-streaming) `.invoke()` gap is now CLOSED:
+`_ClientProxy` treats `with_raw_response`/`with_streaming_response` as
+transparent hops (see `trace._TRANSPARENT_HOPS`), so the call IS captured,
+WITH usage (via `extract_usage`'s `.parse()` fallback on the raw-response
+wrapper). The streaming-usage gap remains OPEN and is intentionally still
+asserted here as a DOCUMENTED LIMITATION (a v1 non-goal — the streaming path
+hands the interceptor a `Stream` iterator with no `.parse()`, so usage stays
+unrecoverable at call time). These tests exist to fail loudly if either
+behavior is ever silently changed, so a future contributor who touches
+`_ClientProxy`/the interceptor/`extract_usage` has to consciously update this
+file rather than accidentally gaining/losing capability unnoticed."""
 from __future__ import annotations
 
 import httpx
@@ -29,32 +35,38 @@ def test_wrap_chatopenai_raises(tmp_ctrace_path):
         tracer.wrap(llm)
 
 
-def test_client_injection_default_invoke_not_captured(respx_mock, tmp_ctrace_path):
+def test_client_injection_default_invoke_is_captured(respx_mock, tmp_ctrace_path):
     """Client-injection wiring (`client=wrapped.chat.completions,
     root_client=wrapped`) is mechanically sound — pydantic accepts the proxy
     with no validation error, and `.invoke()` SUCCEEDS end-to-end against the
-    stub — but the call is NOT captured: `len(ct.get_calls()) == 0`.
+    stub — and, as of the transparent-hop fix, the call IS captured, WITH
+    usage: `len(ct.get_calls()) == 1` and `call.usage` reflects the canned
+    token counts.
 
-    ROOT CAUSE (spike §4, confirmed by reading langchain_openai 1.4.0's
-    `ChatOpenAI._generate()`, base.py ~line 1733): the default/non-streaming
-    invoke path calls `self.client.with_raw_response.create(**payload)`, NOT
-    `self.client.create(**payload)`. `ctxdiff._ClientProxy.__getattr__` only
-    keeps wrapping when the traversed attribute path stays an exact prefix of
-    the adapter's fixed `create_path` tuple `("chat","completions","create")`.
-    `with_raw_response` extends the path to `("chat","completions",
-    "with_raw_response")`, which is NOT a prefix of `create_path`, so the
-    proxy's prefix check fails and `__getattr__` falls through to returning
-    the REAL, unwrapped `CompletionsWithRawResponse` object straight off the
-    underlying SDK client — the interceptor is never installed on it, so
-    `tracer._on_create` is never called for this path.
+    PREVIOUS ROOT CAUSE, NOW FIXED (spike §4, confirmed by reading
+    langchain_openai 1.4.0's `ChatOpenAI._generate()`, base.py ~line 1733):
+    the default/non-streaming invoke path calls
+    `self.client.with_raw_response.create(**payload)`, NOT
+    `self.client.create(**payload)`. `ctxdiff._ClientProxy.__getattr__` used
+    to only keep wrapping when the traversed attribute path stayed an exact
+    prefix of the adapter's fixed `create_path` tuple
+    `("chat","completions","create")` — `with_raw_response` extended the
+    path to `("chat","completions","with_raw_response")`, not a prefix of
+    `create_path`, so the proxy fell through to the REAL, unwrapped
+    `CompletionsWithRawResponse` object and the interceptor never ran.
 
-    THIS TEST MUST BE FLIPPED GREEN (its `== 0` assertion changed to `== 1`,
-    deliberately, with a comment explaining why) by whoever fixes
-    `_ClientProxy` to treat `with_raw_response`/`with_streaming_response` as
-    transparent infixes rather than path-breaking hops. Until then, this
-    assertion is the correct, intentional ground truth."""
+    THE FIX (trace.py `_TRANSPARENT_HOPS`): `__getattr__` now recognizes
+    `with_raw_response`/`with_streaming_response` as transparent when
+    encountered exactly one step before `create` — it keeps wrapping WITHOUT
+    advancing the tracked path, so the following `.create` access still
+    lands on `create_path` and IS intercepted. And because
+    `with_raw_response.create()` returns a raw-response wrapper with no
+    `.usage` of its own, `OpenAIAdapter.extract_usage` now falls back to
+    calling the wrapper's (memoized) `.parse()` and reading `.usage` off the
+    parsed body — which is why `call.usage` is populated here, not None."""
     respx_mock.post("https://api.openai.com/v1/chat/completions").mock(
-        return_value=httpx.Response(200, json=canned_openai_response()))
+        return_value=httpx.Response(
+            200, json=canned_openai_response(prompt_tokens=10, completion_tokens=5)))
 
     tracer = trace.init(project="p", path=tmp_ctrace_path)
     oa = openai.OpenAI(api_key="x")
@@ -68,7 +80,14 @@ def test_client_injection_default_invoke_not_captured(respx_mock, tmp_ctrace_pat
     tracer.close()
 
     ct = CTrace.open(tmp_ctrace_path)
-    assert len(ct.get_calls()) == 0  # ...but ctxdiff genuinely misses it
+    calls = ct.get_calls()
+    assert len(calls) == 1  # the gap is closed: the hop is now captured
+    assert calls[0].usage == {
+        "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+    }  # usage recovered via the raw-response .parse() fallback
+
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert any(b.block.text == "hi" for b in blocks)  # user content captured too
     ct.close()
 
 
@@ -78,15 +97,19 @@ def test_client_injection_streaming_invoke_is_captured(respx_mock, tmp_ctrace_pa
     no `with_raw_response` hop — which DOES match the proxy's `create_path`
     exactly, so the interceptor IS installed and the call IS captured.
 
-    This is the one LangChain invocation path client-injection captures
-    today, but with a caveat this test also locks in: `real_create(...)`
-    returns an `openai.Stream[ChatCompletionChunk]` iterator (not a completed
-    response) at the moment the interceptor's `tracer._on_create` runs, so
-    `OpenAIAdapter.extract_usage`'s `getattr(response, "usage", None)` finds
-    nothing — `call.usage` is `None` even though the call itself succeeded
-    and blocks were recorded. A future fix for the streaming-usage gap (e.g.
-    wrapping the iterator to capture usage from its final chunk) should
-    change this test's `is None` assertion deliberately, not by accident.
+    This LangChain invocation path is captured (as is, now, the default
+    non-streaming path — see `test_client_injection_default_invoke_is_
+    captured`), but with a caveat this test locks in as a SEPARATE, STILL
+    OPEN gap (a v1 non-goal, not addressed by the with_raw_response
+    transparent-hop fix): `real_create(...)` returns an
+    `openai.Stream[ChatCompletionChunk]` iterator (not a completed response,
+    and not a raw-response wrapper with a `.parse()`) at the moment the
+    interceptor's `tracer._on_create` runs, so `OpenAIAdapter.extract_usage`
+    finds neither a direct `.usage` nor a `.parse()` to fall back to —
+    `call.usage` is `None` even though the call itself succeeded and blocks
+    were recorded. A future fix for the streaming-usage gap (e.g. wrapping
+    the iterator to capture usage from its final chunk) should change this
+    test's `is None` assertion deliberately, not by accident.
 
     How the canned response is built: the openai SDK's streaming client
     parses a Server-Sent-Events body (`data: <json>\\n\\n` per chunk,

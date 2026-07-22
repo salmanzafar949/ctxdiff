@@ -20,6 +20,15 @@ _log = logging.getLogger("ctxdiff")
 # Provider detection maps a client's top-level module to an adapter factory.
 _ADAPTERS = {"openai": OpenAIAdapter, "anthropic": AnthropicAdapter}
 
+# SDK response-wrapper hops that sit BETWEEN a resource and its `.create`
+# method without changing which HTTP call gets made — e.g. LangChain's
+# `ChatOpenAI._generate()` calls `self.client.with_raw_response.create(...)`
+# instead of `self.client.create(...)` to get at raw headers/status before
+# parsing the body. `_ClientProxy` treats a name in this set as transparent
+# (see `__getattr__`) when it is encountered exactly one step before the
+# create path, so the call is still tracked and recorded.
+_TRANSPARENT_HOPS = ("with_raw_response", "with_streaming_response")
+
 
 def _detect_provider(client: object) -> str:
     """Infer the provider from the client's module path (e.g. an OpenAI client's
@@ -138,7 +147,11 @@ class _ClientProxy:
     def __getattr__(self, name: str):
         """Resolve `name` on the wrapped target. If the new path IS the create
         path, return the interceptor. If it is a prefix of the create path, wrap
-        the intermediate object so traversal continues. Otherwise return the raw
+        the intermediate object so traversal continues. If `name` is a known
+        SDK response-wrapper hop (`with_raw_response`/`with_streaming_response`)
+        encountered exactly one step before create, treat it as transparent —
+        keep wrapping WITHOUT advancing the path, so the create step right
+        after it still lands on the tracked path. Otherwise return the raw
         attribute — full pass-through."""
         target = object.__getattribute__(self, "_ctx_target")
         path = object.__getattribute__(self, "_ctx_path")
@@ -153,6 +166,19 @@ class _ClientProxy:
         # Is new_path a prefix of create_path? If so keep wrapping.
         if new_path == create_path[:len(new_path)]:
             return _ClientProxy(attr, new_path, tracer, create_path)
+        # Transparent SDK hop: e.g. LangChain calls
+        # `client.chat.completions.with_raw_response.create(...)` rather than
+        # `client.chat.completions.create(...)`. That inserts a
+        # `with_raw_response` attribute access exactly one step before the
+        # tracked `create` step. Recognize it ONLY there (not anywhere else
+        # in the tree, so unrelated same-named attributes never get
+        # over-wrapped) and keep the SAME `path` — not `new_path` — so the
+        # immediately-following `.create` access still computes
+        # `path + ("create",) == create_path` and is intercepted normally.
+        if (name in _TRANSPARENT_HOPS
+                and len(path) == len(create_path) - 1
+                and path == create_path[:len(path)]):
+            return _ClientProxy(attr, path, tracer, create_path)
         return attr
 
 

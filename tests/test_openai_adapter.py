@@ -50,3 +50,31 @@ def test_extract_usage_reads_object_or_none():
     u = OpenAIAdapter().extract_usage(Resp())
     assert u["total_tokens"] == 13
     assert OpenAIAdapter().extract_usage(object()) is None
+
+
+def test_extract_usage_falls_back_to_parse_for_raw_response():
+    """`with_raw_response.create()` (the hop LangChain's ChatOpenAI uses)
+    returns a raw-response wrapper with NO `.usage` directly — only its
+    parsed body does. When `.usage` is absent but a callable `.parse()` is
+    present, extract_usage calls it and reads `.usage` off the parsed
+    result."""
+    class Usage:
+        def __init__(self): self.prompt_tokens = 7; self.completion_tokens = 2; self.total_tokens = 9
+    class Parsed:
+        usage = Usage()
+    class RawResponse:
+        """No `.usage` attribute — only `.parse()`, mirroring openai's
+        `LegacyAPIResponse`/`APIResponse` raw-response wrapper shape."""
+        def parse(self): return Parsed()
+
+    u = OpenAIAdapter().extract_usage(RawResponse())
+    assert u == {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+
+
+def test_extract_usage_parse_fallback_failure_degrades_to_none():
+    """If `.parse()` exists but raises, extract_usage must degrade to None
+    rather than propagate — it runs inside the fail-open recorder, but stays
+    defensive here too."""
+    class BoomRawResponse:
+        def parse(self): raise RuntimeError("boom")
+    assert OpenAIAdapter().extract_usage(BoomRawResponse()) is None

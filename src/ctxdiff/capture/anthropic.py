@@ -53,8 +53,24 @@ class AnthropicAdapter:
 
     def extract_usage(self, response: object) -> dict | None:
         """Map Anthropic's `response.usage.input_tokens/output_tokens` into a
-        plain dict, or None when absent."""
+        plain dict, or None when absent.
+
+        Fallback: a raw-response wrapper (what `with_raw_response.create()`
+        returns) has no `.usage` of its own; only its parsed body does. If
+        `.usage` isn't directly present but a callable `.parse()` is, call it
+        and read `.usage` off the parsed result instead — the SDK's
+        raw-response `.parse()` is memoized, so this doesn't consume the
+        body or interfere with a later caller-side parse. Any failure during
+        this fallback is swallowed (extract_usage runs inside the fail-open
+        recorder, but stays defensive here too)."""
         usage = getattr(response, "usage", None)
+        if usage is None:
+            parse = getattr(response, "parse", None)
+            if callable(parse):
+                try:
+                    usage = getattr(parse(), "usage", None)
+                except Exception:  # noqa: BLE001 — defensive; never raise from here
+                    usage = None
         if usage is None:
             return None
         return {

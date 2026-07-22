@@ -117,6 +117,69 @@ def test_wrap_reraises_host_error_and_records_it(tmp_path):
     ct.close()
 
 
+class _FakeRawResponseCompletions:
+    """Stand-in for the SDK's `.with_raw_response` resource — same shape as
+    `_FakeCompletions` (a recording create()) but reached via the
+    with_raw_response hop, the way LangChain's `ChatOpenAI._generate()`
+    calls `self.client.with_raw_response.create(**payload)` instead of
+    `self.client.create(**payload)` directly."""
+    def __init__(self): self.calls = []
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _Resp()
+
+
+class _FakeCompletionsWithRawHop:
+    """client.chat.completions augmented with a `.with_raw_response` hop,
+    mirroring how the real openai SDK resource exposes both `.create()`
+    directly and `.with_raw_response.create()` off the same resource."""
+    def __init__(self): self.with_raw_response = _FakeRawResponseCompletions()
+
+
+class _FakeChatWithRawHop:
+    def __init__(self): self.completions = _FakeCompletionsWithRawHop()
+
+
+class _FakeOpenAIWithRawHop:
+    """Duck-typed OpenAI client exposing a with_raw_response hop nested
+    exactly one step before create() (chat.completions.with_raw_response)
+    AND an unrelated same-named attribute at the TOP level (off the create
+    path), so one test can check both the transparent-hop success case and
+    the no-over-wrapping guard case."""
+    __module__ = "openai"
+    def __init__(self):
+        self.chat = _FakeChatWithRawHop()
+        self.with_raw_response = object()  # off-path sentinel; must stay raw
+
+
+def test_wrap_treats_with_raw_response_as_transparent_hop(tmp_path):
+    """LangChain's ChatOpenAI calls `client.chat.completions.with_raw_response
+    .create(...)` instead of `.create(...)` directly (spike §4). The proxy
+    must keep tracking the create path THROUGH that hop — recording the
+    call — while an unrelated `with_raw_response` attribute reached anywhere
+    else (here: the top level) must stay a raw, unwrapped pass-through, i.e.
+    NOT get swept up into transparent-hop wrapping it doesn't belong to."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeOpenAIWithRawHop()
+    wrapped = t.wrap(client)
+
+    resp = wrapped.chat.completions.with_raw_response.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    assert isinstance(resp, _Resp)                                   # real response passed through
+    assert len(client.chat.completions.with_raw_response.calls) == 1  # real create actually ran
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1  # the hop was transparent — the call WAS captured
+    ct.close()
+
+    # No-over-wrapping guard: with_raw_response accessed anywhere OTHER than
+    # exactly one step before create() (here: the top level, not
+    # chat.completions) must remain the raw, unwrapped attribute.
+    assert wrapped.with_raw_response is client.with_raw_response
+
+
 def test_wrap_is_fail_open_if_recording_breaks(tmp_path, monkeypatch):
     """If recording raises internally, the host call still returns normally."""
     t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
