@@ -1,6 +1,7 @@
-# AI assistant config
+# AI assistant config & local memory (personal — never publish)
 CLAUDE.md
 AGENTS.md
+.claude/
 
 # IDE
 .idea/
