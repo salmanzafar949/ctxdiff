@@ -1,5 +1,10 @@
 # ctxdiff
 
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Status: M1 · capture + store](https://img.shields.io/badge/status-M1%20%C2%B7%20capture%20%2B%20store-orange.svg)](#status)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
 
 `ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI or Anthropic client in one line, run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
