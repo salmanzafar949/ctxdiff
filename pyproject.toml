@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ctxdiff"
-version = "0.3.0"
+version = "0.3.1"
 description = "git diff for your agent's context window — a context-window debugger for LLM agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,10 @@ eval = ["openai>=1.0", "anthropic>=0.30", "langchain-openai", "langchain-core", 
 
 [project.scripts]
 ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · view · export · runs)
+
+[tool.hatch.build.targets.sdist]
+# Keep the source tarball lean — no 2.4MB demo GIF, no tests/CI in the pip download.
+exclude = ["assets", "tests", ".github", "docs"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ctxdiff"]
