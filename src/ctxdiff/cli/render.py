@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 
+from ctxdiff.analyze.cache import CacheReport, PrefixBreak
 from ctxdiff.analyze.differ import TurnDiff
 from ctxdiff.analyze.tokens import BloatReport, CallTokens
 
@@ -205,6 +206,73 @@ def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
     if bloat is not None and bloat.unused_tools:
         sections.append(render_bloat(bloat, total_tools))
     return "\n\n".join(sections)
+
+
+def _group_breaks(breaks: list[PrefixBreak]) -> list[list[PrefixBreak]]:
+    """Group PrefixBreaks that describe the "same" underlying culprit —
+    (culprit_kind, culprit_label, divergent_position) — into one list per
+    distinct culprit, in first-seen order. Grouping deliberately ignores the
+    per-pair `detail`/`culprit_snippet` text (a changing timestamp's exact
+    before/after values differ every pair by definition) — what makes two
+    breaks "the same warning" is that the same slot keeps breaking the same
+    way, not that the literal diff text is identical."""
+    groups: dict[tuple[str, str, int], list[PrefixBreak]] = {}
+    for b in breaks:
+        key = (b.culprit_kind, b.culprit_label, b.divergent_position)
+        groups.setdefault(key, []).append(b)
+    return list(groups.values())
+
+
+def render_cache_report(report: CacheReport) -> str:
+    """Render `ctxdiff cache`'s full output (spec §6.4/§7.1):
+
+    - fewer than 2 calls: just the analyzer's own explanatory note, plain.
+    - no breaks: a single green "prefix stable" line, plus the waste note
+      only when there's something nonzero to report (there won't be, on the
+      happy path, but the analyzer's math is trusted over assuming so).
+    - breaks: one yellow warning line per DISTINCT culprit (identical
+      culprits across pairs — e.g. the same timestamp breaking every turn —
+      collapse into one warning carrying a count), each followed by its
+      culprit snippet and detail; then a summary block (stable-prefix
+      tokens, rebilled total, the waste note); then the fix hint, dimmed,
+      when one was detected."""
+    enabled = _color_enabled()
+
+    if report.pairs_analyzed == 0:
+        return report.estimated_waste_note
+
+    lines: list[str] = []
+
+    if not report.breaks:
+        line = (f"✓ prefix stable across all {report.pairs_analyzed} turn pairs "
+                f"— minimum stable prefix {report.stable_prefix_tokens_min:,} tokens")
+        lines.append(_paint(line, _GREEN, enabled))
+        if report.rebilled_tokens_total > 0:
+            lines.append(report.estimated_waste_note)
+        return "\n".join(lines)
+
+    for group in _group_breaks(report.breaks):
+        rep = group[0]
+        count = len(group)
+        frequency = (
+            f"breaks the prefix on every turn ({count}/{report.pairs_analyzed} pairs)"
+            if count == report.pairs_analyzed else
+            f"breaks the prefix on {count}/{report.pairs_analyzed} turn pairs"
+        )
+        header = f"⚠ warning: [{rep.culprit_label}·{rep.culprit_kind}] {frequency}"
+        lines.append(_paint(header, _YELLOW, enabled))
+        lines.append(f"  {repr(rep.culprit_snippet)}")
+        lines.append(f"  {rep.detail}")
+
+    lines.append("")
+    lines.append(f"stable prefix (min): {report.stable_prefix_tokens_min:,} tokens")
+    lines.append(f"re-billed: {report.rebilled_tokens_total:,} tokens")
+    lines.append(report.estimated_waste_note)
+
+    if report.fix_hint:
+        lines.append(_paint(f"hint: {report.fix_hint}", _DIM, enabled))
+
+    return "\n".join(lines)
 
 
 def render_runs_list(rows: list[tuple[str, str, str, int]]) -> str:

@@ -279,3 +279,91 @@ def test_tokens_no_color_output_has_no_ansi_escapes(tmp_path, monkeypatch, capsy
 
     out = capsys.readouterr().out
     assert not _ANSI_RE.search(out)
+
+
+# --- `ctxdiff cache` ------------------------------------------------------------
+
+
+def _cache_cb(text, position, role="user", label="user", token_count=None):
+    if token_count is None:
+        token_count = len(text)
+    block = Block(content_hash=f"h:{role}:{text}", role=role, kind="message",
+                  text=text, token_count=token_count, token_method="tiktoken")
+    return CallBlock(block=block, position=position, label=label, label_source="heuristic")
+
+
+def _make_cache_break_trace(path):
+    """Build a 3-turn .ctrace with a deliberate timestamp break: the system
+    block's embedded timestamp changes every turn while the rest of the
+    context is stable, breaking the cache prefix on every consecutive pair."""
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    for seq, ts in enumerate(["10:00:00", "10:00:05", "10:00:10"], start=1):
+        blocks = [
+            _cache_cb(f"you are an assistant. current time: {ts}", 0,
+                     role="system", label="system"),
+            _cache_cb("static rule", 1, role="system", label="system"),
+            _cache_cb("hello", 2, role="user", label="user"),
+        ]
+        ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=None, latency_ms=10,
+                       error=None, call_blocks=blocks)
+    ct.close()
+
+
+def _make_cache_stable_trace(path):
+    """Build a 3-turn .ctrace that only ever appends to history — a stable
+    cache prefix on every pair, the happy path."""
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    turn1 = [_cache_cb("system prompt", 0, role="system", label="system"),
+             _cache_cb("hello", 1, role="user", label="user")]
+    turn2 = turn1 + [_cache_cb("hi", 2, role="assistant", label="history"),
+                     _cache_cb("bye", 3, role="user", label="user")]
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None, latency_ms=10,
+                   error=None, call_blocks=turn1)
+    ct.record_call(seq=2, params={"model": "gpt-4o"}, usage=None, latency_ms=10,
+                   error=None, call_blocks=turn2)
+    ct.close()
+
+
+def test_cache_reports_grouped_warning_with_waste_note(tmp_path, capsys):
+    """A trace with a deliberate timestamp break shows a warning line, the
+    grouped count (2/2 pairs, since both pairs break the same way), and the
+    waste note — with clean NO_COLOR output."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_cache_break_trace(path)
+    exit_code = main(["cache", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "⚠ warning" in out
+    assert "(2/2 pairs)" in out
+    assert "re-billed" in out
+    assert "tokens re-billed across 2 turns" in out
+    assert "dynamic value" in out  # the fix hint
+
+
+def test_cache_no_color_output_has_no_ansi_escapes(tmp_path, monkeypatch, capsys):
+    path = str(tmp_path / "demo.ctrace")
+    _make_cache_break_trace(path)
+    monkeypatch.setenv("NO_COLOR", "1")
+    import sys
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    main(["cache", "--run", path])
+
+    out = capsys.readouterr().out
+    assert not _ANSI_RE.search(out)
+
+
+def test_cache_stable_trace_shows_green_line_and_exits_zero(tmp_path, capsys):
+    """A run whose prefix never breaks (pure append growth) shows the green
+    stable line and exits 0, with no warning line."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_cache_stable_trace(path)
+
+    exit_code = main(["cache", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "✓" in out
+    assert "prefix stable across all 1 turn pairs" in out
+    assert "⚠" not in out

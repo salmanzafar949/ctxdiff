@@ -10,9 +10,15 @@ import glob
 import os
 import sys
 
+from ctxdiff.analyze.cache import analyze_cache
 from ctxdiff.analyze.differ import diff_turns
 from ctxdiff.analyze.tokens import analyze_run, registered_tool_names
-from ctxdiff.cli.render import render_runs_list, render_run_tokens, render_turn_diff
+from ctxdiff.cli.render import (
+    render_cache_report,
+    render_runs_list,
+    render_run_tokens,
+    render_turn_diff,
+)
 from ctxdiff.store.ctrace import CTrace
 
 
@@ -69,6 +75,16 @@ def _add_tokens_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_tokens)
 
 
+def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff cache [--run PATH]`: no other arguments — the
+    profiler always analyzes the whole run's consecutive-call pairs."""
+    p = subparsers.add_parser(
+        "cache", help="prefix-stability report + wasted-spend estimate")
+    p.add_argument("--run", default=None, help="path to a .ctrace file "
+                    "(default: most recently modified *.ctrace in cwd)")
+    p.set_defaults(func=_cmd_cache)
+
+
 def _add_runs_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register `ctxdiff runs` (no arguments: it always lists the cwd)."""
     p = subparsers.add_parser(
@@ -78,7 +94,7 @@ def _add_runs_parser(subparsers: argparse._SubParsersAction) -> None:
 
 # Every registered subcommand's add_parser function, in help-listing order.
 # Appending here is the ONLY change later milestones need to add a subcommand.
-_SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_runs_parser]
+_SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_cache_parser, _add_runs_parser]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -167,6 +183,31 @@ def _cmd_tokens(args: argparse.Namespace) -> int:
             total_tools = len(registered_tool_names(all_blocks))
 
         print(render_run_tokens(selected, run_tokens.bloat, total_tools))
+    finally:
+        ct.close()
+    return 0
+
+
+def _cmd_cache(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff cache`. How: resolves and opens the `.ctrace`
+    (missing/corrupt file -> exit 1, same convention as `diff`/`tokens`),
+    runs the cache-prefix profiler over the whole run, and prints the
+    rendered report. Breaks found are informational (not a usage/operational
+    failure), so a clean run and a run full of warnings both exit 0 — same
+    convention as `tokens`' schema-bloat warning."""
+    path = _resolve_run_path(args.run)
+    if path is None:
+        print("no .ctrace here — did the run capture?", file=sys.stderr)
+        return 1
+    try:
+        ct = CTrace.open(path)
+    except Exception as exc:  # noqa: BLE001 — any open failure is reported, not crashed
+        print(f"ctxdiff: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        report = analyze_cache(ct)
+        print(render_cache_report(report))
     finally:
         ct.close()
     return 0
