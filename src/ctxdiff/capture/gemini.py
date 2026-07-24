@@ -41,7 +41,20 @@ class GeminiAdapter:
     """Normalize Gemini generate_content requests into the block model."""
 
     provider = "gemini"
-    create_path = ("models", "generate_content")
+    create_path = ("models", "generate_content")  # kept for backward compat
+    # `generate_content_stream` is a SEPARATE method (not a `stream=True`
+    # kwarg on `generate_content`, unlike OpenAI/Anthropic) that returns a
+    # DIRECT iterator/async-iterator of response chunks — confirmed
+    # empirically (Phase 13 Step 0 probe against real `google-genai` 2.14.0):
+    # a plain generator (sync) / async generator (async, reached via the
+    # `.aio` transparent root-hop already handled by `_ClientProxy`), never a
+    # context-manager. trace.py's `_ClientProxy.__getattr__` recognizes this
+    # shape by the path's LAST segment ENDING WITH "stream" but not being
+    # exactly "stream" (which instead means the Anthropic/OpenAI `.stream()`
+    # MANAGER helpers) and routes it through the existing raw-stream
+    # `_StreamProxy`/`_AsyncStreamProxy` machinery, the same as
+    # `create(stream=True)` on the other providers.
+    create_paths = (("models", "generate_content"), ("models", "generate_content_stream"))
 
     def extract_blocks(self, kwargs: dict) -> list[RawBlock]:
         """Flatten a request into ordered RawBlocks: `config.system_instruction`
@@ -124,3 +137,25 @@ class GeminiAdapter:
             "candidates_token_count": getattr(usage, "candidates_token_count", None),
             "total_token_count": getattr(usage, "total_token_count", None),
         }
+
+    def accumulate_stream_usage(self, chunk: object, state: dict) -> None:
+        """Fold ONE streamed chunk's `usage_metadata` into `state`. Confirmed
+        empirically (Phase 13 Step 0 probe, real `google-genai` 2.14.0 SSE
+        parsing) that Gemini's `usage_metadata` is CUMULATIVE — each
+        successive chunk already carries the running totals for the whole
+        response so far, unlike OpenAI (a single final delta) or Anthropic
+        (split across two events). So accumulation here is a plain OVERWRITE
+        of `state` with the latest chunk's counts — last chunk wins — never a
+        sum; a chunk with no `usage_metadata` at all (duck-typed via
+        `getattr`) simply leaves `state` as it was. Wrapped in a catch-all
+        exactly like the other adapters' `accumulate_stream_usage`: a
+        malformed/unexpected chunk must never interrupt the caller's own
+        iteration."""
+        try:
+            usage = getattr(chunk, "usage_metadata", None)
+            if usage is not None:
+                state["prompt_token_count"] = getattr(usage, "prompt_token_count", None)
+                state["candidates_token_count"] = getattr(usage, "candidates_token_count", None)
+                state["total_token_count"] = getattr(usage, "total_token_count", None)
+        except Exception:  # noqa: BLE001 — never break the caller's iteration
+            pass

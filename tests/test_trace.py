@@ -1354,3 +1354,650 @@ def test_async_stream_context_manager_mid_error_records_error_exactly_once(tmp_p
     assert len(calls) == 1
     assert calls[0].error == "BoomError"
     ct.close()
+
+
+# --- `.stream()` convenience-manager helpers ---------------------------------
+# Anthropic's `messages.stream(...)` / OpenAI's `chat.completions.stream(...)`
+# and `responses.stream(...)` return a StreamManager, not a stream: nothing
+# happens (no request, no recording) until the caller enters `with .../async
+# with ... as stream:` — see trace.py's `_StreamManagerProxy`/
+# `_AsyncStreamManagerProxy`. These fakes mirror that shape (confirmed against
+# the real `anthropic`/`openai` SDKs, Phase 13 Step 0 probe): a manager whose
+# `__enter__`/`__aenter__` returns a stream-shaped object and is where a host
+# error would actually surface, plus `__exit__`/`__aexit__` that forward to
+# the real stream's own close.
+
+
+class _FakeStreamManager:
+    """Stand-in for MessageStreamManager/ChatCompletionStreamManager. Makes no
+    request itself — `enter_raises`, if set, simulates the REAL request
+    (fired inside `__enter__`) failing."""
+    def __init__(self, stream=None, enter_raises=None):
+        self._stream = stream
+        self._enter_raises = enter_raises
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        if self._enter_raises is not None:
+            raise self._enter_raises
+        self.entered = True
+        return self._stream
+
+    def __exit__(self, exc_type, exc, tb):
+        self.exited = True
+        real_exit = getattr(self._stream, "__exit__", None)
+        return real_exit(exc_type, exc, tb) if callable(real_exit) else False
+
+
+class _FakeAsyncStreamManager:
+    """Async mirror of `_FakeStreamManager`."""
+    def __init__(self, stream=None, enter_raises=None):
+        self._stream = stream
+        self._enter_raises = enter_raises
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        if self._enter_raises is not None:
+            raise self._enter_raises
+        self.entered = True
+        return self._stream
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exited = True
+        real_aexit = getattr(self._stream, "__aexit__", None)
+        return await real_aexit(exc_type, exc, tb) if callable(real_aexit) else False
+
+
+class _FakeStreamManagerCompletions:
+    """Stand-in for client.chat.completions exposing `.stream()` (NOT
+    `.create()`) — the manager-returning convenience helper, matching the
+    real SDK shape 1:1 rather than reusing the `.create(stream=True)` fakes
+    above."""
+    def __init__(self):
+        self.calls = []
+        self.next_manager = None
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.next_manager
+
+
+class _FakeStreamManagerChat:
+    def __init__(self): self.completions = _FakeStreamManagerCompletions()
+
+
+class _FakeStreamManagerOpenAI:
+    __module__ = "openai"
+    def __init__(self): self.chat = _FakeStreamManagerChat()
+
+
+class _FakeAsyncStreamManagerCompletions:
+    """Async mirror: `.stream()` is itself a PLAIN (non-async) method even on
+    an async client — confirmed against real `AsyncOpenAI`/`AsyncAnthropic`
+    (Phase 13 Step 0 probe) — it's only `__aenter__` that's async."""
+    def __init__(self):
+        self.calls = []
+        self.next_manager = None
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.next_manager
+
+
+class _FakeAsyncStreamManagerChat:
+    def __init__(self): self.completions = _FakeAsyncStreamManagerCompletions()
+
+
+class _FakeAsyncStreamManagerOpenAI:
+    __module__ = "openai"
+    def __init__(self): self.chat = _FakeAsyncStreamManagerChat()
+
+
+def test_stream_manager_nothing_recorded_before_with_block_entered(tmp_path):
+    """Calling `.stream()` itself makes no request and records nothing — the
+    turn counter only advances once the caller actually enters the `with`
+    block (mirroring the real SDKs, where `.stream()` just builds the
+    manager and defers the request to `__enter__`)."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _FakeSyncStream([_StreamChunk("hi")])
+    client.chat.completions.next_manager = _FakeStreamManager(real_stream)
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    assert t._seq == 0  # nothing recorded yet
+    with manager as s:
+        list(s)
+    assert t._seq == 1  # exactly one call recorded once the block ran
+    t.close()
+
+
+def test_stream_manager_sync_with_block_records_once_with_usage(tmp_path):
+    """`with wrapped_manager as s: for ev in s: ...` delivers every event
+    unchanged and in order, then records exactly once on block exit, with
+    usage accumulated from the events — the manager-wrapped mirror of
+    `test_stream_yields_chunks_unchanged_and_records_once_with_usage`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    events = [_StreamChunk("Hello"), _StreamChunk(" there"),
+             _StreamChunk(None, usage=_StreamUsage(10, 2, 12))]
+    real_stream = _FakeSyncStream(events)
+    client.chat.completions.next_manager = _FakeStreamManager(real_stream)
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with manager as s:
+        received = list(s)
+    assert received == events  # identical objects, in order
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert any(b.block.text == "hi" for b in blocks)  # request blocks still captured
+    ct.close()
+
+
+def test_stream_manager_exit_forwards_and_does_not_double_close(tmp_path):
+    """`__exit__` forwards to the real manager's own `__exit__` (which closes
+    the real stream once) and does NOT also close the wrapped stream a
+    second time through `_StreamProxy.close()` — the real stream's `close()`
+    is called exactly once even though ctxdiff sits in between."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _FakeSyncStream([_StreamChunk("hi")])
+    client.chat.completions.next_manager = _FakeStreamManager(real_stream)
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with manager as s:
+        list(s)
+    assert real_stream.close_calls == 1
+    assert client.chat.completions.next_manager.exited
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert len(ct.get_calls()) == 1
+    ct.close()
+
+
+def test_stream_manager_early_exit_before_exhaustion_still_finalizes(tmp_path):
+    """Exiting the `with` block WITHOUT exhausting the stream still records
+    the call once, via the manager's own `__exit__` triggering the wrapped
+    stream's finalize directly."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    events = [_StreamChunk("Hello"), _StreamChunk(" there"),
+             _StreamChunk(None, usage=_StreamUsage(10, 2, 12))]
+    real_stream = _FakeSyncStream(events)
+    client.chat.completions.next_manager = _FakeStreamManager(real_stream)
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with manager as s:
+        first = next(s)
+    assert first is events[0]
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None  # abandoned before the usage-bearing chunk
+    ct.close()
+
+
+def test_stream_manager_getattr_passthrough(tmp_path):
+    """Attributes not defined on the manager proxy forward straight to the
+    real manager (before __enter__) and, per _StreamProxy, straight to the
+    real stream once entered — same transparency contract as everywhere
+    else in this module."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _FakeSyncStream([_StreamChunk("hi")])
+    fake_manager = _FakeStreamManager(real_stream)
+    fake_manager.sentinel = "manager-sentinel"
+    client.chat.completions.next_manager = fake_manager
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    assert manager.sentinel == "manager-sentinel"
+    with manager as s:
+        assert s.response == "raw-http-response-sentinel"
+        list(s)
+    t.close()
+
+
+def test_stream_manager_enter_raises_records_error_and_reraises_unchanged(tmp_path):
+    """A host error firing INSIDE `__enter__` (the real request) is the
+    caller's problem: re-raised unchanged, and recorded as a failed call —
+    the manager-wrapped mirror of the non-streaming host-error path."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_manager = _FakeStreamManager(
+        enter_raises=BoomError("request failed"))
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with pytest.raises(BoomError):
+        with manager:
+            pass
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    ct.close()
+
+
+def test_stream_manager_mid_error_records_error_exactly_once(tmp_path):
+    """A mid-stream error inside `with manager as s: for ev in s: ...`
+    records error='BoomError' exactly once (from `_StreamProxy.__next__`),
+    and the manager's own `__exit__` — which also fires afterward — is a
+    clean no-op against the ALREADY-finalized wrapped stream, plus still
+    forwards to the real manager's own `__exit__`/close."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _RaisingSyncStream([_StreamChunk("Hi")], raise_after=1)
+    fake_manager = _FakeStreamManager(real_stream)
+    client.chat.completions.next_manager = fake_manager
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with pytest.raises(BoomError):
+        with manager as s:
+            for _ in s:
+                pass
+    assert fake_manager.exited
+    assert real_stream.closed
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    ct.close()
+
+
+def test_stream_manager_fail_open_accumulate_raises_events_still_delivered(tmp_path, monkeypatch):
+    """A raising `accumulate_stream_usage` must never interrupt event
+    delivery through the manager-wrapped path either — same hardest
+    fail-open constraint as the raw stream path."""
+    from ctxdiff.capture.openai import OpenAIAdapter
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    events = [_StreamChunk("Hello"), _StreamChunk(None, usage=_StreamUsage(1, 1, 2))]
+    client.chat.completions.next_manager = _FakeStreamManager(_FakeSyncStream(events))
+
+    monkeypatch.setattr(OpenAIAdapter, "accumulate_stream_usage",
+                        lambda self, chunk, state: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with manager as s:
+        received = list(s)
+    assert received == events
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_calls()[0].usage is None
+    ct.close()
+
+
+def test_stream_manager_fail_open_record_raises_with_block_still_completes(tmp_path, monkeypatch):
+    """A broken recorder must never break the caller's `with` block — the
+    manager-wrapped mirror of the raw stream's own fail-open record test."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    only_chunk = _StreamChunk("hi")
+    client.chat.completions.next_manager = _FakeStreamManager(_FakeSyncStream([only_chunk]))
+    monkeypatch.setattr(t._recorder, "record",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("record boom")))
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    with manager as s:
+        received = list(s)
+    assert received == [only_chunk]  # delivered despite broken recorder
+    t.close()
+
+
+# --- Async `.stream()` manager equivalents -----------------------------------
+
+
+def test_async_stream_manager_records_once_with_usage(tmp_path):
+    """`async with wrapped_manager as s: async for ev in s: ...` — async
+    mirror of `test_stream_manager_sync_with_block_records_once_with_usage`.
+    `.stream()` is confirmed (Phase 13 Step 0 probe) to be a PLAIN method
+    even on an async client — no `await` before it — only `__aenter__` is
+    async, so `manager = wrapped.chat.completions.stream(...)` happens
+    synchronously and only the `async with`/`async for` below run inside
+    `asyncio.run`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    events = [_StreamChunk("Hi"), _StreamChunk(None, usage=_StreamUsage(4, 2, 6))]
+    client.chat.completions.next_manager = _FakeAsyncStreamManager(_FakeAsyncStream(events))
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    async def run():
+        async with manager as s:
+            return [c async for c in s]
+
+    received = asyncio.run(run())
+    assert received == events
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+    ct.close()
+
+
+def test_async_stream_manager_enter_raises_records_error_and_reraises(tmp_path):
+    """Async mirror of `test_stream_manager_enter_raises_records_error_and_reraises_unchanged`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_manager = _FakeAsyncStreamManager(
+        enter_raises=BoomError("async request failed"))
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    async def run():
+        async with manager:
+            pass
+
+    with pytest.raises(BoomError):
+        asyncio.run(run())
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    ct.close()
+
+
+def test_async_stream_manager_mid_error_records_error_exactly_once(tmp_path):
+    """Async mirror of `test_stream_manager_mid_error_records_error_exactly_once`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamManagerOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _RaisingAsyncStream([_StreamChunk("Hi")], raise_after=1)
+    fake_manager = _FakeAsyncStreamManager(real_stream)
+    client.chat.completions.next_manager = fake_manager
+
+    manager = wrapped.chat.completions.stream(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    async def run():
+        with pytest.raises(BoomError):
+            async with manager as s:
+                async for _ in s:
+                    pass
+
+    asyncio.run(run())
+    assert fake_manager.exited
+    assert real_stream.closed
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    ct.close()
+
+
+# --- Gemini `generate_content_stream` (a distinctly-NAMED streaming method,
+# not a manager and not a `stream=True` kwarg) -------------------------------
+# Confirmed (Phase 13 Step 0 probe against real `google-genai` 2.14.0):
+# `client.models.generate_content_stream(...)` returns a DIRECT iterator
+# (sync) — routed through the EXISTING raw-stream `_StreamProxy` via
+# `is_named_stream_method` (see `_ClientProxy.__getattr__`), exactly like
+# `create(stream=True)` on the other providers. `client.aio.models.
+# generate_content_stream(...)` IS itself a coroutine function (unlike the
+# `.stream()` manager helpers) that resolves, once awaited, to an async
+# iterator — so it flows through the same await-then-check-stream branch
+# `create(stream=True)` already uses on an async client. `usage_metadata` is
+# CUMULATIVE (confirmed): each chunk already carries the running totals, so
+# `GeminiAdapter.accumulate_stream_usage` OVERWRITES `state` each time —
+# last chunk wins, never a sum.
+
+
+class _GeminiUsage:
+    def __init__(self, prompt_token_count, candidates_token_count, total_token_count):
+        self.prompt_token_count = prompt_token_count
+        self.candidates_token_count = candidates_token_count
+        self.total_token_count = total_token_count
+
+
+class _GeminiChunk:
+    """Stand-in for a streamed `GenerateContentResponse` chunk."""
+    def __init__(self, text, usage_metadata=None):
+        self.text = text
+        self.usage_metadata = usage_metadata
+
+
+class _FakeGeminiModelsWithStream(_FakeModels):
+    """Adds `generate_content_stream` (a DIRECT iterator, not a manager) to
+    the existing `_FakeModels` fake used for the non-streaming gemini
+    tests."""
+    def __init__(self):
+        super().__init__()
+        self.stream_calls = []
+        self.next_stream = None
+
+    def generate_content_stream(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        return iter(self.next_stream)
+
+
+class _FakeGeminiClientWithStream:
+    __module__ = "google.genai.client"
+    def __init__(self): self.models = _FakeGeminiModelsWithStream()
+
+
+def test_gemini_stream_records_once_with_cumulative_usage_last_wins(tmp_path):
+    """A real-shaped Gemini stream: every chunk reaches the caller unchanged
+    and in order, and the recorded usage is the LAST chunk's cumulative
+    totals — never a sum of the two chunks' counts."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithStream()
+    wrapped = t.wrap(client)
+    chunks = [
+        _GeminiChunk("Hello", _GeminiUsage(10, 1, 11)),
+        _GeminiChunk(" there!", _GeminiUsage(10, 5, 15)),
+    ]
+    client.models.next_stream = chunks
+
+    stream = wrapped.models.generate_content_stream(
+        model="gemini-2.0-flash", contents="hi")
+    received = list(stream)
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {
+        "prompt_token_count": 10, "candidates_token_count": 5, "total_token_count": 15,
+    }
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert any(b.block.text == "hi" for b in blocks)
+    ct.close()
+
+
+def test_gemini_stream_no_usage_records_usage_none_not_a_crash(tmp_path):
+    """A chunk with no `usage_metadata` at all still passes through fine;
+    the call is recorded with usage=None, not a crash."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithStream()
+    wrapped = t.wrap(client)
+    client.models.next_stream = [_GeminiChunk("Hello"), _GeminiChunk(" there")]
+
+    stream = wrapped.models.generate_content_stream(
+        model="gemini-2.0-flash", contents="hi")
+    assert len(list(stream)) == 2
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None
+    ct.close()
+
+
+def test_gemini_stream_fail_open_accumulate_raises_chunks_still_delivered(tmp_path, monkeypatch):
+    """A raising `accumulate_stream_usage` must never interrupt delivery —
+    same hardest fail-open constraint as the other providers' streams."""
+    from ctxdiff.capture.gemini import GeminiAdapter
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithStream()
+    wrapped = t.wrap(client)
+    chunks = [_GeminiChunk("hi", _GeminiUsage(1, 1, 2))]
+    client.models.next_stream = chunks
+    monkeypatch.setattr(GeminiAdapter, "accumulate_stream_usage",
+                        lambda self, chunk, state: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    stream = wrapped.models.generate_content_stream(model="gemini-2.0-flash", contents="hi")
+    received = list(stream)
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_calls()[0].usage is None
+    ct.close()
+
+
+def test_gemini_stream_fail_open_record_raises_iteration_still_completes(tmp_path, monkeypatch):
+    """A broken recorder must never break the caller's own iteration."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithStream()
+    wrapped = t.wrap(client)
+    chunks = [_GeminiChunk("hi", _GeminiUsage(1, 1, 2))]
+    client.models.next_stream = chunks
+    monkeypatch.setattr(t._recorder, "record",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("record boom")))
+
+    stream = wrapped.models.generate_content_stream(model="gemini-2.0-flash", contents="hi")
+    received = list(stream)
+    assert received == chunks
+    t.close()
+
+
+class _AsyncGeminiChunkIterator:
+    """Stand-in for the async iterator google-genai's async
+    `generate_content_stream` resolves to once awaited (confirmed via Phase
+    13 Step 0 probe: the method itself is a coroutine function, unlike the
+    `.stream()` manager helpers)."""
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self._i = 0
+
+    def __aiter__(self): return self
+
+    async def __anext__(self):
+        if self._i >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._i]
+        self._i += 1
+        return chunk
+
+
+class _FakeAsyncGeminiModelsWithStream(_FakeAsyncModels):
+    """`generate_content_stream` here is itself `async def` — confirmed
+    against the real SDK (`inspect.iscoroutinefunction` is True on
+    `AsyncModels.generate_content_stream`) — resolving to an async iterator
+    once awaited, not an async-generator function called directly."""
+    def __init__(self):
+        super().__init__()
+        self.next_stream = None
+
+    async def generate_content_stream(self, **kwargs):
+        await asyncio.sleep(0)
+        return _AsyncGeminiChunkIterator(self.next_stream)
+
+
+class _FakeAsyncGeminiNamespaceWithStream:
+    def __init__(self): self.models = _FakeAsyncGeminiModelsWithStream()
+
+
+class _FakeGeminiClientWithAioStream:
+    __module__ = "google.genai.client"
+    def __init__(self):
+        self.models = _FakeGeminiModelsWithStream()
+        self.aio = _FakeAsyncGeminiNamespaceWithStream()
+
+
+def test_gemini_async_stream_records_once_with_cumulative_usage(tmp_path):
+    """`await client.aio.models.generate_content_stream(...)` then `async
+    for` over the result — async mirror of
+    `test_gemini_stream_records_once_with_cumulative_usage_last_wins`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithAioStream()
+    wrapped = t.wrap(client)
+    chunks = [
+        _GeminiChunk("Hi", _GeminiUsage(4, 1, 5)),
+        _GeminiChunk("!", _GeminiUsage(4, 2, 6)),
+    ]
+    client.aio.models.next_stream = chunks
+
+    async def run():
+        stream = await wrapped.aio.models.generate_content_stream(
+            model="gemini-2.0-flash", contents="hi async")
+        return [c async for c in stream]
+
+    received = asyncio.run(run())
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {
+        "prompt_token_count": 4, "candidates_token_count": 2, "total_token_count": 6,
+    }
+    ct.close()
+
+
+def test_gemini_async_stream_fail_open_accumulate_raises(tmp_path, monkeypatch):
+    """Async mirror of the sync fail-open accumulate test."""
+    from ctxdiff.capture.gemini import GeminiAdapter
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithAioStream()
+    wrapped = t.wrap(client)
+    chunks = [_GeminiChunk("hi", _GeminiUsage(1, 1, 2))]
+    client.aio.models.next_stream = chunks
+    monkeypatch.setattr(GeminiAdapter, "accumulate_stream_usage",
+                        lambda self, chunk, state: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    async def run():
+        stream = await wrapped.aio.models.generate_content_stream(
+            model="gemini-2.0-flash", contents="hi")
+        return [c async for c in stream]
+
+    received = asyncio.run(run())
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_calls()[0].usage is None
+    ct.close()

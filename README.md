@@ -76,7 +76,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 
 **What it doesn't do (yet):**
 
-- ⏳ **Gemini/Bedrock streaming usage** — `generate_content_stream`/`converse_stream` calls are separate, not-yet-wrapped methods; use the non-streaming `generate_content`/`converse` if you need usage from these two providers today. (OpenAI chat+Responses and Anthropic streaming usage ARE captured — see [Streaming usage](#streaming-usage) below.)
+- ⏳ **Gemini/Bedrock streaming usage** — `generate_content_stream`/`converse_stream` calls are separate, not-yet-wrapped methods; use the non-streaming `generate_content`/`converse` if you need usage from these two providers today. (OpenAI chat+Responses and Anthropic streaming usage ARE captured, including the `.stream()` convenience-manager helpers — see [Streaming usage](#streaming-usage) below.)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
 - ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
@@ -353,6 +353,22 @@ Whether usage is actually captured depends on what the provider puts on the wire
 - **Gemini** (`generate_content_stream`) and **Bedrock** (`converse_stream`) are separate, not-yet-wrapped methods — use the non-streaming call if you need usage from these two today.
 
 A stream you never fully consume, close, or use as a context manager still gets recorded, best-effort, on garbage collection — with whatever usage was accumulated before you moved on (possibly none).
+
+The `.stream()` convenience-manager helpers — the style each provider's own docs actually recommend — are captured the same way, sync and async:
+
+```python
+with client.messages.stream(model="claude-opus-4-8", max_tokens=1024, messages=[...]) as stream:
+    for event in stream:
+        ...  # your code sees every event, unmodified
+
+with client.chat.completions.stream(model="gpt-4o", messages=[...]) as stream:
+    ...
+
+with client.responses.stream(model="gpt-4o", input="...") as stream:
+    ...
+```
+
+`Anthropic.messages.stream`, OpenAI's `chat.completions.stream`, and OpenAI's `responses.stream` all work this way — `with`/`async with client.messages.stream(...) as stream:` — nothing is recorded until you actually enter the block (that's when the provider request fires), and the same usage rules above apply (Anthropic/Responses unconditional, Chat Completions needs your own `stream_options={"include_usage": True}`). Gemini/Bedrock stream methods are still not wrapped, same as the raw `stream=True` path above.
 
 ### Semantic tagging
 

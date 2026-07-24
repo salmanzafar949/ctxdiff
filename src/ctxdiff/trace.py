@@ -16,7 +16,20 @@ see `_StreamProxy` for the full completion contract). Blocks/params still
 come from `kwargs` exactly as before; only usage now flows from the stream
 instead of a completed response. `stream=True` is a reliable signal read
 straight off the request kwargs — deliberately NOT duck-typed off the
-response shape, which would be fragile and provider-specific."""
+response shape, which would be fragile and provider-specific.
+
+`.stream()` convenience helpers (Anthropic's `messages.stream`, OpenAI's
+`chat.completions.stream`/`responses.stream` — the `with client.messages.
+stream(...) as stream:` context-manager style the providers' own docs
+recommend): these are a SEPARATE completion method per adapter (its own
+`create_paths` entry ending in "stream"), resolved by `_ClientProxy` exactly
+like `create` — but they return a StreamManager, not a stream, so
+`_make_interceptor` wraps THAT in `_StreamManagerProxy`/
+`_AsyncStreamManagerProxy` instead. The manager makes no request at all until
+`__enter__`/`__aenter__`; once entered, the real stream it hands back is
+wrapped in the SAME `_StreamProxy`/`_AsyncStreamProxy` used for
+`create(stream=True)`, so all usage-accumulation/finalize-once/fail-open
+machinery is shared, not duplicated."""
 from __future__ import annotations
 
 import inspect
@@ -334,7 +347,37 @@ class _ClientProxy:
         new_path = path + (name,)
 
         if new_path in create_paths:
-            return _make_interceptor(attr, tracer, recorder, agent, provider, adapter)
+            # Two DIFFERENT "this method always streams" shapes share the
+            # generic "path segment says so" signal but need different
+            # wrapping, distinguished by the LAST path segment's exact text:
+            #
+            # - Exactly "stream" (Anthropic's `messages.stream`, OpenAI's
+            #   `chat.completions.stream`/`responses.stream`) is a `.stream()`
+            #   CONVENIENCE-MANAGER helper — it returns a context-manager
+            #   object (a `MessageStreamManager`/`ChatCompletionStreamManager`
+            #   /...) whose `__enter__`/`__aenter__` is what actually fires
+            #   the real HTTP request, not the `.stream()` call itself. Routed
+            #   to `_StreamManagerProxy`/`_AsyncStreamManagerProxy`.
+            # - Ends WITH "stream" but ISN'T literally "stream" (Gemini's
+            #   `generate_content_stream` — confirmed via Phase 13 Step 0
+            #   probe against real `google-genai`) is a distinctly-NAMED
+            #   method (no `stream=True` kwarg exists for it) that returns a
+            #   DIRECT iterator/async-iterator, not a manager — closer in
+            #   shape to `create(stream=True)` than to `.stream()`. Routed
+            #   through the EXISTING raw-stream path in `_make_interceptor`
+            #   (`_StreamProxy`/`_AsyncStreamProxy`) by `is_named_stream_
+            #   method`, which that path treats as equivalent to a truthy
+            #   `stream` kwarg (there is no kwarg to read here at all).
+            #
+            # Both are STRUCTURAL signals read off the path the proxy itself
+            # resolved (which method the caller is invoking) — never
+            # duck-typed off the eventual return value.
+            last = new_path[-1]
+            is_manager = last == "stream"
+            is_named_stream_method = last != "stream" and last.endswith("stream")
+            return _make_interceptor(attr, tracer, recorder, agent, provider, adapter,
+                                     is_manager=is_manager,
+                                     is_named_stream_method=is_named_stream_method)
         # Is new_path a prefix of ANY create path? If so keep wrapping
         # (carrying this wrap's recording context down to the completion
         # method that new_path is heading towards).
@@ -375,12 +418,35 @@ class _ClientProxy:
 
 def _make_interceptor(real_create: Callable, tracer: "Tracer",
                       recorder: "Recorder", agent: str | None,
-                      provider: str | None, adapter: object) -> Callable:
+                      provider: str | None, adapter: object,
+                      is_manager: bool = False,
+                      is_named_stream_method: bool = False) -> Callable:
     """Wrap the provider's completion method: call the REAL method first
     (never delaying or altering the host's request/response), measure latency,
     then hand the (kwargs, response) to the tracer along with this wrap's
     recorder/agent/provider. On host error, record the failed call and re-raise
     the host's exception unchanged.
+
+    `is_manager` (set by `_ClientProxy.__getattr__` whenever the matched
+    create path's LAST segment is "stream"): the intercepted method is a
+    `.stream()` convenience helper (Anthropic's `messages.stream`, OpenAI's
+    `chat.completions.stream`/`responses.stream`), not a plain completion
+    call. Confirmed empirically (Phase 13 Step 0 probe against real
+    `anthropic`/`openai` SDKs) that these methods are ALWAYS plain, non-
+    coroutine functions — even on an async client (`AsyncAnthropic().
+    messages.stream(...)` returns its manager synchronously, with no
+    `await` needed) — and that calling them makes NO HTTP request at all;
+    the manager they return just closes over the request kwargs and defers
+    the real request to `__enter__`/`__aenter__`. So the manager branch
+    below is checked FIRST, before any of the awaitable/sync/raw-stream
+    logic that follows (none of which applies to a `.stream()` call): the
+    manager comes back from `real_create` directly, gets wrapped in
+    `_StreamManagerProxy`/`_AsyncStreamManagerProxy` (chosen by duck-typing
+    the manager's OWN `__aenter__`/`__enter__` — the only reliable signal
+    available, since sync-vs-async can't be read off awaitability here the
+    way the rest of this function does it), and returned immediately with
+    NOTHING recorded yet — recording happens once the caller actually
+    enters the `with`/`async with` block (see those classes' docstrings).
 
     Async-aware via CALL-TIME awaitable detection, not definition-time
     `inspect.iscoroutinefunction`: `AsyncOpenAI`/`AsyncAnthropic` (and any
@@ -398,13 +464,26 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
     otherwise the original synchronous record-and-return path below runs
     unchanged, so sync clients pay zero extra cost or behavior change.
 
-    Streaming (`kwargs.get("stream")` truthy): checked AFTER the real result
-    is in hand (post-await, for an async SDK) rather than duck-typed off the
-    result's shape — `stream` is the caller's own, unambiguous signal for
-    what they asked the provider for. A truthy result routes to
-    `_StreamProxy`/`_AsyncStreamProxy` instead of recording immediately; see
-    the module docstring for why (usage isn't on the stream yet at this
-    point — only later, as chunks are consumed)."""
+    Streaming (`kwargs.get("stream")` truthy OR `is_named_stream_method`):
+    checked AFTER the real result is in hand (post-await, for an async SDK)
+    rather than duck-typed off the result's shape. `kwargs.get("stream")` is
+    the caller's own, unambiguous signal for what they asked the provider
+    for on OpenAI/Anthropic's `create()`. `is_named_stream_method` (set by
+    `_ClientProxy.__getattr__` whenever the matched path's last segment ends
+    with, but isn't exactly, "stream") is the equivalent signal for a
+    provider like Gemini whose streaming call is a DIFFERENTLY-NAMED method
+    (`generate_content_stream`) rather than a kwarg — there is no `stream`
+    kwarg to read at all, so the path itself is the only available signal,
+    read once at proxy-resolution time rather than duck-typed off the
+    result. Either signal routes to `_StreamProxy`/`_AsyncStreamProxy`
+    instead of recording immediately; see the module docstring for why
+    (usage isn't on the stream yet at this point — only later, as chunks
+    are consumed). Confirmed (Phase 13 Step 0 probe) that Gemini's async
+    `generate_content_stream` IS a coroutine function (unlike the `.stream()`
+    manager helpers) — `await client.aio.models.generate_content_stream(...)`
+    — so it flows through the EXISTING awaitable branch below unchanged,
+    only needing the `is_named_stream_method` check added alongside
+    `kwargs.get("stream")` post-await."""
     def interceptor(*args, **kwargs):
         """Stand in for the provider's completion method. What: times and
         forwards the call unchanged, reports it to the tracer, and returns
@@ -419,6 +498,19 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
         hands off to `_record_after_await` (below) instead of recording now
         — recording an async call before it has actually run would report a
         call that hasn't happened yet, with no response/usage to extract."""
+        if is_manager:
+            # `.stream()` itself makes no HTTP request (see the enclosing
+            # docstring) — any exception here is a pure construction-time
+            # failure (e.g. bad kwargs) with no request ever attempted, so
+            # there is nothing meaningful to record; just let it propagate
+            # exactly as it would unwrapped.
+            manager = real_create(*args, **kwargs)
+            if hasattr(manager, "__aenter__"):
+                return _AsyncStreamManagerProxy(manager, kwargs, tracer, recorder,
+                                                agent, provider, adapter)
+            return _StreamManagerProxy(manager, kwargs, tracer, recorder,
+                                       agent, provider, adapter)
+
         start = time.perf_counter()
         try:
             result = real_create(*args, **kwargs)
@@ -448,7 +540,7 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
                     tracer._on_create(kwargs, None, latency_ms, type(exc).__name__,
                                       recorder, agent, provider)
                     raise
-                if kwargs.get("stream"):
+                if kwargs.get("stream") or is_named_stream_method:
                     return _AsyncStreamProxy(response, kwargs, tracer, recorder,
                                              agent, provider, adapter, start)
                 latency_ms = int((time.perf_counter() - start) * 1000)
@@ -457,7 +549,7 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
                 return response
             return _record_after_await()
 
-        if kwargs.get("stream"):
+        if kwargs.get("stream") or is_named_stream_method:
             return _StreamProxy(result, kwargs, tracer, recorder,
                                 agent, provider, adapter, start)
 
@@ -472,16 +564,17 @@ def _accumulate_stream_usage(adapter: object, chunk: object, state: dict) -> Non
     """Fold one streamed chunk's usage into `state` via the adapter's
     OPTIONAL `accumulate_stream_usage` (see `capture/base.py`'s Adapter
     Protocol). Looked up with `getattr(..., None)` rather than assumed
-    present: Gemini/Bedrock's adapters don't define it (their streaming
-    methods — `generate_content_stream`/`converse_stream` — are separate,
-    out-of-scope create paths this pass), so a stream wrapped for one of
-    those providers simply never accumulates usage; `state` stays empty and
-    the eventual recorded call gets `usage=None`, same as not capturing
-    streaming at all. When the method IS present, the call is wrapped in its
-    own try/except — on top of every provider adapter already being
-    defensive internally — so a raise here can NEVER interrupt the caller's
-    own chunk-by-chunk iteration; this is the hardest constraint on the whole
-    streaming feature (see module docstring)."""
+    present: Bedrock's adapter doesn't define it (its streaming method —
+    `converse_stream` — is a separate, still out-of-scope create path), so a
+    stream wrapped for that provider simply never accumulates usage; `state`
+    stays empty and the eventual recorded call gets `usage=None`, same as not
+    capturing streaming at all. OpenAI, Anthropic, and Gemini all define it
+    (Gemini's `generate_content_stream` is now covered too — Phase 13). When
+    the method IS present, the call is wrapped in its own try/except — on
+    top of every provider adapter already being defensive internally — so a
+    raise here can NEVER interrupt the caller's own chunk-by-chunk
+    iteration; this is the hardest constraint on the whole streaming feature
+    (see module docstring)."""
     accumulate = getattr(adapter, "accumulate_stream_usage", None)
     if accumulate is None:
         return
@@ -495,16 +588,28 @@ def _accumulate_stream_usage(adapter: object, chunk: object, state: dict) -> Non
 class _SyntheticStreamResponse:
     """Stands in for a completed `response` at RECORD time for a call that
     was actually a stream — it carries nothing but the usage accumulated
-    across the stream's chunks, exposed as `.usage`, an ATTRIBUTE-based
-    object (not the raw dict) because every adapter's `extract_usage` duck-
-    types `response.usage.<field>` via `getattr`. Routing accumulated stream
-    usage through THIS shape, into the SAME `extract_usage` code path a
+    across the stream's chunks, exposed as an ATTRIBUTE-based object (not the
+    raw dict) because every adapter's `extract_usage` duck-types
+    `response.<attr>.<field>` via `getattr`. Routing accumulated stream usage
+    through THIS shape, into the SAME `extract_usage` code path a
     non-streaming call already uses, means there is no second, parallel
     usage-shaping path to keep in sync — a stream-derived call's stored
     `usage` dict is byte-for-byte what a non-streaming call's would have
-    been, for the same accumulated numbers."""
+    been, for the same accumulated numbers.
+
+    Exposed under BOTH `.usage` (OpenAI's/Anthropic's `extract_usage` reads
+    `response.usage`) AND `.usage_metadata` (Gemini's `extract_usage` reads
+    `response.usage_metadata` instead — confirmed the mismatch empirically,
+    Phase 13: without this, a Gemini stream's accumulated usage silently
+    vanished at record time even though accumulation itself worked
+    correctly) — both names point at the SAME namespace object, so whichever
+    attribute a given adapter's `extract_usage` happens to duck-type off of,
+    it finds the right data; neither adapter needs to know the other
+    exists."""
     def __init__(self, state: dict):
-        self.usage = types.SimpleNamespace(**state)
+        ns = types.SimpleNamespace(**state)
+        self.usage = ns
+        self.usage_metadata = ns
 
 
 def _finalize_stream_call(kwargs: dict, state: dict, start: float, tracer: "Tracer",
@@ -797,3 +902,138 @@ class _AsyncStreamProxy:
             self._finalize(quiet=True)
         except BaseException:  # noqa: BLE001 — __del__ must never raise or spew
             pass
+
+
+class _StreamManagerProxy:
+    """Wraps the StreamManager object returned by a `.stream()` convenience
+    helper (Anthropic's `messages.stream`, OpenAI's `chat.completions.
+    stream`/`responses.stream`) — used as `with client.messages.stream(...)
+    as stream: ...`. Confirmed empirically (Phase 13 Step 0 probe) that
+    `.stream()` itself never makes an HTTP request and is never awaitable,
+    even on an async client: the manager it returns just closes over the
+    request kwargs, deferring the ACTUAL request to `__enter__`. So
+    `_make_interceptor` hands this proxy straight back from the `.stream()`
+    call with nothing recorded yet — there's nothing to record until the
+    caller enters the `with` block.
+
+    `__enter__` calls the REAL manager's `__enter__` (this is where the
+    request actually fires) with the latency clock starting right before
+    that call, mirroring how the raw `create(stream=True)` path starts its
+    own clock right before ITS real request. The real stream `__enter__`
+    hands back is wrapped in the EXISTING `_StreamProxy` — reusing its
+    usage-accumulation / finalize-once / fail-open machinery completely
+    unchanged; this class adds nothing but the extra manager layer around
+    it. A host error raised by the real `__enter__` (the request itself
+    failing) is recorded as a failed call as usual, then re-raised
+    unchanged — the caller's problem, not swallowed.
+
+    `__exit__` does NOT close the real stream a second time via the wrapped
+    stream (that would double-close the SAME underlying HTTP response the
+    real manager's own `__exit__` already closes): it forwards to the real
+    manager's `__exit__` first — closing exactly like unwrapped usage would
+    — THEN calls the wrapped stream's `_finalize()` directly (not `.close()`
+    /`.__exit__()`, which would try to close again). Reusing `_StreamProxy`'s
+    own `_finalized` guard this way means the call is recorded exactly once
+    regardless of whether the caller already exhausted the stream inside the
+    `with` block (which finalizes from `_StreamProxy.__next__` on
+    `StopIteration`/mid-error) or exited early instead."""
+
+    def __init__(self, manager: object, kwargs: dict, tracer: "Tracer",
+                 recorder: "Recorder", agent: str | None, provider: str | None,
+                 adapter: object):
+        object.__setattr__(self, "_ctx_manager", manager)
+        object.__setattr__(self, "_ctx_kwargs", kwargs)
+        object.__setattr__(self, "_ctx_tracer", tracer)
+        object.__setattr__(self, "_ctx_recorder", recorder)
+        object.__setattr__(self, "_ctx_agent", agent)
+        object.__setattr__(self, "_ctx_provider", provider)
+        object.__setattr__(self, "_ctx_adapter", adapter)
+        object.__setattr__(self, "_ctx_wrapped_stream", None)
+
+    def __getattr__(self, name: str):
+        """Pass through to the wrapped manager — same transparency contract
+        as `_StreamProxy.__getattr__`/`_ClientProxy.__getattr__`."""
+        return getattr(object.__getattribute__(self, "_ctx_manager"), name)
+
+    def __enter__(self):
+        start = time.perf_counter()
+        try:
+            real_stream = self._ctx_manager.__enter__()
+        except Exception as exc:  # the REAL request, fired here, failed
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            self._ctx_tracer._on_create(self._ctx_kwargs, None, latency_ms,
+                                        type(exc).__name__, self._ctx_recorder,
+                                        self._ctx_agent, self._ctx_provider)
+            raise
+        wrapped = _StreamProxy(real_stream, self._ctx_kwargs, self._ctx_tracer,
+                              self._ctx_recorder, self._ctx_agent, self._ctx_provider,
+                              self._ctx_adapter, start)
+        object.__setattr__(self, "_ctx_wrapped_stream", wrapped)
+        return wrapped
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Forward to the real manager's own `__exit__` (closes the real
+        stream, same as unwrapped usage) inside a `finally` so a raise from
+        it still lets the wrapped stream's finalize run — mirroring
+        `_StreamProxy.close()`'s own `finally`-guarded forwarding. `suppress`
+        is only read on the non-raising path (see that method's docstring
+        for why an exception here skips straight past it)."""
+        try:
+            real_exit = getattr(self._ctx_manager, "__exit__", None)
+            suppress = real_exit(exc_type, exc, tb) if callable(real_exit) else False
+        finally:
+            wrapped = self._ctx_wrapped_stream
+            if wrapped is not None:
+                wrapped._finalize()
+        return bool(suppress)
+
+
+class _AsyncStreamManagerProxy:
+    """Async mirror of `_StreamManagerProxy` — see its docstring for the full
+    contract (nothing recorded until `__aenter__`, real error fired there is
+    recorded then re-raised, `__aexit__` forwards to the real manager then
+    finalizes the wrapped stream directly rather than double-closing).
+    Used for `async with client.messages.stream(...) as stream:` /
+    `async with client.chat.completions.stream(...) as stream:` /
+    `async with client.responses.stream(...) as stream:`."""
+
+    def __init__(self, manager: object, kwargs: dict, tracer: "Tracer",
+                 recorder: "Recorder", agent: str | None, provider: str | None,
+                 adapter: object):
+        object.__setattr__(self, "_ctx_manager", manager)
+        object.__setattr__(self, "_ctx_kwargs", kwargs)
+        object.__setattr__(self, "_ctx_tracer", tracer)
+        object.__setattr__(self, "_ctx_recorder", recorder)
+        object.__setattr__(self, "_ctx_agent", agent)
+        object.__setattr__(self, "_ctx_provider", provider)
+        object.__setattr__(self, "_ctx_adapter", adapter)
+        object.__setattr__(self, "_ctx_wrapped_stream", None)
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_ctx_manager"), name)
+
+    async def __aenter__(self):
+        start = time.perf_counter()
+        try:
+            real_stream = await self._ctx_manager.__aenter__()
+        except Exception as exc:  # the REAL request, fired here, failed
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            self._ctx_tracer._on_create(self._ctx_kwargs, None, latency_ms,
+                                        type(exc).__name__, self._ctx_recorder,
+                                        self._ctx_agent, self._ctx_provider)
+            raise
+        wrapped = _AsyncStreamProxy(real_stream, self._ctx_kwargs, self._ctx_tracer,
+                                    self._ctx_recorder, self._ctx_agent, self._ctx_provider,
+                                    self._ctx_adapter, start)
+        object.__setattr__(self, "_ctx_wrapped_stream", wrapped)
+        return wrapped
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        try:
+            real_aexit = getattr(self._ctx_manager, "__aexit__", None)
+            suppress = await real_aexit(exc_type, exc, tb) if callable(real_aexit) else False
+        finally:
+            wrapped = self._ctx_wrapped_stream
+            if wrapped is not None:
+                wrapped._finalize()
+        return bool(suppress)

@@ -3,7 +3,7 @@
 Public surface is deliberately tiny: `from ctxdiff import trace`, then
 `trace.init(...)` and `tracer.wrap(client)`.
 """
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # __version__ must exist before this import: trace.py transitively imports
 # ctxdiff.store.ctrace, which does `from ctxdiff import __version__` at load time.

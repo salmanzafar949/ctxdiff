@@ -15,7 +15,16 @@ class AnthropicAdapter:
     """Normalize Anthropic messages requests into the block model."""
 
     provider = "anthropic"
-    create_path = ("messages", "create")
+    create_path = ("messages", "create")  # kept for backward compat
+    # `messages.stream(**kwargs)` (the `with client.messages.stream(...) as
+    # stream:` convenience helper) is a SECOND completion method sharing the
+    # exact same request/response shape as `messages.create` — confirmed
+    # empirically (Phase 13 Step 0 probe) that the events it yields
+    # (message_start/message_delta/...) are the SAME raw event objects a
+    # `create(stream=True)` call yields, so `accumulate_stream_usage` below
+    # needs no changes at all to also work for the manager-wrapped path (see
+    # trace.py's `_StreamManagerProxy`).
+    create_paths = (("messages", "create"), ("messages", "stream"))
 
     def extract_blocks(self, kwargs: dict) -> list[RawBlock]:
         """Flatten a request into ordered RawBlocks: the top-level `system`
