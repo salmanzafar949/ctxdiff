@@ -193,6 +193,41 @@ tracer.tag("rag", [retrievedDoc]);    // labels the NEXT call's matching blocks 
 
 `mark` is sticky across calls; `tag` applies to the next call only. Each is optional — a role-based heuristic labels everything else.
 
+**Per-async-context semantics.** `tag()` and `mark()` are scoped to the **current async context**, held in an [`AsyncLocalStorage`](https://nodejs.org/api/async_context.html) — not global tracer state. The interceptor snapshots the current tag/step **synchronously at call time** (before any `await`), so a plain fan-out where each branch labels then calls records correctly with no bleed:
+
+```ts
+await Promise.all(
+  docs.map(async (doc, i) => {
+    tracer.mark(`worker-${i}`);
+    tracer.tag("rag", [doc]);
+    await client.chat.completions.create({ model, messages: build(doc) }); // records worker-i / rag
+  }),
+);
+```
+
+The one hazard: if a branch `await`s **between** labeling and the call, concurrent siblings share the root store and a sibling's `mark()` can land in the gap and relabel it. For that — and any concurrent phase-labeling — use the scoped `step()` form, which gives each branch its **own** isolated context.
+
+**Scoped `step()` — the recommended concurrency-safe form.** Mirrors the Python `Tracer.step()` context manager. The callback form runs your block inside a fresh async context (via `AsyncLocalStorage.run`), so every call inside records `step=label` and nothing leaks into a sibling branch; a branch that opens no `step()` records `step=null`, never a sibling's leftover label:
+
+```ts
+// callback form — fully concurrency-safe, isolates each branch
+await Promise.all(
+  phases.map((p) => tracer.step(p.label, async () => {
+    await client.chat.completions.create({ model, messages: p.messages });
+  })),
+);
+
+// Disposable form (TS 5.2 `using`) — for sequential / single-context phases
+{
+  using _phase = tracer.step("answer");
+  await client.chat.completions.create({ model, messages });
+} // previous step restored on scope exit
+```
+
+Prefer the **callback form** under `Promise.all`; the `using` form uses `enterWith` and is leak-proof for sequential nesting but — like a bare `mark()` — can share state across branches started in the same tick. `step()` is fully reentrant: nested scopes restore the exact enclosing label on exit.
+
+> **Node note:** unlike the Python SDK, ctxdiff-js does no background writer thread — Node is single-threaded and `node:sqlite` writes stay synchronous on the main thread, so there's no cross-thread DB race to guard against. The concurrency fix here is purely the per-async-context tag/step isolation.
+
 ### Multi-agent runs
 
 ```ts

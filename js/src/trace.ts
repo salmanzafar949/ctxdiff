@@ -26,6 +26,7 @@
  * Gemini next phase means registering another entry in `REGISTRY` — nothing
  * here changes.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Adapter } from "./capture/base.js";
 import { OpenAIAdapter } from "./capture/openai.js";
 import { AnthropicAdapter } from "./capture/anthropic.js";
@@ -43,6 +44,18 @@ interface WrapContext {
   provider: string;
   adapter: Adapter;
   createPaths: string[][];
+}
+
+/**
+ * The per-async-context capture state that `tag()`/`mark()`/`step()` read and
+ * write. Held in an `AsyncLocalStorage` so each concurrent async operation sees
+ * its OWN pending tags + sticky step and can't cross-contaminate a sibling's
+ * attribution (see `Tracer`'s ALS docstring). `pendingTags` is one-shot (drained
+ * by the next recorded call); `step` is sticky within the context until changed.
+ */
+interface TagStore {
+  pendingTags: [string, string][];
+  step: string | null;
 }
 
 /** A provider entry: how to recognize a client and build its adapter. The
@@ -176,13 +189,40 @@ export class Tracer {
   private ct: CTrace | null = null;
   private firstRecorder: Recorder | null = null;
   private seq = 0; // monotonically increasing turn index across ALL agents
-  private step: string | null = null; // sticky step label (see mark())
-  private pendingTags: [string, string][] = []; // (label, needle) for next call
+
+  /**
+   * Per-async-context capture state — the core of the concurrency model.
+   *
+   * `tag()`/`mark()` used to live in instance fields, so under a `Promise.all`
+   * fan-out one call's tag/step would bleed into another and MISLABEL
+   * attribution — the worst failure mode for a debugger (confidently wrong).
+   * They now live in an `AsyncLocalStorage` store instead: `step(label, fn)`
+   * runs `fn` inside `als.run()` with a fresh store, so each concurrent branch
+   * gets its OWN pending tags + sticky step and mutations never escape into a
+   * sibling branch. (Node is single-threaded and `node:sqlite` writes stay
+   * synchronous on the main thread, so — unlike the Python port — there is no
+   * cross-thread DB race and no background writer thread is needed; the only
+   * real bug shared with Python was this tag/step interleaving.)
+   *
+   * `rootStore` is the fallback used when no `step()` scope is active (the
+   * common sequential case): `tag()`/`mark()` then behave EXACTLY as before —
+   * mark() sticky, tag() next-call-only — because everything shares this one
+   * store. It is per-Tracer (a Tracer is a once-per-run object), so a fresh run
+   * never inherits a leftover step/tag from a previous Tracer.
+   */
+  private als = new AsyncLocalStorage<TagStore>();
+  private rootStore: TagStore = { pendingTags: [], step: null };
 
   constructor(project: string, redact: RedactHook | null, path: string) {
     this.project = project;
     this.redact = redact;
     this.path = path;
+  }
+
+  /** The capture store for the CURRENT async context: the `step()` scope's
+   * store if one is active, else the shared `rootStore`. Never throws. */
+  private currentStore(): TagStore {
+    return this.als.getStore() ?? this.rootStore;
   }
 
   /**
@@ -227,41 +267,155 @@ export class Tracer {
   }
 
   /**
-   * Buffer semantic tags for the NEXT recorded call only. Each item is reduced
-   * to its text (string as-is, else a 'text'/'content' field, else String()) and
-   * paired with `label`; the recorder marks any block containing that text as
-   * `label`. Contrast mark(): tag() is next-call-only, mark() is sticky.
+   * Buffer semantic tags for the NEXT recorded call only, IN THE CURRENT ASYNC
+   * CONTEXT. Each item is reduced to its text (string as-is, else a
+   * 'text'/'content' field, else String()) and paired with `label`; the recorder
+   * marks any block containing that text as `label`. Contrast mark(): tag() is
+   * next-call-only (drained after one call), mark() is sticky.
+   *
+   * Concurrency: the pending tags live in an AsyncLocalStorage store, so a tag()
+   * inside one `step()` scope is visible ONLY to that scope's next recorded call
+   * — never a concurrent sibling's. Fail-open: a store failure is swallowed so a
+   * broken tag() can never break the host.
    */
   tag(label: string, items: unknown[]): void {
-    for (const item of items) {
-      let text: string;
-      if (typeof item === "string") {
-        text = item;
-      } else if (item && typeof item === "object") {
-        const o = item as Record<string, unknown>;
-        text = (o["text"] as string) || (o["content"] as string) || "";
-      } else {
-        text = String(item);
+    try {
+      const store = this.currentStore();
+      for (const item of items) {
+        let text: string;
+        if (typeof item === "string") {
+          text = item;
+        } else if (item && typeof item === "object") {
+          const o = item as Record<string, unknown>;
+          text = (o["text"] as string) || (o["content"] as string) || "";
+        } else {
+          text = String(item);
+        }
+        if (text) store.pendingTags.push([label, text]);
       }
-      if (text) this.pendingTags.push([label, text]);
+    } catch {
+      // fail-open: a tag() must never break the host
     }
   }
 
   /**
-   * Set the CURRENT step label stamped onto every subsequent recorded call —
-   * across ALL agents — until changed; `mark(null)` clears it. STICKY, unlike
-   * tag() which applies to the next call only.
+   * Set the sticky step label stamped onto every subsequent recorded call IN THE
+   * CURRENT ASYNC CONTEXT until changed; `mark(null)` clears it. STICKY (persists
+   * until the next mark()), unlike tag() which is next-call-only.
+   *
+   * SEMANTICS: the step is stored per async context, not in global tracer state,
+   * so "sticky" means sticky WITHIN THE CURRENT ASYNC CONTEXT. In sequential code
+   * this is IDENTICAL to the old behavior. Under concurrency it is only self-
+   * correct for a branch that runs inside its own `step()` scope (which gives it
+   * a private store). A bare `mark()` at the synchronous top of several
+   * `Promise.all` branches all mutate the SHARED root store and WILL bleed —
+   * exactly the mislabeling this change fixes. For concurrent fan-out prefer the
+   * scoped `step()` below, which isolates each branch. Fail-open.
    */
   mark(step: string | null): void {
-    this.step = step;
+    try {
+      this.currentStore().step = step;
+    } catch {
+      // fail-open: a mark() must never break the host
+    }
   }
 
   /**
-   * Interceptor callback: advance the turn counter, hand everything to the
-   * wrapping proxy's recorder (with its agent and the tracer's current sticky
-   * step), then clear pending tags. `seq` stays a single monotonic counter
-   * across ALL agents. Never throws — record is internally fail-open, but this
-   * wiring is guarded too so a replaced/broken record can't break the host.
+   * Scoped, concurrency-safe phase label — the RECOMMENDED way to label phases
+   * under concurrency. Two forms:
+   *
+   *   // callback (fully concurrency-safe — runs `fn` in its own async context)
+   *   await tracer.step("retrieve", async () => { ...calls... });
+   *
+   *   // Disposable (TS 5.2 `using`, for sequential/single-context phases)
+   *   { using _ = tracer.step("retrieve"); ...calls... }
+   *
+   * Every call recorded inside the scope carries `step=label`, and on exit the
+   * previous step is restored. Prefer the callback form under a `Promise.all`
+   * fan-out: it uses `AsyncLocalStorage.run()` to give the block a FRESH store
+   * (its own pending tags + step), so `tag()`/`mark()` inside one branch are
+   * isolated from every sibling branch — a branch that opens no `step()` scope
+   * records `step=null`, never a sibling's leftover label. The Disposable form
+   * uses `enterWith`, which is leak-proof for sequential nesting but — like a
+   * bare `mark()` — can share state across branches started synchronously in the
+   * same tick, so reach for the callback form when fanning out. Fully reentrant:
+   * nested scopes restore the exact enclosing state. Fail-open throughout.
+   */
+  step<T>(label: string | null, fn: () => T): T;
+  step(label: string | null): Disposable;
+  step<T>(label: string | null, fn?: () => T): T | Disposable {
+    // A fresh store for the scope: inherit the parent's pending tags (so a tag()
+    // set just before the scope still applies) but override the step to `label`.
+    // Because it's a new object, nothing written inside the scope escapes to the
+    // parent or a sibling branch.
+    let parentTags: [string, string][] = [];
+    try {
+      parentTags = [...this.currentStore().pendingTags];
+    } catch {
+      /* fail-open: fall back to empty */
+    }
+    const child: TagStore = { pendingTags: parentTags, step: label };
+
+    if (fn) {
+      // Callback form: run `fn` inside its own async context. als.run restores
+      // the previous store automatically when `fn` (and its awaited promise)
+      // settle — including on a synchronous throw — so nested/sibling scopes
+      // never see this one's state. Let als.run's throw propagate UNCHANGED:
+      // it is `fn`'s own error, and re-running `fn` in a catch would double
+      // its side effects. The only fail-open guard is around store SETUP
+      // above (parentTags), never around `fn` execution itself.
+      return this.als.run(child, fn);
+    }
+
+    // Disposable form: swap in the child store now and restore on dispose.
+    const previous = this.als.getStore();
+    try {
+      this.als.enterWith(child);
+    } catch {
+      /* fail-open: leave the store as-is */
+    }
+    let disposed = false;
+    return {
+      [Symbol.dispose]: (): void => {
+        if (disposed) return;
+        disposed = true;
+        try {
+          this.als.enterWith(previous ?? this.rootStore);
+        } catch {
+          /* fail-open: nothing to restore */
+        }
+      },
+    };
+  }
+
+  /**
+   * Drain the CURRENT async context's capture state for one recorded call.
+   * Called SYNCHRONOUSLY by the interceptor on the calling side — before any
+   * await that could cross into another context — so the returned tags/step
+   * belong to the branch that made the call, not whoever happens to be running
+   * when the async record later completes. Consumes the one-shot pending tags
+   * (clears them so they apply to exactly this one call) and reads the sticky
+   * step. Never throws: on any failure returns empty attribution (fail-open).
+   */
+  consumeContext(): { tags: [string, string][]; step: string | null } {
+    try {
+      const store = this.currentStore();
+      const tags = store.pendingTags;
+      store.pendingTags = [];
+      return { tags, step: store.step };
+    } catch {
+      return { tags: [], step: null };
+    }
+  }
+
+  /**
+   * Interceptor callback: advance the turn counter and hand everything to the
+   * wrapping proxy's recorder. `tags`/`step` are the attribution SNAPSHOTTED by
+   * the interceptor via `consumeContext()` at call time (never re-read here,
+   * which could run after an await in a different async context). `seq` stays a
+   * single monotonic counter across ALL agents. Never throws — record is
+   * internally fail-open, but this wiring is guarded too so a replaced/broken
+   * record can't break the host.
    */
   onCreate(args: {
     kwargs: Record<string, unknown>;
@@ -270,13 +424,12 @@ export class Tracer {
     error: string | null;
     recorder: Recorder | null;
     agent: string | null;
+    tags: [string, string][];
+    step: string | null;
     quiet?: boolean;
   }): void {
-    const { kwargs, response, latencyMs, error, recorder, agent, quiet = false } = args;
+    const { kwargs, response, latencyMs, error, recorder, agent, tags, step, quiet = false } = args;
     this.seq += 1;
-    const tags = this.pendingTags;
-    this.pendingTags = [];
-    const step = this.step;
     if (recorder !== null) {
       try {
         recorder.record({
@@ -376,6 +529,38 @@ function makeInterceptor(
         : {};
     const start = performance.now();
 
+    // Snapshot this call's attribution SYNCHRONOUSLY, on the calling side, before
+    // the real method's promise can settle in a different async context. This is
+    // what makes concurrent fan-out correct: whatever tag()/mark()/step() applied
+    // in THIS branch is captured here and threaded into every deferred record —
+    // never re-read after an await. Drains the one-shot pending tags.
+    const { tags, step } = ctx.tracer.consumeContext();
+
+    // Streaming if: a `.stream()` helper, a named streaming method (Gemini), or
+    // the caller's own `stream:true` kwarg. Any of these routes to the stream
+    // proxy, whose record is DEFERRED until the stream finishes iterating.
+    const streaming = isStreamHelper || isNamedStreamMethod || !!kwargs["stream"];
+
+    // Snapshot the request NOW for the deferred streaming record, on the SAME
+    // tick as consumeContext() — before the stream is handed back. The proxy
+    // records only after iteration ends, by which point the host may have
+    // mutated its own live `messages` array / params object (append an
+    // assistant placeholder to fill during streaming, or reuse it for the next
+    // turn). Recording off the live ref would then capture blocks that were
+    // never sent in THIS call. A deep clone freezes exactly what went out; the
+    // cloned text is identical, so tag() needle-matching still resolves.
+    // Fail-open: if the payload isn't structured-cloneable, fall back to the
+    // live ref rather than throw into the host. Non-streaming needs no snapshot
+    // — it records synchronously in `.then`/on return, before the host resumes.
+    let streamKwargs: Record<string, unknown> = kwargs;
+    if (streaming) {
+      try {
+        streamKwargs = structuredClone(kwargs);
+      } catch {
+        streamKwargs = kwargs;
+      }
+    }
+
     let result: unknown;
     try {
       result = realFn(...args);
@@ -389,20 +574,18 @@ function makeInterceptor(
         error: errName(exc),
         recorder: ctx.recorder,
         agent: ctx.agent,
+        tags,
+        step,
       });
       throw exc;
     }
 
-    // Streaming if: a `.stream()` helper, a named streaming method (Gemini), or
-    // the caller's own `stream:true` kwarg. Any of these routes to the stream
-    // proxy instead of recording immediately.
-    const streaming = isStreamHelper || isNamedStreamMethod || !!kwargs["stream"];
-
     if (isThenable(result)) {
-      // create()/create({stream:true}) — returns a Promise. Record after await.
+      // create()/create({stream:true}) — returns a Promise. Record after await,
+      // but with the tags/step SNAPSHOTTED above (not re-read post-await).
       return result.then(
         (resolved: unknown) => {
-          if (streaming) return wrapStream(resolved, kwargs, ctx, start);
+          if (streaming) return wrapStream(resolved, streamKwargs, ctx, start, tags, step);
           const latencyMs = Math.round(performance.now() - start);
           ctx.tracer.onCreate({
             kwargs,
@@ -411,6 +594,8 @@ function makeInterceptor(
             error: null,
             recorder: ctx.recorder,
             agent: ctx.agent,
+            tags,
+            step,
           });
           return resolved;
         },
@@ -423,6 +608,8 @@ function makeInterceptor(
             error: errName(exc),
             recorder: ctx.recorder,
             agent: ctx.agent,
+            tags,
+            step,
           });
           throw exc; // host's own async error — re-raised unchanged
         },
@@ -430,7 +617,7 @@ function makeInterceptor(
     }
 
     // Synchronous return — the `.stream()` helper hands back its stream directly.
-    if (streaming) return wrapStream(result, kwargs, ctx, start);
+    if (streaming) return wrapStream(result, streamKwargs, ctx, start, tags, step);
 
     // Non-streaming sync return (unusual for openai) — record now.
     const latencyMs = Math.round(performance.now() - start);
@@ -441,6 +628,8 @@ function makeInterceptor(
       error: null,
       recorder: ctx.recorder,
       agent: ctx.agent,
+      tags,
+      step,
     });
     return result;
   };
@@ -471,6 +660,8 @@ function wrapStream(
   kwargs: Record<string, unknown>,
   ctx: WrapContext,
   start: number,
+  tags: [string, string][],
+  step: string | null,
 ): unknown {
   // If the returned value isn't actually a stream (defensive), record it as a
   // plain response and return unchanged rather than risk breaking the caller.
@@ -488,6 +679,8 @@ function wrapStream(
       error: null,
       recorder: ctx.recorder,
       agent: ctx.agent,
+      tags,
+      step,
     });
     return stream;
   }
@@ -521,6 +714,8 @@ function wrapStream(
         error,
         recorder: ctx.recorder,
         agent: ctx.agent,
+        tags,
+        step,
       });
     } catch {
       // fail-open: finalize must never throw into a completion path

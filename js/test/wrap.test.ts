@@ -159,6 +159,71 @@ describe("wrap: streaming via create({stream:true})", () => {
   });
 });
 
+describe("wrap: streaming snapshots the request at call time", () => {
+  // Regression: the deferred streaming record used to read the host's LIVE
+  // request object at finalize (after the stream drained), so a host that
+  // mutated its own messages array mid-stream (rewrite the turn, append an
+  // assistant placeholder to fill while streaming, reuse it next turn) got
+  // blocks recorded that were NEVER sent in this call. The interceptor now
+  // deep-clones the request synchronously at call time, so finalize records
+  // exactly what went out. FAILS pre-fix (records MUTATED/INJECTED), passes now.
+  it("records what was SENT even if the host mutates the array before consuming the stream", async () => {
+    const path = tmpTrace();
+    const client = stubClient(() =>
+      sseResponse([
+        {
+          id: "1",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+        },
+        {
+          id: "1",
+          object: "chat.completion.chunk",
+          choices: [],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        },
+      ]),
+    );
+    const tracer = init("proj", { path });
+    const wrapped = tracer.wrap(client) as OpenAI;
+
+    // The host's LIVE array — the object it will mutate mid-stream.
+    const messages: { role: "user" | "assistant"; content: string }[] = [
+      { role: "user", content: "ORIGINAL" },
+    ];
+    // A tag whose needle points at the ORIGINAL text: proves needle-matching
+    // still resolves against the snapshot (not the mutated live ref).
+    tracer.tag("the-question", ["ORIGINAL"]);
+
+    const stream = await wrapped.chat.completions.create({
+      model: "gpt-4o",
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    // Host mutates its own request BEFORE consuming the stream.
+    messages[0].content = "MUTATED";
+    messages.push({ role: "assistant", content: "INJECTED" });
+
+    for await (const _chunk of stream) {
+      void _chunk;
+    }
+    tracer.close();
+
+    const r = CTrace.open(path);
+    const calls = r.getCalls();
+    expect(calls).toHaveLength(1);
+    const cbs = r.getCallBlocks(calls[0].id);
+    // Exactly what was sent — no MUTATED text, no INJECTED assistant block.
+    expect(cbs.map((cb) => cb.block.text)).toEqual(["ORIGINAL"]);
+    // tag() needle matched the snapshot's text.
+    expect(cbs[0].label).toBe("the-question");
+    expect(cbs[0].labelSource).toBe("tagged");
+    r.close();
+  });
+});
+
 describe("wrap: .stream() convenience helper", () => {
   it("records the call with folded usage and delivers every chunk", async () => {
     const path = tmpTrace();
