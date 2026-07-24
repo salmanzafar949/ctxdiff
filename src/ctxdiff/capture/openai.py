@@ -43,7 +43,15 @@ class OpenAIAdapter:
 
     provider = "openai"
     create_path = ("chat", "completions", "create")  # kept for backward compat
-    create_paths = (("chat", "completions", "create"), ("responses", "create"))
+    # The `.stream()` convenience-manager helpers (`with client.chat.
+    # completions.stream(...) as stream:` / `with client.responses.stream(
+    # ...) as stream:`) share the SAME request shape as their `.create()`
+    # siblings, so they're just two more completion methods on this same
+    # adapter — see trace.py's `_StreamManagerProxy`/`_AsyncStreamManagerProxy`
+    # for how a path ending in "stream" gets manager-wrapped instead of
+    # stream-wrapped directly.
+    create_paths = (("chat", "completions", "create"), ("responses", "create"),
+                    ("chat", "completions", "stream"), ("responses", "stream"))
 
     def extract_blocks(self, kwargs: dict) -> list[RawBlock]:
         """Dispatch to the Responses extractor when the kwargs shape says so;
@@ -265,7 +273,21 @@ class OpenAIAdapter:
           event carries the completed `Response` at `.response`, whose
           `.usage` is the same `input_tokens`/`output_tokens`/`total_tokens`
           shape as a non-streaming Responses call — no caller opt-in needed,
-          Responses streams emit usage unconditionally.
+          Responses streams emit usage unconditionally. Confirmed (Phase 13
+          Step 0 probe) that `client.responses.stream(...)`'s manager-wrapped
+          events include this SAME `response.completed` shape unchanged, so
+          this branch already covers it with no changes.
+        - Chat Completions via the `.stream()` CONVENIENCE MANAGER (`with
+          client.chat.completions.stream(...) as stream:`), NOT `create(
+          stream=True)`: confirmed (Phase 13 Step 0 probe) that this yields
+          typed `ChatCompletionStreamEvent`s — `chunk`/`content.delta`/... —
+          rather than raw `ChatCompletionChunk`s directly, so usage is NOT at
+          `chunk.usage` (that attribute doesn't exist on these event objects
+          at all) but one level deeper, at `chunk.chunk.usage`, ONLY on the
+          `type == "chunk"` event wrapping the real final chunk. Same
+          caller-opt-in requirement as the raw path (`stream_options={
+          "include_usage": True}`) since it's the same underlying HTTP
+          stream, just re-wrapped by the SDK.
 
         Duck-typed via `getattr(..., None)` throughout and wrapped in a
         catch-all: a malformed/unexpected chunk must never interrupt the
@@ -289,5 +311,15 @@ class OpenAIAdapter:
                     state["input_tokens"] = getattr(resp_usage, "input_tokens", None)
                     state["output_tokens"] = getattr(resp_usage, "output_tokens", None)
                     state["total_tokens"] = getattr(resp_usage, "total_tokens", None)
+                    return
+            if getattr(chunk, "type", None) == "chunk":
+                inner_usage = getattr(getattr(chunk, "chunk", None), "usage", None)
+                if inner_usage is not None:
+                    prompt_tokens = getattr(inner_usage, "prompt_tokens", None)
+                    completion_tokens = getattr(inner_usage, "completion_tokens", None)
+                    if prompt_tokens is not None or completion_tokens is not None:
+                        state["prompt_tokens"] = prompt_tokens
+                        state["completion_tokens"] = completion_tokens
+                        state["total_tokens"] = getattr(inner_usage, "total_tokens", None)
         except Exception:  # noqa: BLE001 — never break the caller's iteration
             pass
