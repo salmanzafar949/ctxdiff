@@ -1,9 +1,10 @@
 # ctxdiff
 
 [![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg)](https://pypi.org/project/ctxdiff/)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml/badge.svg)](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/CONTRIBUTING.md)
 
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
 
@@ -28,7 +29,7 @@ tracer.close()                          # writes ./customer-support-agent-<id>.c
 
 Then `ctxdiff view` opens the self-contained dashboard — here debugging a **multi-agent** run (researcher + writer), with agent filtering, turn-by-turn diffs, an agent handoff, and light/dark themes:
 
-![ctxdiff dashboard — a multi-agent run: agent chips and filtering, git-style turn diffs, token allocation, cache-break attribution, light and dark themes](assets/ctxdiff-dashboard-agents.gif)
+![ctxdiff dashboard — a multi-agent run: agent chips and filtering, git-style turn diffs, token allocation, cache-break attribution, light and dark themes](https://raw.githubusercontent.com/salmanzafar949/ctxdiff/main/assets/ctxdiff-dashboard-agents.gif)
 
 > **See it in 30 seconds — no API key, no setup:**
 > ```bash
@@ -90,11 +91,18 @@ See [The CLI](#the-cli) below for every subcommand, with real sample output.
 `ctxdiff` targets **Python ≥ 3.10**.
 
 ```bash
-# from source (PyPI package coming soon)
+pip install ctxdiff
+```
+
+<details>
+<summary>…or install from source</summary>
+
+```bash
 git clone https://github.com/salmanzafar949/ctxdiff
 cd ctxdiff
 pip install -e .
 ```
+</details>
 
 The only runtime dependency is [`tiktoken`](https://github.com/openai/tiktoken) (for exact OpenAI token counts). The provider SDKs (`openai`, `anthropic`, …) are **not** dependencies — `ctxdiff` wraps whatever client you already use.
 
@@ -620,4 +628,4 @@ The eval suite drives the real `openai`, `anthropic`, `google-genai`, `boto3`, a
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE).
