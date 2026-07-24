@@ -8,7 +8,41 @@ import difflib
 from dataclasses import dataclass
 
 from ctxdiff.models import Block, CallBlock
-from ctxdiff.store.ctrace import CTrace
+from ctxdiff.store.ctrace import Call, CTrace
+
+# --- agent-awareness helpers -------------------------------------------------
+
+
+def filter_calls(calls: list[Call], agent: str | None) -> list[Call]:
+    """Filter a call list to one agent's calls. `agent=None` means NO filter —
+    every call is returned (the CLI passes None when no `--agent` was given).
+    A concrete agent name returns only calls whose `.agent` equals it. There is
+    no all-agents sentinel: None already means "all", so callers never need
+    one."""
+    if agent is None:
+        return list(calls)
+    return [c for c in calls if c.agent == agent]
+
+
+def agent_calls(ct: CTrace, agent: str | None) -> list[Call]:
+    """Convenience wrapper: load every call from `ct` and delegate to
+    filter_calls. `agent=None` returns the whole run; a name returns that
+    agent's calls in global seq order."""
+    return filter_calls(ct.get_calls(), agent)
+
+
+def distinct_agents(calls: list[Call]) -> list[str | None]:
+    """Distinct agent labels across `calls`, in first-appearance order. A call
+    with no agent contributes a single `None` entry, so a run mixing named and
+    unlabeled calls counts as multiple distinct agents (which is what triggers
+    per-agent grouping in the analyzers). Two named agents and no unlabeled
+    calls yields exactly those two names."""
+    seen: list[str | None] = []
+    for c in calls:
+        if c.agent not in seen:
+            seen.append(c.agent)
+    return seen
+
 
 # --- value types -------------------------------------------------------------
 

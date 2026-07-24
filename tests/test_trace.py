@@ -279,6 +279,105 @@ def test_wrap_raises_for_unrecognized_botocore_client():
         t.wrap(_FakeS3())
 
 
+class _AnthUsage:
+    input_tokens = 5; output_tokens = 2
+class _AnthResp:
+    usage = _AnthUsage()
+
+
+class _FakeMessages:
+    """Stand-in for client.messages with a recording create()."""
+    def __init__(self): self.calls = []
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _AnthResp()
+
+
+class _FakeAnthropic:
+    """Duck-typed Anthropic client: module 'anthropic' drives detection, and
+    its completion path is `messages.create` — different from OpenAI's
+    `chat.completions.create`."""
+    __module__ = "anthropic"
+    def __init__(self): self.messages = _FakeMessages()
+
+
+def test_two_wraps_carry_their_own_agent(tmp_path):
+    """Wrapping two clients with different agent names stamps each call with
+    the agent of the proxy that made it; seq stays a single global counter."""
+    t = trace.init("multi", path=str(tmp_path / "r.ctrace"))
+    a = t.wrap(_FakeOpenAI(), agent="researcher")
+    b = t.wrap(_FakeOpenAI(), agent="writer")
+    a.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "r"}])
+    b.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "w"}])
+    a.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "r2"}])
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert [c.seq for c in calls] == [1, 2, 3]
+    assert [c.agent for c in calls] == ["researcher", "writer", "researcher"]
+    ct.close()
+
+
+def test_multi_provider_wraps_record_through_own_adapter(tmp_path):
+    """The multi-provider regression: an OpenAI-shaped and an Anthropic-shaped
+    client wrapped in the SAME run must each record through their OWN adapter
+    (the pre-v2 bug built one recorder from the first provider's adapter and
+    mis-parsed the second). Proof: only the Anthropic adapter extracts a
+    top-level `system` field into a block and reports usage as input_tokens —
+    if the anthropic call had gone through the openai adapter, the system block
+    would vanish and the usage shape would be wrong."""
+    t = trace.init("multi", path=str(tmp_path / "r.ctrace"))
+    oa = t.wrap(_FakeOpenAI(), agent="oa")
+    an = t.wrap(_FakeAnthropic(), agent="an")
+
+    oa.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi from openai"}])
+    an.messages.create(
+        model="claude-sonnet-4-5", system="anthropic system prompt",
+        messages=[{"role": "user", "content": "hi from anthropic"}])
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    by_provider = {c.provider: c for c in ct.get_calls()}
+    assert set(by_provider) == {"openai", "anthropic"}
+
+    # OpenAI call: openai usage shape, its user block present.
+    oa_call = by_provider["openai"]
+    assert "prompt_tokens" in (oa_call.usage or {})
+    assert "input_tokens" not in (oa_call.usage or {})
+    oa_texts = [cb.block.text for cb in ct.get_call_blocks(oa_call.id)]
+    assert "hi from openai" in oa_texts
+
+    # Anthropic call: anthropic usage shape, and the top-level system block
+    # ONLY the anthropic adapter extracts — the smoking gun for correct routing.
+    an_call = by_provider["anthropic"]
+    assert "input_tokens" in (an_call.usage or {})
+    an_texts = [cb.block.text for cb in ct.get_call_blocks(an_call.id)]
+    assert "anthropic system prompt" in an_texts
+    assert "hi from anthropic" in an_texts
+    ct.close()
+
+
+def test_mark_is_sticky_across_calls_and_clearable(tmp_path):
+    """mark(step) applies to every subsequent call until changed (sticky,
+    unlike tag which is next-call-only); mark(None) clears it."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    w = t.wrap(_FakeOpenAI())
+    t.mark("plan")
+    w.chat.completions.create(model="m", messages=[{"role": "user", "content": "a"}])
+    w.chat.completions.create(model="m", messages=[{"role": "user", "content": "b"}])
+    t.mark("answer")
+    w.chat.completions.create(model="m", messages=[{"role": "user", "content": "c"}])
+    t.mark(None)
+    w.chat.completions.create(model="m", messages=[{"role": "user", "content": "d"}])
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert [c.step for c in ct.get_calls()] == ["plan", "plan", "answer", None]
+    ct.close()
+
+
 def test_wrap_is_fail_open_if_recording_breaks(tmp_path, monkeypatch):
     """If recording raises internally, the host call still returns normally."""
     t = trace.init("agent", path=str(tmp_path / "r.ctrace"))

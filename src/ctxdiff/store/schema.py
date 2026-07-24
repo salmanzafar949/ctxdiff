@@ -1,8 +1,18 @@
 """The `.ctrace` SQLite schema. One file = one run. `SCHEMA_VERSION` is written
 into every run row so an old/foreign file can be rejected with a clear message
-instead of crashing a reader."""
+instead of crashing a reader.
 
-SCHEMA_VERSION = 1
+Version history:
+- v1: run + call + block + call_block, no per-call attribution.
+- v2: `call` gains three nullable TEXT columns — `agent`, `step`, `provider` —
+  so multi-agent runs can attribute each call to the agent that made it, the
+  step label active when it was made, and the provider it went through (a single
+  codebase can drive several agents/providers within one run). The columns are
+  nullable so a v1 file read under v2 code surfaces them as NULL rather than
+  needing migration; `CTrace.open()` accepts both versions read-only and never
+  rewrites a v1 file (a debugger must not mutate the evidence it inspects)."""
+
+SCHEMA_VERSION = 2
 
 DDL = """
 CREATE TABLE IF NOT EXISTS run (
@@ -23,6 +33,9 @@ CREATE TABLE IF NOT EXISTS call (
   usage       TEXT,                -- JSON, nullable
   latency_ms  INTEGER,
   error       TEXT,
+  agent       TEXT,                -- v2: which agent made this call (nullable)
+  step        TEXT,                -- v2: sticky step label active at call time (nullable)
+  provider    TEXT,                -- v2: provider this call went through (nullable)
   UNIQUE(run_id, seq)
 );
 

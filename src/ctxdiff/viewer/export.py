@@ -27,7 +27,7 @@ import json
 import os
 
 from ctxdiff.analyze.cache import CacheReport, analyze_cache
-from ctxdiff.analyze.differ import TurnDiff, diff_turns
+from ctxdiff.analyze.differ import TurnDiff, diff_turns, distinct_agents
 from ctxdiff.analyze.tokens import RunTokens, analyze_run
 from ctxdiff.store.ctrace import CTrace
 from ctxdiff.viewer.template import render_page
@@ -71,6 +71,8 @@ def _serialize_call(call, call_blocks) -> dict:
         "seq": call.seq,
         "latency_ms": call.latency_ms,
         "error": call.error,
+        "agent": call.agent,
+        "step": call.step,
         "params": {"model": (call.params or {}).get("model")},
         "usage": call.usage,
         "blocks": [_serialize_block(cb) for cb in call_blocks],
@@ -133,6 +135,10 @@ def _serialize_tokens(rt: RunTokens) -> dict:
             "unused_tokens_per_call": rt.bloat.unused_tokens_per_call,
             "pct_of_avg_context": rt.bloat.pct_of_avg_context,
         },
+        # NB: per-agent BLOCK-token totals are intentionally NOT embedded — the
+        # template renders per-agent numbers from stats.agents (tokens) and
+        # stats.usage.by_agent (provider in/out), so a tokens.by_agent field
+        # would be dead weight in the payload.
     }
 
 
@@ -152,6 +158,7 @@ def _serialize_cache(cr: CacheReport) -> dict:
                 "culprit_label": b.culprit_label,
                 "culprit_snippet": b.culprit_snippet,
                 "detail": b.detail,
+                "agent": b.agent,
             }
             for b in cr.breaks
         ],
@@ -159,6 +166,7 @@ def _serialize_cache(cr: CacheReport) -> dict:
         "rebilled_tokens_total": cr.rebilled_tokens_total,
         "waste_note": cr.estimated_waste_note,
         "fix_hint": cr.fix_hint,
+        "agents_analyzed": cr.agents_analyzed,
     }
 
 
@@ -183,13 +191,29 @@ def build_payload(ct: CTrace) -> dict:
     # calls, in send order
     calls_out = [_serialize_call(c, blocks_by_call[c.id]) for c in calls]
 
-    # diffs: one per adjacent (N-1, N) turn pair, in order
-    diffs_out = [
-        _serialize_diff(diff_turns(ct, prev.seq, cur.seq))
-        for prev, cur in zip(calls, calls[1:])
-    ]
+    # diffs: one per adjacent (N-1, N) turn pair, in global seq order. Each
+    # entry gains `cross_agent` (the pair spans two agents — the UI renders it
+    # as an agent hand-off, not a normal diff). When it IS a hand-off, and the
+    # newer call's agent has an earlier call of its OWN, also precompute
+    # `same_agent_diff` (the diff vs that same-agent predecessor) so the panel
+    # can show a meaningful "vs this agent's previous turn" diff; it is omitted
+    # when there is no earlier same-agent call to compare against.
+    diffs_out = []
+    for i in range(1, len(calls)):
+        prev, cur = calls[i - 1], calls[i]
+        d = _serialize_diff(diff_turns(ct, prev.seq, cur.seq))
+        d["cross_agent"] = (prev.agent != cur.agent)
+        if d["cross_agent"]:
+            same_prev = next((calls[j] for j in range(i - 1, -1, -1)
+                              if calls[j].agent == cur.agent), None)
+            if same_prev is not None:
+                d["same_agent_diff"] = _serialize_diff(
+                    diff_turns(ct, same_prev.seq, cur.seq))
+        diffs_out.append(d)
 
-    # precomputed analyzer output (single source of truth)
+    # precomputed analyzer output (single source of truth). analyze_cache with
+    # agent=None auto-groups per agent, so cross-agent hand-offs are never
+    # miscounted as cache breaks.
     run_tokens = analyze_run(ct)
     tokens_out = _serialize_tokens(run_tokens)
     cache_out = _serialize_cache(analyze_cache(ct))
@@ -204,6 +228,32 @@ def build_payload(ct: CTrace) -> dict:
     # context growth reuses the token attributor's per-call totals so the
     # scrubber, the growth chart, and the token panel all agree on one number.
     growth = [c.total_tokens for c in run_tokens.calls]
+
+    # per-agent stats for the header chips: name (unlabeled calls bucketed),
+    # call count, and total block tokens — in first-appearance order.
+    tokens_by_call = {c.id: sum(cb.block.token_count for cb in blocks_by_call[c.id])
+                      for c in calls}
+    agents_stats = []
+    for label in distinct_agents(calls):
+        group = [c for c in calls if c.agent == label]
+        agents_stats.append({
+            "name": label if label is not None else "(unlabeled)",
+            "calls": len(group),
+            "tokens": sum(tokens_by_call[c.id] for c in group),
+        })
+
+    # run-level provider-usage rollup (input/output token totals, coverage as
+    # [reported, total], and per-agent [in, out] when multi-agent) — surfaced
+    # in the header beside the block-token total.
+    u = run_tokens.usage
+    usage_stats = {
+        "input": u.input_tokens,
+        "output": u.output_tokens,
+        "coverage": [u.calls_with_usage, u.calls_total],
+        "by_agent": None if u.by_agent is None else {
+            name: [inp, outp] for name, (inp, outp) in u.by_agent.items()
+        },
+    }
 
     return {
         "run": {
@@ -221,6 +271,8 @@ def build_payload(ct: CTrace) -> dict:
             "distinct_blocks": len(distinct),
             "total_block_refs": total_refs,
             "context_growth": growth,
+            "agents": agents_stats,
+            "usage": usage_stats,
         },
     }
 

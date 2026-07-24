@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from ctxdiff.analyze.differ import distinct_agents, filter_calls
 from ctxdiff.models import CallBlock
 from ctxdiff.store.ctrace import Call, CTrace
 
@@ -43,6 +44,8 @@ class CallTokens:
     slices: list[LabelSlice]
     provider_usage: dict | None
     reconciliation_delta: int | None
+    agent: str | None = None  # v2 attribution passthrough from the Call, so the
+    step: str | None = None   # CLI/viewer can label a turn's panels [agent·step]
 
 
 @dataclass(frozen=True)
@@ -61,12 +64,37 @@ class BloatReport:
 
 
 @dataclass(frozen=True)
+class UsageTotals:
+    """Run-level rollup of PROVIDER-REPORTED usage (not our own block counts):
+    summed input/output tokens across the run, normalized over the four
+    provider key shapes. Calls that reported no usage are skipped from the sums
+    but still counted in `calls_total`, so coverage can be reported honestly
+    ('5/6 calls reported usage') rather than implying a complete total from a
+    partial one. `by_agent` maps each agent label to an (input, output) tuple
+    ('(unlabeled)' for None), populated only when the run spans ≥2 distinct
+    agent labels (else None), and only for agents that actually reported
+    usage."""
+    input_tokens: int
+    output_tokens: int
+    calls_with_usage: int
+    calls_total: int
+    by_agent: dict[str, tuple[int, int]] | None
+
+
+@dataclass(frozen=True)
 class RunTokens:
-    """A whole run's token attribution: every call's CallTokens plus the
-    run-level BloatReport (None when the run has no tool_schema blocks at
-    all — there is nothing to report bloat about)."""
+    """A whole run's token attribution: every call's CallTokens, the run-level
+    BloatReport (None when the run has no tool_schema blocks at all — there is
+    nothing to report bloat about), and the provider-usage rollup (`usage`).
+    `by_agent` maps each agent label to its total BLOCK tokens (None-labeled
+    calls collected under '(unlabeled)') — but only when the analyzed calls
+    span ≥2 distinct agent labels; it is None for a single-agent run or an
+    --agent-filtered analysis, where a per-agent breakdown would be trivial
+    noise."""
     calls: list[CallTokens]
     bloat: BloatReport | None
+    usage: UsageTotals
+    by_agent: dict[str, int] | None = None
 
 
 # --- provider usage reconciliation --------------------------------------------
@@ -76,6 +104,24 @@ class RunTokens:
 # since a usage dict only ever carries one provider's shape at a time.
 _PROMPT_TOKEN_KEYS = ("prompt_tokens", "input_tokens", "prompt_token_count", "inputTokens")
 
+# Output/completion-side token count key, by provider wire shape — the mirror of
+# _PROMPT_TOKEN_KEYS. Same first-present-wins rule (a usage dict only ever
+# carries one provider's shape at a time).
+_OUTPUT_TOKEN_KEYS = ("completion_tokens", "output_tokens", "candidates_token_count", "outputTokens")
+
+
+def _first_present(usage: dict | None, keys: tuple[str, ...]) -> int | None:
+    """First key in `keys` present in `usage` with a non-None value, or None.
+    A key mapped to None (an adapter's getattr-default when the SDK object
+    lacked the attribute) is treated as absent — the next candidate is tried."""
+    if not usage:
+        return None
+    for key in keys:
+        value = usage.get(key)
+        if value is not None:
+            return value
+    return None
+
 
 def _reconciliation_delta(usage: dict | None, total_tokens: int) -> int | None:
     """Provider-reported prompt-side tokens minus our own summed total, or
@@ -84,13 +130,8 @@ def _reconciliation_delta(usage: dict | None, total_tokens: int) -> int | None:
     adapter's getattr-with-default-None when the SDK object lacks the
     attribute) is treated as absent — only the next candidate key is tried,
     not "reconciled against None"."""
-    if not usage:
-        return None
-    for key in _PROMPT_TOKEN_KEYS:
-        value = usage.get(key)
-        if value is not None:
-            return value - total_tokens
-    return None
+    value = _first_present(usage, _PROMPT_TOKEN_KEYS)
+    return None if value is None else value - total_tokens
 
 
 # --- schema-name extraction ---------------------------------------------------
@@ -190,6 +231,73 @@ def analyze_call(call: Call, call_blocks: list[CallBlock]) -> CallTokens:
         slices=slices,
         provider_usage=call.usage,
         reconciliation_delta=_reconciliation_delta(call.usage, total_tokens),
+        agent=call.agent,
+        step=call.step,
+    )
+
+
+# Bucket label for calls with no agent, used only in the by_agent breakdown so
+# unlabeled calls still surface as their own line rather than vanishing.
+_UNLABELED = "(unlabeled)"
+
+
+def _by_agent_totals(
+    calls: list[Call], all_blocks: list[list[CallBlock]]
+) -> dict[str, int] | None:
+    """Total block tokens per agent label across `calls`, or None when the run
+    spans fewer than 2 distinct agent labels (nothing worth breaking down).
+    None-labeled calls accumulate under '(unlabeled)'. Insertion order follows
+    first appearance, so the breakdown reads in the order agents entered the
+    run."""
+    if len(distinct_agents(calls)) < 2:
+        return None
+    totals: dict[str, int] = {}
+    for c, blocks in zip(calls, all_blocks):
+        key = c.agent if c.agent is not None else _UNLABELED
+        totals[key] = totals.get(key, 0) + sum(cb.block.token_count for cb in blocks)
+    return totals
+
+
+def usage_totals(calls: list[Call]) -> UsageTotals:
+    """Roll up PROVIDER-REPORTED usage across `calls` into a UsageTotals. How:
+    for each call, pull the input and output token counts by trying the four
+    provider key shapes in order (first-present wins, mirroring reconciliation);
+    a call that yields NEITHER an input nor an output number reported no usage —
+    it is skipped from the sums but still counted in `calls_total`, so coverage
+    stays honest. Per-agent (input, output) tuples are accumulated in parallel
+    and surfaced only when the run spans ≥2 distinct agent labels (else None),
+    keyed '(unlabeled)' for None-agent calls and limited to agents that
+    actually reported usage, in first-appearance order."""
+    input_total = 0
+    output_total = 0
+    with_usage = 0
+    per_in: dict[str, int] = {}
+    per_out: dict[str, int] = {}
+    for c in calls:
+        in_v = _first_present(c.usage, _PROMPT_TOKEN_KEYS)
+        out_v = _first_present(c.usage, _OUTPUT_TOKEN_KEYS)
+        if in_v is None and out_v is None:
+            continue  # this call reported no recognizable provider usage
+        with_usage += 1
+        input_total += in_v or 0
+        output_total += out_v or 0
+        key = c.agent if c.agent is not None else _UNLABELED
+        per_in[key] = per_in.get(key, 0) + (in_v or 0)
+        per_out[key] = per_out.get(key, 0) + (out_v or 0)
+
+    by_agent: dict[str, tuple[int, int]] | None = None
+    if len(distinct_agents(calls)) >= 2:
+        # first-appearance order, only agents that reported usage
+        by_agent = {}
+        for label in distinct_agents(calls):
+            key = label if label is not None else _UNLABELED
+            if key in per_in or key in per_out:
+                by_agent[key] = (per_in.get(key, 0), per_out.get(key, 0))
+
+    return UsageTotals(
+        input_tokens=input_total, output_tokens=output_total,
+        calls_with_usage=with_usage, calls_total=len(calls),
+        by_agent=by_agent,
     )
 
 
@@ -261,14 +369,18 @@ def detect_bloat(all_calls_with_blocks: list[list[CallBlock]]) -> BloatReport | 
     )
 
 
-def analyze_run(ct: CTrace) -> RunTokens:
-    """Convenience wrapper: load every call and its blocks from `ct`, attribute
-    each call's tokens, and run bloat detection once across the whole run."""
-    calls = ct.get_calls()
+def analyze_run(ct: CTrace, agent: str | None = None) -> RunTokens:
+    """Convenience wrapper: load the run's calls (filtered to `agent` when
+    given, else all), attribute each call's tokens, run bloat detection once
+    across the analyzed calls, and compute the per-agent token breakdown
+    (`by_agent`, non-None only for an unfiltered multi-agent run)."""
+    calls = filter_calls(ct.get_calls(), agent)
     all_calls_with_blocks = [ct.get_call_blocks(c.id) for c in calls]
     call_tokens = [
         analyze_call(call, blocks)
         for call, blocks in zip(calls, all_calls_with_blocks)
     ]
     bloat = detect_bloat(all_calls_with_blocks)
-    return RunTokens(calls=call_tokens, bloat=bloat)
+    by_agent = _by_agent_totals(calls, all_calls_with_blocks)
+    usage = usage_totals(calls)
+    return RunTokens(calls=call_tokens, bloat=bloat, usage=usage, by_agent=by_agent)

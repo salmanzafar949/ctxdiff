@@ -106,7 +106,13 @@ a{color:inherit}
 .noscript{margin:18px 22px; padding:14px 16px; border:1px solid var(--warn);
   border-radius:10px; color:var(--warn)}
 
-main{max-width:1100px; margin:0 auto; padding:22px; display:grid; gap:18px}
+/* minmax(0,1fr) is load-bearing: grid children default to min-width:auto, so a
+   panel holding a long unbreakable line (a single-line diff row) would refuse
+   to shrink, blow past max-width, and force the PAGE to scroll horizontally —
+   text-overflow ellipsis only engages once the track is genuinely constrained. */
+main{max-width:1100px; margin:0 auto; padding:22px; display:grid;
+  grid-template-columns:minmax(0,1fr); gap:18px}
+main > *{min-width:0}
 
 .panel{
   background:var(--panel); border:1px solid var(--hairline); border-radius:14px;
@@ -136,6 +142,30 @@ main{max-width:1100px; margin:0 auto; padding:22px; display:grid; gap:18px}
 .bar.err{
   background:linear-gradient(180deg,var(--evicted),color-mix(in srgb,var(--evicted) 45%, transparent));
 }
+/* Agent-colored underline strip on each turn bar, and dimming for bars whose
+   agent isn't the active filter. Placed AFTER .bar.sel so a dim wins on equal
+   specificity. */
+.bar-underline{position:absolute; left:2px; right:2px; bottom:0; height:3px;
+  border-radius:2px}
+.bar.dim{opacity:.2}
+
+/* --- agent chips (header) --- */
+.agents{display:flex; flex-wrap:wrap; gap:6px; align-items:center; min-width:0}
+.agent-chip{display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+  font-family:var(--mono); font-size:12px; color:var(--ink); flex:none;
+  background:transparent; border:1px solid var(--hairline); border-radius:999px;
+  padding:3px 10px}
+.agent-chip:hover{border-color:var(--secondary)}
+.agent-chip.active{border-color:var(--ink); background:var(--surface)}
+.agent-dot{width:9px; height:9px; border-radius:50%; flex:none; display:inline-block}
+.agent-count{color:var(--secondary); font-size:11px}
+.agent-chip:focus-visible{outline:2px solid var(--c-system); outline-offset:2px}
+
+/* --- agent hand-off marker (what-changed panel) --- */
+.handoff{font-family:var(--mono); font-size:12px; color:var(--modified);
+  background:color-mix(in srgb,var(--modified) 12%, transparent);
+  border:1px solid color-mix(in srgb,var(--modified) 32%, transparent);
+  border-radius:8px; padding:8px 11px; margin-bottom:10px}
 
 /* --- diff / what changed --- */
 .diff-item,.diff-row{margin:3px 0}
@@ -246,6 +276,7 @@ sup.est{color:var(--warn); font-size:9px; margin-left:2px; font-family:var(--mon
     <span id="h-project" class="project"></span>
   </div>
   <div class="right">
+    <div id="h-agents" class="agents"></div>
     <div id="h-meta" class="meta"></div>
     <button id="theme-btn" class="theme-btn" title="toggle light/dark" aria-label="toggle light/dark theme">&#9680;</button>
   </div>
@@ -297,6 +328,54 @@ function head(title, meta){
 }
 function dot(label){ const d = el("span", "dot"); d.style.background = labelColor(label); return d; }
 
+// --- agents ------------------------------------------------------------------
+// Per-agent color is assigned by order of first appearance from a fixed
+// categorical palette, cycled when a run has more agents than colors. Agent
+// NAMES are NEVER interpolated into CSS — only these fixed hex values reach a
+// style property — so a hostile agent name cannot inject styles. Every agent
+// name that reaches the DOM does so via el()/textContent.
+const AGENTS = (DATA.stats && DATA.stats.agents) || [];
+const AGENT_MULTI = AGENTS.length > 1;
+const AGENT_PALETTE = ["#3987e5","#d95926","#199e70","#c98500","#d55181",
+                       "#9085e9","#008300","#c0498a"];
+const AGENT_COLOR = {};
+AGENTS.forEach((a, i) => { AGENT_COLOR[a.name] = AGENT_PALETTE[i % AGENT_PALETTE.length]; });
+let agentFilter = null;   // active agent-chip filter (dims other agents' bars)
+function agentKey(call){ return call && call.agent != null ? call.agent : "(unlabeled)"; }
+function agentColor(name){ return AGENT_COLOR[name] || "var(--c-unknown)"; }
+// A trailing " \\u00b7 agent \\u00b7 step" fragment for a panel header, or "" when
+// neither is set. Built as plain text handed to el()/textContent by the caller.
+function agentStep(call){
+  const parts = [];
+  if(call.agent != null) parts.push(call.agent);
+  if(call.step != null) parts.push(call.step);
+  return parts.length ? " \\u00b7 " + parts.join(" \\u00b7 ") : "";
+}
+function renderAgents(){
+  const host = document.getElementById("h-agents");
+  host.innerHTML = "";
+  if(!AGENT_MULTI) return;   // one (or zero) agent: no chips, nothing to filter
+  AGENTS.forEach(a => {
+    const chip = el("button", "agent-chip" + (agentFilter === a.name ? " active" : ""));
+    const d = el("span", "agent-dot"); d.style.background = agentColor(a.name);
+    chip.appendChild(d);
+    chip.appendChild(el("span", "agent-name", a.name));      // textContent — safe
+    chip.appendChild(el("span", "agent-count", "\\u00b7 " + a.calls));
+    // Provider in/out on the tooltip (title attribute — value, never parsed as
+    // markup); present only when this agent reported usage.
+    const uba = (DATA.stats.usage || {}).by_agent || {};
+    const io = uba[a.name];
+    if(io) chip.setAttribute("title", a.name + " \\u00b7 in " + fmt(io[0]) +
+                             " \\u00b7 out " + fmt(io[1]));
+    chip.setAttribute("aria-pressed", agentFilter === a.name ? "true" : "false");
+    chip.addEventListener("click", () => {
+      agentFilter = (agentFilter === a.name) ? null : a.name;  // toggle
+      render();
+    });
+    host.appendChild(chip);
+  });
+}
+
 // --- header ------------------------------------------------------------------
 function renderHeader(){
   const r = DATA.run || {};
@@ -305,9 +384,18 @@ function renderHeader(){
   const total = (DATA.stats.context_growth || []).reduce((a,b)=>a+b, 0);
   const dedup = DATA.stats.distinct_blocks + " distinct blocks / " +
                 DATA.stats.total_block_refs + " references";
+  // Provider-usage rollup, shown only when at least one call reported usage —
+  // never fabricate an "in 0 / out 0" from a run with no provider numbers.
+  const u = DATA.stats.usage || {};
+  const cov = u.coverage || [0, 0];
   const items = [ r.provider || "?", (r.models || []).join(", ") || "?",
                   r.started_at || "?", CALLS.length + " turns",
-                  fmt(total) + " tokens", dedup ];
+                  fmt(total) + " tokens" ];
+  if(cov[0] > 0){
+    items.push("in " + fmt(u.input) + " \\u00b7 out " + fmt(u.output) +
+               " (" + cov[0] + "/" + cov[1] + " reported)");
+  }
+  items.push(dedup);
   const box = document.getElementById("h-meta");
   box.innerHTML = "";
   items.forEach((m, i) => {
@@ -332,6 +420,12 @@ function renderScrubber(){
     b.setAttribute("aria-label", "turn " + c.seq + " \\u2014 " + fmt(tok) +
                    " tokens" + (c.error ? " (error)" : ""));
     b.addEventListener("click", () => { sel = i; render(); });
+    if(AGENT_MULTI){
+      const key = agentKey(c);
+      const u = el("span", "bar-underline"); u.style.background = agentColor(key);
+      b.appendChild(u);
+      if(agentFilter && agentFilter !== key) b.classList.add("dim");
+    }
     strip.appendChild(b);
   });
 }
@@ -377,7 +471,20 @@ function renderChanged(){
     host.appendChild(el("p", "empty", "first turn \\u2014 everything is new"));
     return;
   }
-  const d = DATA.diffs[sel-1];
+  let d = DATA.diffs[sel-1];
+  // Agent hand-off: when the previous GLOBAL turn belongs to a different
+  // agent, mark it and (when available) show the diff against THIS agent's own
+  // previous turn instead of the cross-agent one.
+  if(d.cross_agent){
+    const prevName = agentKey(CALLS[sel-1]);
+    const curName = agentKey(c);
+    host.appendChild(el("div", "handoff",
+      "agent hand-off \\u2014 previous turn was " + prevName +
+      (d.same_agent_diff
+        ? "; diff vs " + curName + "'s own previous turn shown instead"
+        : "; no earlier turn for " + curName + " to diff against")));
+    if(d.same_agent_diff) d = d.same_agent_diff;
+  }
   const sum = el("div", "diff-summary");
   const up = el("span", "up", "+" + fmt(d.tokens_added) + " added");
   const dn = el("span", "dn", "\\u2212" + fmt(d.tokens_evicted) + " evicted");
@@ -395,7 +502,7 @@ function renderTokens(){
   const host = document.getElementById("alloc");
   host.innerHTML = "";
   const t = DATA.tokens.calls[sel];
-  const h = head("Token allocation", fmt(t.total) + " tokens");
+  const h = head("Token allocation", fmt(t.total) + " tokens" + agentStep(CALLS[sel]));
   if(t.approximate){ const b = el("span", "badge", "~approx"); h.querySelector("h2").appendChild(b); }
   host.appendChild(h);
 
@@ -480,7 +587,8 @@ function renderBlocks(){
   const host = document.getElementById("blocks");
   host.innerHTML = "";
   const c = CALLS[sel];
-  host.appendChild(head("Blocks \\u00b7 turn " + c.seq, c.blocks.length + " blocks"));
+  host.appendChild(head("Blocks \\u00b7 turn " + c.seq,
+                        c.blocks.length + " blocks" + agentStep(c)));
   const wrap = el("div", "table-wrap");
   const tbl = el("table", "blocks-table");
   const thead = el("thead"); const hr = el("tr");
@@ -552,6 +660,7 @@ function renderGrowth(){
 
 // --- orchestration -----------------------------------------------------------
 function render(){
+  renderAgents();
   renderScrubber();
   renderChanged();
   renderTokens();

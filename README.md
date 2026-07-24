@@ -26,6 +26,10 @@ client.chat.completions.create(
 tracer.close()                          # writes ./customer-support-agent-<id>.ctrace
 ```
 
+Then `ctxdiff view` opens the self-contained dashboard — here debugging a **multi-agent** run (researcher + writer), with agent filtering, turn-by-turn diffs, an agent handoff, and light/dark themes:
+
+![ctxdiff dashboard — a multi-agent run: agent chips and filtering, git-style turn diffs, token allocation, cache-break attribution, light and dark themes](assets/ctxdiff-dashboard-agents.gif)
+
 ---
 
 ## Features
@@ -40,6 +44,7 @@ tracer.close()                          # writes ./customer-support-agent-<id>.c
 - 💸 **[Prompt-cache profiling](#ctxdiff-cache)** — `ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
 - 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request dashboard with a turn scrubber, diff panel, token heatmap, cache findings, and block inspector — safe to attach to a bug ticket.
 - 🏷️ **[Semantic tagging](#semantic-tagging)** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
+- 🤝 **[Multi-agent runs](#multi-agent-runs)** — `tracer.wrap(client, agent="researcher")` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters on `diff`/`tokens`/`cache`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🔒 **[Privacy first](#redaction)** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **[Honest numbers](#token-counting)** — exact `tiktoken` counts for OpenAI; estimates are always *marked* as estimates, never passed off as precise.
 
@@ -304,6 +309,35 @@ client.chat.completions.create(
 
 Any block whose text contains a tagged string is stored with `label="rag"` and `label_source="tagged"`. Untagged apps lose nothing but label precision — capture, dedup, and token counting all work regardless. `tag()` accepts a list of strings or dicts (it reads a `text`/`content` field from dicts).
 
+### Multi-agent runs
+
+A single codebase often drives several agents — a researcher, a writer, a critic — sometimes across different providers, all within one run. Name each client's agent at wrap time, and optionally `mark()` the current step; every call is then attributed to the agent (and step) that made it, on one shared, monotonic global timeline.
+
+```python
+tracer = trace.init("research-pipeline")
+researcher = tracer.wrap(OpenAI(), agent="researcher")     # per-agent adapter + recorder
+writer     = tracer.wrap(Anthropic(), agent="writer")      # a DIFFERENT provider, same run
+
+tracer.mark("gather")                                       # sticky: labels every later call…
+researcher.chat.completions.create(model="gpt-4o", messages=[...])
+tracer.mark("draft")                                        # …until you change or clear it
+writer.messages.create(model="claude-sonnet-4-5", messages=[...])
+tracer.close()
+```
+
+- **`wrap(client, agent=...)`** — each wrap builds its own provider adapter and recorder, so two agents on two providers each record correctly (no cross-contamination). `agent` is optional; unlabeled calls are grouped as `(unlabeled)`.
+- **`mark(step)`** — sets a **sticky** step label applied to every subsequent call across all agents until the next `mark()`; `mark(None)` clears it. (Contrast `tag()`, which is next-call-only.)
+- **`--agent NAME`** — filters `ctxdiff diff`, `tokens`, and `cache` to one agent's calls. Turn numbers stay global `seq` values everywhere; `diff --agent` validates that both `--turn` values belong to that agent.
+- **Agent-aware analysis** — cache-prefix stability is computed **within each agent's own timeline**, so an adjacent cross-agent hand-off is never mistaken for a cache break. `ctxdiff tokens` prints a per-agent token summary, `ctxdiff runs` lists each trace's agents, and the [HTML dashboard](#html-dashboard) shows a colored chip per agent, an agent-colored underline on each turn bar, and an "agent hand-off" marker (diffing against that agent's *own* previous turn).
+
+`ctxdiff tokens` also opens with a run-level rollup of **provider-reported** usage (input/output tokens, normalized across all four provider key shapes), with an honest coverage fraction and a per-agent breakdown:
+
+```
+run total · in 18,400 tok · out 640 tok (5/6 calls reported usage)
+  researcher · in 12,900 · out 410
+  writer     · in  5,500 · out 230
+```
+
 ### Reading a trace back
 
 Traces are read through the `CTrace` API. A run has calls (one per LLM request, in `seq` order); each call has ordered blocks.
@@ -317,8 +351,8 @@ run = ct.get_run()
 # Run(id, project, started_at, provider, models, ctxdiff_version)
 
 for call in ct.get_calls():
-    # Call(id, run_id, seq, params, usage, latency_ms, error)
-    print(call.seq, call.params.get("model"), call.usage, call.latency_ms)
+    # Call(id, run_id, seq, params, usage, latency_ms, error, agent, step, provider)
+    print(call.seq, call.params.get("model"), call.usage, call.latency_ms, call.agent)
 
     for cb in ct.get_call_blocks(call.id):
         # CallBlock(block, position, label, label_source)

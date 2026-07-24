@@ -13,9 +13,9 @@ def _cb(text, position, role="user", kind="message", label="user", token_count=N
     return CallBlock(block=block, position=position, label=label, label_source="heuristic")
 
 
-def _record(ct, seq, blocks):
+def _record(ct, seq, blocks, agent=None):
     ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=None, latency_ms=10,
-                   error=None, call_blocks=blocks)
+                   error=None, call_blocks=blocks, agent=agent)
 
 
 SYSTEM = _cb("system prompt", 0, role="system", label="system")
@@ -223,3 +223,89 @@ def test_zero_calls_returns_empty_report_no_crash(tmp_path):
 
     assert report.pairs_analyzed == 0
     assert report.breaks == []
+
+
+# --- multi-agent grouping (the correctness fix) ---------------------------------
+
+
+def test_interleaved_agents_each_internally_stable_have_zero_breaks(tmp_path):
+    """Two agents interleaved on the global timeline, each only ever appending
+    to its OWN history, must produce ZERO breaks: a cross-agent adjacent pair
+    (which shares no prefix) is never a cache break. Before per-agent grouping
+    this run would have flagged every hand-off — nearly all-breaks."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    a1 = [_cb("sys A", 0, role="system", label="system"), _cb("a-q1", 1, label="user")]
+    b1 = [_cb("sys B", 0, role="system", label="system"), _cb("b-q1", 1, label="user")]
+    a2 = a1 + [_cb("a-ans", 2, role="assistant", label="history"),
+               _cb("a-q2", 3, label="user")]
+    b2 = b1 + [_cb("b-ans", 2, role="assistant", label="history"),
+               _cb("b-q2", 3, label="user")]
+    _record(ct, 1, a1, agent="researcher")
+    _record(ct, 2, b1, agent="writer")
+    _record(ct, 3, a2, agent="researcher")
+    _record(ct, 4, b2, agent="writer")
+
+    report = analyze_cache(ct)
+    ct.close()
+
+    assert report.breaks == []
+    assert report.rebilled_tokens_total == 0
+    assert report.pairs_analyzed == 2   # one within-agent pair each, no cross pairs
+    assert report.agents_analyzed == 2
+
+
+def test_break_is_attributed_to_the_single_offending_agent(tmp_path):
+    """One agent has a changing-timestamp system block (a break); the other is
+    stable append growth. The single break is attributed to the offending
+    agent only, and the stable agent contributes none."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    def _a(ts):
+        return [_cb(f"sys A time {ts}", 0, role="system", label="system"),
+                _cb("a-q", 1, label="user")]
+    b1 = [_cb("sys B", 0, role="system", label="system"), _cb("b-q1", 1, label="user")]
+    b2 = b1 + [_cb("b-ans", 2, role="assistant", label="history"),
+               _cb("b-q2", 3, label="user")]
+    _record(ct, 1, _a("10:00:00"), agent="researcher")
+    _record(ct, 2, b1, agent="writer")
+    _record(ct, 3, _a("10:00:05"), agent="researcher")  # researcher break here
+    _record(ct, 4, b2, agent="writer")                  # writer stays stable
+
+    report = analyze_cache(ct)
+    ct.close()
+
+    assert len(report.breaks) == 1
+    b = report.breaks[0]
+    assert b.agent == "researcher"
+    assert b.culprit_kind == "modified"
+    assert b.divergent_position == 0
+    assert report.agents_analyzed == 2
+
+
+def test_agent_filter_analyzes_only_that_agents_calls(tmp_path):
+    """analyze_cache(ct, agent='writer') restricts to the writer's own calls;
+    the researcher's break is not counted, and the result is a single-timeline
+    report (agents_analyzed None)."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    def _a(ts):
+        return [_cb(f"sys A time {ts}", 0, role="system", label="system"),
+                _cb("a-q", 1, label="user")]
+    b1 = [_cb("sys B", 0, role="system", label="system"), _cb("b-q1", 1, label="user")]
+    b2 = b1 + [_cb("b-ans", 2, role="assistant", label="history"),
+               _cb("b-q2", 3, label="user")]
+    _record(ct, 1, _a("10:00:00"), agent="researcher")
+    _record(ct, 2, b1, agent="writer")
+    _record(ct, 3, _a("10:00:05"), agent="researcher")
+    _record(ct, 4, b2, agent="writer")
+
+    report = analyze_cache(ct, agent="writer")
+    ct.close()
+
+    assert report.breaks == []            # writer never breaks
+    assert report.pairs_analyzed == 1     # writer's single within-agent pair
+    assert report.agents_analyzed is None

@@ -7,6 +7,7 @@ from ctxdiff.analyze.tokens import (
     analyze_run,
     detect_bloat,
     extract_tool_name,
+    usage_totals,
 )
 from ctxdiff.models import Block, CallBlock
 from ctxdiff.store.ctrace import Call, CTrace
@@ -311,6 +312,165 @@ def test_bloat_recognizes_openai_tool_call_content_part_as_used():
 def _record(ct, seq, blocks, usage=None):
     ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=usage,
                    latency_ms=10, error=None, call_blocks=blocks)
+
+
+# --- usage_totals: provider-usage rollup --------------------------------------
+
+
+def _usage_call(seq, usage, agent=None):
+    return Call(id=f"c-{seq}", run_id="run", seq=seq, params={}, usage=usage,
+                latency_ms=10, error=None, agent=agent)
+
+
+@pytest.mark.parametrize("usage,exp_in,exp_out", [
+    ({"prompt_tokens": 100, "completion_tokens": 20}, 100, 20),          # openai
+    ({"input_tokens": 90, "output_tokens": 15}, 90, 15),                 # anthropic
+    ({"prompt_token_count": 80, "candidates_token_count": 12}, 80, 12),  # gemini
+    ({"inputTokens": 70, "outputTokens": 8}, 70, 8),                     # bedrock
+])
+def test_usage_totals_normalizes_each_provider_shape(usage, exp_in, exp_out):
+    """usage_totals sums input/output across the four provider key shapes,
+    first-present wins for each side."""
+    totals = usage_totals([_usage_call(1, usage)])
+    assert totals.input_tokens == exp_in
+    assert totals.output_tokens == exp_out
+    assert totals.calls_with_usage == 1
+    assert totals.calls_total == 1
+
+
+def test_usage_totals_mixed_run_reports_coverage():
+    """A run where only some calls carry usage: sums come only from the ones
+    that reported, but calls_total counts every call (honest coverage)."""
+    calls = [
+        _usage_call(1, {"prompt_tokens": 100, "completion_tokens": 20}),
+        _usage_call(2, None),                                  # no usage
+        _usage_call(3, {"prompt_tokens": 50, "completion_tokens": 10}),
+        _usage_call(4, {"completion_tokens": 5}),              # output only
+    ]
+    totals = usage_totals(calls)
+    assert totals.input_tokens == 150
+    assert totals.output_tokens == 35
+    assert totals.calls_with_usage == 3   # calls 1, 3, 4 reported something
+    assert totals.calls_total == 4
+
+
+def test_usage_totals_no_usage_run_is_all_zero_zero_coverage():
+    """A run where NO call reported usage sums to zero with zero coverage — the
+    caller (CLI/dashboard) uses this to say 'no provider usage reported'."""
+    totals = usage_totals([_usage_call(1, None), _usage_call(2, {})])
+    assert totals.input_tokens == 0
+    assert totals.output_tokens == 0
+    assert totals.calls_with_usage == 0
+    assert totals.calls_total == 2
+    assert totals.by_agent is None
+
+
+def test_usage_totals_by_agent_when_multiple_agents():
+    """by_agent carries (input, output) per agent when the run spans ≥2 agents;
+    single-agent runs get None."""
+    calls = [
+        _usage_call(1, {"prompt_tokens": 100, "completion_tokens": 20}, agent="researcher"),
+        _usage_call(2, {"input_tokens": 40, "output_tokens": 6}, agent="writer"),
+        _usage_call(3, {"prompt_tokens": 30, "completion_tokens": 4}, agent="researcher"),
+    ]
+    totals = usage_totals(calls)
+    assert totals.by_agent == {"researcher": (130, 24), "writer": (40, 6)}
+
+    single = usage_totals([_usage_call(1, {"prompt_tokens": 5}, agent="solo")])
+    assert single.by_agent is None
+
+
+def test_usage_totals_by_agent_buckets_unlabeled():
+    """A named agent mixed with unlabeled calls counts as multi-agent; the
+    unlabeled calls' usage accumulates under '(unlabeled)'."""
+    calls = [
+        _usage_call(1, {"prompt_tokens": 10, "completion_tokens": 2}, agent="named"),
+        _usage_call(2, {"prompt_tokens": 7, "completion_tokens": 1}),  # no agent
+    ]
+    totals = usage_totals(calls)
+    assert totals.by_agent == {"named": (10, 2), "(unlabeled)": (7, 1)}
+
+
+def test_analyze_run_carries_usage_totals(tmp_path):
+    """analyze_run threads the provider-usage rollup onto RunTokens.usage."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    ct.record_call(seq=1, params={"model": "m"}, usage={"prompt_tokens": 200, "completion_tokens": 30},
+                   latency_ms=10, error=None, call_blocks=[_cb("hi", 0, token_count=5)])
+    ct.record_call(seq=2, params={"model": "m"}, usage=None,
+                   latency_ms=10, error=None, call_blocks=[_cb("bye", 0, token_count=5)])
+    run_tokens = analyze_run(ct)
+    ct.close()
+
+    assert run_tokens.usage.input_tokens == 200
+    assert run_tokens.usage.output_tokens == 30
+    assert run_tokens.usage.calls_with_usage == 1
+    assert run_tokens.usage.calls_total == 2
+
+
+def _record_agent(ct, seq, blocks, agent=None, step=None):
+    ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=None, latency_ms=10,
+                   error=None, call_blocks=blocks, agent=agent, step=step)
+
+
+def test_by_agent_totals_when_multiple_agents(tmp_path):
+    """by_agent sums block tokens per agent label when the run spans ≥2
+    distinct agents; each CallTokens also carries its agent/step passthrough."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    _record_agent(ct, 1, [_cb("aa", 0, token_count=10)], agent="researcher", step="plan")
+    _record_agent(ct, 2, [_cb("bb", 0, token_count=30)], agent="writer")
+    _record_agent(ct, 3, [_cb("cc", 0, token_count=5)], agent="researcher")
+
+    run_tokens = analyze_run(ct)
+    ct.close()
+
+    assert run_tokens.by_agent == {"researcher": 15, "writer": 30}
+    first = run_tokens.calls[0]
+    assert first.agent == "researcher" and first.step == "plan"
+
+
+def test_by_agent_none_for_single_agent_run(tmp_path):
+    """A run with a single agent label (or all-unlabeled) has by_agent None —
+    a per-agent breakdown would be trivial noise."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    _record_agent(ct, 1, [_cb("aa", 0, token_count=10)], agent="solo")
+    _record_agent(ct, 2, [_cb("bb", 0, token_count=30)], agent="solo")
+
+    run_tokens = analyze_run(ct)
+    ct.close()
+
+    assert run_tokens.by_agent is None
+
+
+def test_by_agent_buckets_unlabeled_calls(tmp_path):
+    """A run mixing a named agent and unlabeled calls counts as multiple
+    agents; the unlabeled calls collect under '(unlabeled)'."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    _record_agent(ct, 1, [_cb("aa", 0, token_count=10)], agent="named")
+    _record_agent(ct, 2, [_cb("bb", 0, token_count=7)])  # no agent
+
+    run_tokens = analyze_run(ct)
+    ct.close()
+
+    assert run_tokens.by_agent == {"named": 10, "(unlabeled)": 7}
+
+
+def test_analyze_run_agent_filter(tmp_path):
+    """analyze_run(ct, agent=NAME) restricts to that agent's calls, and a
+    single-agent filtered view has by_agent None."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    _record_agent(ct, 1, [_cb("aa", 0, token_count=10)], agent="researcher")
+    _record_agent(ct, 2, [_cb("bb", 0, token_count=30)], agent="writer")
+
+    run_tokens = analyze_run(ct, agent="writer")
+    ct.close()
+
+    assert [c.seq for c in run_tokens.calls] == [2]
+    assert run_tokens.by_agent is None
 
 
 def test_analyze_run_combines_per_call_tokens_and_bloat(tmp_path):

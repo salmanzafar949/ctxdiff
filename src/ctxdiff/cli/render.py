@@ -10,7 +10,7 @@ import sys
 
 from ctxdiff.analyze.cache import CacheReport, PrefixBreak
 from ctxdiff.analyze.differ import TurnDiff
-from ctxdiff.analyze.tokens import BloatReport, CallTokens
+from ctxdiff.analyze.tokens import BloatReport, CallTokens, RunTokens, UsageTotals
 
 # Bare ANSI SGR constants — no colorama/rich, per CLAUDE.md's "runtime deps:
 # tiktoken only" rule. Codes are terminated per-segment by _RESET.
@@ -57,6 +57,15 @@ def _snippet(text: str, limit: int = 70) -> str:
 def _tag(label: str, role: str) -> str:
     """Format the `[label·role]` tag shown before a block's snippet."""
     return f"[{label}·{role}]"
+
+
+def _agent_step_tag(agent: str | None, step: str | None) -> str:
+    """Format a trailing `[agent·step]` marker for a turn header, or "" when
+    neither is present. Both, one, or none may be set: only the parts that
+    exist are shown (e.g. `[researcher]`, `[·retrieve]` never happens — a
+    missing agent simply drops that side)."""
+    parts = [p for p in (agent, step) if p]
+    return f" [{'·'.join(parts)}]" if parts else ""
 
 
 def _render_inline_diff(segments: list[tuple[str, str]], enabled: bool) -> str:
@@ -151,7 +160,8 @@ def render_call_tokens(ct: CallTokens) -> str:
     lines: list[str] = []
 
     approx_marker = " (~approx)" if ct.approximate else ""
-    lines.append(f"turn {ct.seq} · {ct.total_tokens:,} tokens{approx_marker}")
+    agent_step = _agent_step_tag(ct.agent, ct.step)
+    lines.append(f"turn {ct.seq} · {ct.total_tokens:,} tokens{approx_marker}{agent_step}")
 
     for s in ct.slices:
         bar = _bar(s.pct).ljust(_BAR_WIDTH)
@@ -193,16 +203,66 @@ def render_bloat(bloat: BloatReport, total_tools: int | None) -> str:
     return _paint(line, _YELLOW, enabled)
 
 
+def render_usage_summary(usage: UsageTotals, agent: str | None = None) -> str:
+    """Render the provider-usage rollup block for `ctxdiff tokens`. The scope
+    label is honest about what was summed: `<agent> total ·` when the analysis
+    was filtered to one agent (`agent` given), else `run total ·`. Only claims
+    totals from provider-reported numbers: when NO call reported usage it says
+    so plainly rather than printing a misleading `in 0 · out 0`. Otherwise it
+    reports summed input/output with an honest coverage fraction
+    ('5/6 calls reported usage'), then one line per agent when a multi-agent
+    breakdown is available (never the case under an --agent filter)."""
+    scope = f"{agent} total" if agent is not None else "run total"
+    if usage.calls_with_usage == 0:
+        return f"{scope} · no provider usage reported"
+    coverage = (f"({usage.calls_with_usage}/{usage.calls_total} "
+                f"call{'s' if usage.calls_total != 1 else ''} reported usage)")
+    lines = [f"{scope} · in {usage.input_tokens:,} tok · "
+             f"out {usage.output_tokens:,} tok {coverage}"]
+    if usage.by_agent:
+        for name, (inp, outp) in usage.by_agent.items():
+            lines.append(f"  {name} · in {inp:,} · out {outp:,}")
+    return "\n".join(lines)
+
+
+def render_agent_summary(run_tokens: RunTokens) -> str | None:
+    """Render the per-agent summary block for `ctxdiff tokens` — one line
+    listing each agent with its call count and total tokens — or None when the
+    run has no multi-agent breakdown (`by_agent` is None: a single-agent or
+    --agent-filtered run). Call counts are derived from the CallTokens list
+    (each carries its own agent), so the summary needs no extra store read.
+    Unlabeled calls appear under the same '(unlabeled)' bucket by_agent uses."""
+    by_agent = run_tokens.by_agent
+    if not by_agent:
+        return None
+    counts: dict[str, int] = {}
+    for c in run_tokens.calls:
+        key = c.agent if c.agent is not None else "(unlabeled)"
+        counts[key] = counts.get(key, 0) + 1
+    parts = [f"{name} · {counts.get(name, 0)} calls · {tokens:,} tok"
+             for name, tokens in by_agent.items()]
+    return "agents: " + "   ".join(parts)
+
+
 def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
-                       total_tools: int | None) -> str:
-    """Render `ctxdiff tokens`' full output: one block per selected call
-    (already filtered to a single turn by the caller when `--turn` is
-    given), then the bloat warning appended when there is one AND it
-    actually names unused tools (a BloatReport with an empty unused list —
-    every registered tool got used — has nothing worth printing)."""
+                       total_tools: int | None,
+                       agent_summary: str | None = None,
+                       usage_summary: str | None = None) -> str:
+    """Render `ctxdiff tokens`' full output: the run-level provider-usage rollup
+    FIRST (when supplied), then an optional per-agent block-token summary (when
+    the run is multi-agent and unfiltered), then one block per selected call
+    (already filtered to a single turn by the caller when `--turn` is given),
+    then the bloat warning appended when there is one AND it actually names
+    unused tools (a BloatReport with an empty unused list — every registered
+    tool got used — has nothing worth printing)."""
     if not calls:
         return "no calls in this run"
-    sections = [render_call_tokens(c) for c in calls]
+    sections: list[str] = []
+    if usage_summary:
+        sections.append(usage_summary)
+    if agent_summary:
+        sections.append(agent_summary)
+    sections.extend(render_call_tokens(c) for c in calls)
     if bloat is not None and bloat.unused_tools:
         sections.append(render_bloat(bloat, total_tools))
     return "\n\n".join(sections)
@@ -210,15 +270,17 @@ def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
 
 def _group_breaks(breaks: list[PrefixBreak]) -> list[list[PrefixBreak]]:
     """Group PrefixBreaks that describe the "same" underlying culprit —
-    (culprit_kind, culprit_label, divergent_position) — into one list per
-    distinct culprit, in first-seen order. Grouping deliberately ignores the
+    (agent, culprit_kind, culprit_label, divergent_position) — into one list
+    per distinct culprit, in first-seen order. `agent` is part of the key so
+    two agents breaking the same way at the same slot stay SEPARATE warnings
+    (each carries its own agent chip). Grouping deliberately ignores the
     per-pair `detail`/`culprit_snippet` text (a changing timestamp's exact
     before/after values differ every pair by definition) — what makes two
-    breaks "the same warning" is that the same slot keeps breaking the same
-    way, not that the literal diff text is identical."""
-    groups: dict[tuple[str, str, int], list[PrefixBreak]] = {}
+    breaks "the same warning" is that the same agent's same slot keeps
+    breaking the same way, not that the literal diff text is identical."""
+    groups: dict[tuple[str | None, str, str, int], list[PrefixBreak]] = {}
     for b in breaks:
-        key = (b.culprit_kind, b.culprit_label, b.divergent_position)
+        key = (b.agent, b.culprit_kind, b.culprit_label, b.divergent_position)
         groups.setdefault(key, []).append(b)
     return list(groups.values())
 
@@ -247,6 +309,9 @@ def render_cache_report(report: CacheReport) -> str:
         line = (f"✓ prefix stable across all {report.pairs_analyzed} turn pairs "
                 f"— minimum stable prefix {report.stable_prefix_tokens_min:,} tokens")
         lines.append(_paint(line, _GREEN, enabled))
+        if report.agents_analyzed and report.agents_analyzed > 1:
+            lines.append(f"pairs analyzed within {report.agents_analyzed} agents "
+                         f"(cross-agent hand-offs are never counted as breaks)")
         if report.rebilled_tokens_total > 0:
             lines.append(report.estimated_waste_note)
         return "\n".join(lines)
@@ -254,17 +319,31 @@ def render_cache_report(report: CacheReport) -> str:
     for group in _group_breaks(report.breaks):
         rep = group[0]
         count = len(group)
+        # Denominator: when the break is attributed to a specific agent and the
+        # run was analyzed per-agent, use THAT agent's own pair count (a
+        # researcher breaking on both of its 2 pairs is "2/2", not "2/3" of a
+        # run that also includes a stable writer). Fall back to the run-wide
+        # count for an unlabeled break or a single-timeline run.
+        denom = report.pairs_analyzed
+        if rep.agent is not None and report.pairs_by_agent:
+            denom = report.pairs_by_agent.get(rep.agent, report.pairs_analyzed)
         frequency = (
-            f"breaks the prefix on every turn ({count}/{report.pairs_analyzed} pairs)"
-            if count == report.pairs_analyzed else
-            f"breaks the prefix on {count}/{report.pairs_analyzed} turn pairs"
+            f"breaks the prefix on every turn ({count}/{denom} pairs)"
+            if count == denom else
+            f"breaks the prefix on {count}/{denom} turn pairs"
         )
-        header = f"⚠ warning: [{rep.culprit_label}·{rep.culprit_kind}] {frequency}"
+        # Prefix the warning with an agent chip when the break is attributed to
+        # a named agent (a grouped multi-agent run); unlabeled runs omit it.
+        chip = f"[agent:{rep.agent}] " if rep.agent is not None else ""
+        header = f"⚠ warning: {chip}[{rep.culprit_label}·{rep.culprit_kind}] {frequency}"
         lines.append(_paint(header, _YELLOW, enabled))
         lines.append(f"  {repr(rep.culprit_snippet)}")
         lines.append(f"  {rep.detail}")
 
     lines.append("")
+    if report.agents_analyzed and report.agents_analyzed > 1:
+        lines.append(f"pairs analyzed within {report.agents_analyzed} agents "
+                     f"(cross-agent hand-offs are never counted as breaks)")
     lines.append(f"stable prefix (min): {report.stable_prefix_tokens_min:,} tokens")
     lines.append(f"re-billed: {report.rebilled_tokens_total:,} tokens")
     lines.append(report.estimated_waste_note)
@@ -275,14 +354,17 @@ def render_cache_report(report: CacheReport) -> str:
     return "\n".join(lines)
 
 
-def render_runs_list(rows: list[tuple[str, str, str, int]]) -> str:
+def render_runs_list(rows: list[tuple[str, str, str, int, str]]) -> str:
     """Render `ctxdiff runs`' listing. Each row is
-    (filename, project, provider, turn_count); prints one line per row, or a
-    friendly message when the working directory has no `.ctrace` files."""
+    (filename, project, provider, turn_count, agents); prints one line per row,
+    or a friendly message when the working directory has no `.ctrace` files.
+    `agents` is a comma-joined list of the distinct agent names in the trace,
+    or '-' when the run has no named agents (a single-agent/pre-v2 run)."""
     if not rows:
         return "no .ctrace files in the current directory"
     lines = [
         f"{filename}  project={project}  provider={provider}  turns={n_calls}"
-        for filename, project, provider, n_calls in rows
+        f"  agents={agents}"
+        for filename, project, provider, n_calls, agents in rows
     ]
     return "\n".join(lines)
