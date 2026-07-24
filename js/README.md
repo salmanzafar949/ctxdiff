@@ -88,6 +88,24 @@ folded from the provider's own events (OpenAI final-chunk `usage`; Anthropic
 recorded once the stream completes. Traces from any provider open in the same
 Python `ctxdiff view`. (AWS Bedrock is not yet in the JS SDK.)
 
+## CLI (`npx ctxdiff`)
+
+Read-only analysis over any `.ctrace` — including ones written by the **Python**
+SDK. Output is byte-identical to the Python `ctxdiff` CLI.
+
+```bash
+npx ctxdiff diff --turn 7 --turn 8      # git-style block diff between two turns
+npx ctxdiff tokens                      # token heatmap + schema-bloat report
+npx ctxdiff cache                       # prompt-cache prefix-break profiler
+npx ctxdiff runs                        # list .ctrace files in the cwd
+```
+
+Flags mirror the Python CLI: `--turn` (twice for `diff`, once optional for
+`tokens`), `--agent` to scope to one agent, `--run PATH` to pick a trace
+(default: most recently modified `*.ctrace` in the cwd). A positional path also
+works, e.g. `npx ctxdiff tokens my-run.ctrace`. (`view`/`export`/`demo` are not
+in the JS CLI yet — use the Python CLI for those.)
+
 ## Format
 
 The `.ctrace` format is documented as a shared cross-SDK contract in

@@ -9,7 +9,7 @@ import { defineConfig } from "tsup";
 // `tsc --emitDeclarationOnly` in the build script rather than tsup's
 // rollup-plugin-dts, which is incompatible with the installed TypeScript.
 export default defineConfig({
-  entry: ["src/index.ts"],
+  entry: ["src/index.ts", "src/cli.ts"],
   format: ["esm", "cjs"],
   dts: false,
   clean: true,

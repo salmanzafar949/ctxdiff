@@ -32,6 +32,45 @@ export { AnthropicAdapter } from "./capture/anthropic.js";
 export { GeminiAdapter } from "./capture/gemini.js";
 export { Recorder, type RedactHook } from "./capture/recorder.js";
 
+// --- read-side analyzers (parity with Python's `ctxdiff.analyze`) -----------
+export {
+  diffCalls,
+  diffTurns,
+  filterCalls,
+  agentCalls,
+  distinctAgents,
+} from "./analyze/diff.js";
+export type { DiffEntry, DiffKind, TurnDiff, InlineSegment } from "./analyze/diff.js";
+export {
+  analyzeRun,
+  analyzeCall,
+  usageTotals,
+  detectBloat,
+  extractToolName,
+  registeredToolNames,
+} from "./analyze/tokens.js";
+export type {
+  LabelSlice,
+  CallTokens,
+  BloatReport,
+  UsageTotals,
+  RunTokens,
+} from "./analyze/tokens.js";
+export { analyzeCache } from "./analyze/cache.js";
+export type { PrefixBreak, CacheReport } from "./analyze/cache.js";
+export { listRuns } from "./analyze/runs.js";
+export type { RunRow } from "./analyze/runs.js";
+export {
+  renderTurnDiff,
+  renderRunTokens,
+  renderCallTokens,
+  renderBloat,
+  renderUsageSummary,
+  renderAgentSummary,
+  renderCacheReport,
+  renderRunsList,
+} from "./render.js";
+
 /** Namespace mirroring the Python `from ctxdiff import trace` entry point, so
  * `trace.init(...)` reads the same across both SDKs. */
 export const trace = { init, Tracer };
