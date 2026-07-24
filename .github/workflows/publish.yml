@@ -1,11 +1,16 @@
-# CI + PyPI auto-publish for ctxdiff.
+# CI + PyPI auto-publish for the ctxdiff PYTHON package.
+#
+# Path-filtered to the Python package (src/, pyproject.toml, tests/, this
+# workflow) so it ONLY runs when the Python package changes — a JS-only push
+# never triggers PyPI, and a Python-only push never triggers npm (js.yml).
+# That's the "Python → PyPI, JS → npm" split.
 #
 # What runs when:
-#   - pull_request → tests only (the merge gate).
-#   - push to main → tests → build → publish to PyPI, but ONLY when the
-#     version in pyproject.toml is not already on PyPI (the version guard) —
-#     so doc-only merges don't fail trying to republish an existing version.
-#     Releasing = bump `version` in pyproject.toml and merge to main.
+#   - pull_request (Python paths) → tests only (the merge gate).
+#   - push to main (Python paths) → tests → build → publish to PyPI, but ONLY
+#     when the version in pyproject.toml is not already on PyPI (the version
+#     guard) — so doc-only merges don't fail trying to republish an existing
+#     version. Releasing = bump `version` in pyproject.toml and merge to main.
 #   - workflow_dispatch → manual re-run of the same pipeline.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC): no API token or secret is
@@ -17,7 +22,19 @@ name: CI & Publish
 on:
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "tests/**"
+      - "README.md"
+      - ".github/workflows/publish.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "tests/**"
+      - "README.md"
+      - ".github/workflows/publish.yml"
   workflow_dispatch:
 
 jobs:

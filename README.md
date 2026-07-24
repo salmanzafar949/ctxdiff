@@ -12,6 +12,11 @@
 
 > Prompt wording is ~10% of the battle. The other 90% is **context engineering** — what the model sees, in what order, at what cost. When an agent misbehaves at turn 8, `ctxdiff` answers the three questions a raw JSON log can't: *what exactly did the model see, what changed since turn 7, and what did it cost?*
 
+> 📦 **Two SDKs, one format.** ctxdiff ships for **Python** (`pip install ctxdiff`) and **JavaScript/TypeScript** (`npm i ctxdiff`). Both write the same `.ctrace` file and share the same CLI — a trace captured in one language opens in the other's viewer. Code samples below are **tabbed by language** (click to switch).
+
+<details open>
+<summary>🐍 <b>Python</b></summary>
+
 ```python
 from ctxdiff import trace
 from openai import OpenAI
@@ -26,6 +31,26 @@ client.chat.completions.create(
 
 tracer.close()                          # writes ./customer-support-agent-<id>.ctrace
 ```
+</details>
+
+<details>
+<summary>🟨 <b>JavaScript / TypeScript</b></summary>
+
+```ts
+import { trace } from "ctxdiff";
+import OpenAI from "openai";
+
+const tracer = trace.init("customer-support-agent");
+const client = tracer.wrap(new OpenAI());   // ← the only line you add
+
+await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [{ role: "user", content: "What's your refund window?" }],
+});
+
+tracer.close();                             // writes ./customer-support-agent-<id>.ctrace
+```
+</details>
 
 Then `ctxdiff view` opens the self-contained dashboard — here debugging a **multi-agent** run (researcher + writer), with agent filtering, turn-by-turn diffs, an agent handoff, and light/dark themes:
 
@@ -33,10 +58,10 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 
 > **See it in 30 seconds — no API key, no setup:**
 > ```bash
-> pip install ctxdiff
-> ctxdiff demo          # builds a sample multi-agent trace and opens this dashboard
+> pip install ctxdiff && ctxdiff demo        # Python
+> npm  i       ctxdiff && npx ctxdiff demo    # JavaScript / TypeScript
 > ```
-> A realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
+> `demo` builds a sample multi-agent trace and opens this dashboard — a realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off. Both SDKs produce a byte-identical dashboard.
 
 **Jump to:** [How it's different](#how-its-different) · [Features](#features) · [Install](#install) · [Quickstart](#quickstart) · [The CLI](#the-cli) · [HTML dashboard](#html-dashboard) · [Supported providers](#supported-providers) · [How it works](#how-it-works) · [Usage guide](#usage-guide) · [Provider recipes](#provider-recipes) · [The `.ctrace` format](#the-ctrace-format) · [Design principles](#design-principles) · [Roadmap](#roadmap) · [Development](#development)
 
@@ -78,7 +103,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 
 **What it doesn't do (yet):**
 
-- ⏳ **Bedrock streaming usage** — `converse_stream` is a separate, not-yet-wrapped method; use the non-streaming `converse` if you need usage from Bedrock today. (OpenAI chat+Responses, Anthropic, and now **Gemini** `generate_content_stream` streaming usage ARE captured, including the `.stream()` convenience-manager helpers — see [Streaming usage](#streaming-usage) below.)
+- ⏳ **Bedrock streaming usage** — Bedrock's `converse_stream` is a separate, not-yet-wrapped method; use the non-streaming `converse` if you need usage from Bedrock today. (This is the **only** streaming gap — OpenAI chat+Responses, Anthropic, and Gemini streaming usage are all captured, including the `.stream()` convenience-manager helpers; see [Streaming usage](#streaming-usage).)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
 - ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
@@ -90,35 +115,41 @@ See [The CLI](#the-cli) below for every subcommand, with real sample output.
 
 ## Install
 
-`ctxdiff` targets **Python ≥ 3.10**.
+<details open>
+<summary>🐍 <b>Python</b> (≥ 3.10)</summary>
 
 ```bash
 pip install ctxdiff
 ```
 
-<details>
-<summary>…or install from source</summary>
+The only runtime dependency is [`tiktoken`](https://github.com/openai/tiktoken) (for exact OpenAI token counts). The provider SDKs (`openai`, `anthropic`, …) are **not** dependencies — `ctxdiff` wraps whatever client you already use.
+
+Install from source, or with the real-SDK eval extra:
 
 ```bash
-git clone https://github.com/salmanzafar949/ctxdiff
-cd ctxdiff
-pip install -e .
+git clone https://github.com/salmanzafar949/ctxdiff && cd ctxdiff && pip install -e .
+pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
 ```
 </details>
 
-The only runtime dependency is [`tiktoken`](https://github.com/openai/tiktoken) (for exact OpenAI token counts). The provider SDKs (`openai`, `anthropic`, …) are **not** dependencies — `ctxdiff` wraps whatever client you already use.
-
-To run the real-SDK evaluation suite, install the optional extra:
+<details>
+<summary>🟨 <b>JavaScript / TypeScript</b> (Node ≥ 22)</summary>
 
 ```bash
-pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
+npm i ctxdiff
 ```
+
+Requires **Node ≥ 22** (uses the built-in `node:sqlite`). The only runtime dependency is a pure-JS tokenizer (`gpt-tokenizer`) for exact OpenAI token counts. The provider SDKs (`openai`, `@anthropic-ai/sdk`, `@google/genai`) are **optional peer dependencies** — `ctxdiff` wraps whatever client you already use and never imports them itself. The `.ctrace` it writes opens in the Python `ctxdiff view`, and vice-versa.
+</details>
 
 ---
 
 ## Quickstart
 
 Wrap a client, use it exactly as you normally would, then read the trace back.
+
+<details open>
+<summary>🐍 <b>Python</b></summary>
 
 ```python
 from ctxdiff import trace
@@ -148,6 +179,43 @@ for call in ct.get_calls():
         print(f"  [{cb.label:<11}] {b.role:<9} {b.token_count:>4} tok  {b.text[:60]!r}")
 ct.close()
 ```
+</details>
+
+<details>
+<summary>🟨 <b>JavaScript / TypeScript</b></summary>
+
+```ts
+import { trace, CTrace } from "ctxdiff";
+import OpenAI from "openai";
+
+// 1. Start a trace and wrap your client
+const tracer = trace.init("support-agent");
+const client = tracer.wrap(new OpenAI());
+
+// 2. Use the client normally — every call is recorded
+await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    { role: "system", content: "You are a support agent. Be precise." },
+    { role: "user", content: "What's your refund window?" },
+  ],
+});
+tracer.close();
+
+// 3. Read the trace back
+const ct = CTrace.open(tracer.path);
+for (const call of ct.getCalls()) {
+  console.log(`turn ${call.seq}  usage=`, call.usage);
+  for (const cb of ct.getCallBlocks(call.id)) {
+    const b = cb.block;
+    console.log(`  [${cb.label}] ${b.role} ${b.tokenCount} tok  ${JSON.stringify(b.text.slice(0, 60))}`);
+  }
+}
+ct.close();
+```
+</details>
+
+Either way, turn 1 records the same blocks (`.ctrace` files are cross-compatible):
 
 ```
 turn 1  usage={'prompt_tokens': 24, 'completion_tokens': 8, 'total_tokens': 32}
@@ -164,6 +232,8 @@ sqlite3 support-agent-*.ctrace "SELECT seq, usage FROM call ORDER BY seq;"
 ---
 
 ## The CLI
+
+> **🐍 Python:** `ctxdiff <command>` &nbsp;·&nbsp; **🟨 JavaScript:** `npx ctxdiff <command>` — same commands, same flags, **byte-identical output**. The examples below use the Python form; prefix with `npx` for the JS SDK. Either CLI reads any `.ctrace`, no matter which SDK wrote it.
 
 Every subcommand reads a `.ctrace`; `--run PATH` picks which one, and defaults to the most recently modified `*.ctrace` in the current directory when omitted — the common case (one run in the working dir) needs no flag at all. Color is automatic (git-style ANSI) and turns off whenever stdout isn't a real terminal, or when [`NO_COLOR`](https://no-color.org) is set — the output below has `NO_COLOR=1` so it pastes cleanly.
 
@@ -262,7 +332,7 @@ Block text is written into the page as a JSON island and rendered with `textCont
 | **OpenAI** | `openai.OpenAI(...)` | Chat Completions **and Responses API** |
 | **Azure OpenAI** | `openai.AzureOpenAI(...)` | Same adapter, zero config |
 | **Anthropic / Claude** | `anthropic.Anthropic(...)` | Messages API |
-| **Google Gemini** | `google.genai.Client(...)` | Generate Content API (`models.generate_content`) |
+| **Google Gemini** | `google.genai.Client(...)` | Generate Content API — `models.generate_content` **and** `models.generate_content_stream` (streaming usage captured) |
 | **AWS Bedrock** | `boto3.client("bedrock-runtime")` | Converse API (`client.converse(...)`) |
 | **Open-source models** | `openai.OpenAI(base_url="http://localhost:11434/v1", ...)` | Any OpenAI-compatible endpoint — Ollama, vLLM, LM Studio, Together, Groq, … |
 | **LangChain** | `langchain_openai.ChatOpenAI(...)` | Via client injection — see [LangChain](#langchain) |
@@ -307,6 +377,8 @@ The smallest independently-diffable unit of context is a **block**: one message,
 ---
 
 ## Usage guide
+
+> The snippets in this section and in [Provider recipes](#provider-recipes) are shown in **Python**. The **JavaScript/TypeScript** API mirrors them one-to-one (`trace.init` → `tracer.wrap(new Client())` → `tracer.close()`, `CTrace.open(...)` to read back) — see the **[JS SDK README](js/README.md)** for JS-native recipes (async, streaming, `.stream()` helpers, tagging, multi-agent).
 
 ### Wrapping a client
 
@@ -503,6 +575,8 @@ Estimates are always labeled as such — never presented as exact. If `tiktoken`
 
 ## Provider recipes
 
+> **Python** below. For **JavaScript/TypeScript** — OpenAI (chat + Responses), Anthropic, and Gemini, including streaming and `.stream()` helpers — see the **[JS SDK README → Provider recipes](js/README.md#provider-recipes)**. (Azure, Bedrock, OSS-endpoint, and LangChain recipes are Python-only for now.)
+
 ### OpenAI
 
 ```python
@@ -654,7 +728,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: Bedrock streaming usage (`converse_stream`), live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
 
 ---
 

@@ -1,0 +1,89 @@
+{
+  "name": "ctxdiff",
+  "version": "0.1.0",
+  "description": "git diff for your agent's context window — a local-first context-window debugger for LLM agents. Wrap your OpenAI/Anthropic/Gemini client in one line and record every call's context into a shareable .ctrace, then diff turns, profile prompt-cache breaks, and open a self-contained HTML dashboard. Cross-compatible with the Python ctxdiff SDK.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Salman Zafar (https://salmanzafar.dev)",
+  "homepage": "https://github.com/salmanzafar949/ctxdiff/tree/main/js#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/salmanzafar949/ctxdiff.git",
+    "directory": "js"
+  },
+  "bugs": {
+    "url": "https://github.com/salmanzafar949/ctxdiff/issues"
+  },
+  "keywords": [
+    "llm",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "context",
+    "context-engineering",
+    "debugger",
+    "observability",
+    "tracing",
+    "agents",
+    "agent",
+    "prompt",
+    "prompt-caching",
+    "diff",
+    "tokens"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ctxdiff": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup && node scripts/fix-node-sqlite.mjs && tsc --emitDeclarationOnly --outDir dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "gpt-tokenizer": "^3.4.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.30",
+    "@google/genai": ">=0.3",
+    "openai": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "@google/genai": {
+      "optional": true
+    },
+    "openai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.114.0",
+    "@google/genai": "^2.13.0",
+    "@types/node": "^26.1.1",
+    "openai": "^6.49.0",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
