@@ -1,6 +1,6 @@
 # ctxdiff
 
-[![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg)](https://pypi.org/project/ctxdiff/)
+[![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg?logo=pypi&logoColor=white)](https://pypi.org/project/ctxdiff/)
 [![CI](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml/badge.svg)](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
