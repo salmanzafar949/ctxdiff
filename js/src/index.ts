@@ -71,6 +71,11 @@ export {
   renderRunsList,
 } from "./render.js";
 
+// --- viewer + demo (parity with Python's `ctxdiff.viewer` / `ctxdiff.demo`) --
+export { buildPayload, exportHtml } from "./viewer/export.js";
+export { renderPage, PAGE } from "./viewer/template.js";
+export { buildDemoTrace } from "./demo.js";
+
 /** Namespace mirroring the Python `from ctxdiff import trace` entry point, so
  * `trace.init(...)` reads the same across both SDKs. */
 export const trace = { init, Tracer };

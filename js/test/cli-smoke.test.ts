@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { makeFixtures } from "./helpers/fixtures.js";
@@ -108,5 +108,37 @@ describe.skipIf(!hasBuild)("ctxdiff CLI (dist/cli.js) smoke", () => {
     expect(r.out).toContain("\\u200b");
     expect(r.out).toContain("\\u200e");
     expect(r.out).toContain("\\u200f");
+  });
+
+  // --- viewer / demo commands -----------------------------------------------
+
+  it("export writes a self-contained .html and prints its path (exit 0)", () => {
+    const outHtml = join(dir, "smoke-export.html");
+    const r = run(["export", "--run", fx.multiturn, "--out", outHtml]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe(outHtml);
+    expect(existsSync(outHtml)).toBe(true);
+    const html = readFileSync(outHtml, "utf-8");
+    expect(html).toContain("<!DOCTYPE html>");
+    expect(html).not.toMatch(/https?:\/\//); // self-contained
+  });
+
+  it("view --no-open writes a dashboard and prints the path (exit 0, no browser)", () => {
+    const r = run(["view", "--no-open", "--run", fx.multiturn]);
+    expect(r.code).toBe(0);
+    const p = r.out.trim();
+    expect(p.endsWith(".html")).toBe(true);
+    expect(existsSync(p)).toBe(true);
+    rmSync(p, { force: true });
+  });
+
+  it("demo --no-open --out writes a sample trace + dashboard (exit 0)", () => {
+    const demoCtrace = join(dir, "smoke-demo.ctrace");
+    const r = run(["demo", "--no-open", "--out", demoCtrace]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("sample trace  ->");
+    expect(r.out).toContain("dashboard     ->");
+    expect(existsSync(demoCtrace)).toBe(true);
+    expect(existsSync(join(dir, "smoke-demo.html"))).toBe(true);
   });
 });

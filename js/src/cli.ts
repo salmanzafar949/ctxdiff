@@ -1,20 +1,27 @@
 #!/usr/bin/env node
 /**
- * ctxdiff's command-line entry point (`npx ctxdiff <cmd>`). Read-only analysis
- * commands only — `diff`, `tokens`, `cache`, `runs` — matching the Python CLI's
- * names, flags (`--turn`, `--agent`, `--run`), output, and exit codes. (view /
- * export / demo are a later phase.) Uses Node's built-in `util.parseArgs`; no
- * CLI framework dependency. As an ergonomic extra over the Python CLI, a
- * positional `.ctrace` path is accepted as an alias for `--run`.
+ * ctxdiff's command-line entry point (`npx ctxdiff <cmd>`). Matches the Python
+ * CLI's command surface — `diff`, `tokens`, `cache`, `runs` (read-only
+ * analysis) plus `view`, `export`, `demo` (the HTML dashboard) — with the same
+ * flags (`--turn`, `--agent`, `--run`, `--out`, `--no-open`, `--keep`), output,
+ * and exit codes. Uses Node's built-in `util.parseArgs`; no CLI framework
+ * dependency. As an ergonomic extra over the Python CLI, a positional `.ctrace`
+ * path is accepted as an alias for `--run`.
  */
 import { parseArgs } from "node:util";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { platform } from "node:process";
 import { CTrace } from "./store/ctrace.js";
 import { diffTurns } from "./analyze/diff.js";
 import { analyzeRun, registeredToolNames } from "./analyze/tokens.js";
 import { analyzeCache } from "./analyze/cache.js";
 import { listRuns } from "./analyze/runs.js";
+import { exportHtml } from "./viewer/export.js";
+import { buildDemoTrace } from "./demo.js";
 import {
   renderTurnDiff,
   renderRunTokens,
@@ -243,6 +250,147 @@ function cmdRuns(): number {
   return 0;
 }
 
+/** Open `filePath` in the default browser via the OS opener (`open` on macOS,
+ * `start` on Windows, `xdg-open` on Linux). Best-effort and fully guarded: a
+ * failing/absent browser NEVER crashes the command — the path is already
+ * printed, so the user can open it themselves. Mirrors Python's webbrowser
+ * wrapping. */
+function openInBrowser(filePath: string): void {
+  try {
+    const url = "file://" + filePath;
+    let cmd: string;
+    let args: string[];
+    if (platform === "darwin") {
+      cmd = "open";
+      args = [url];
+    } else if (platform === "win32") {
+      cmd = "cmd";
+      args = ["/c", "start", "", url];
+    } else {
+      cmd = "xdg-open";
+      args = [url];
+    }
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    child.on("error", () => {
+      /* no browser available — already printed the path */
+    });
+    child.unref();
+  } catch {
+    /* never let a browser launch crash the command */
+  }
+}
+
+/** Parse the viewer commands' flags via parseArgs, converting a parse failure
+ * into a UsageError (→ exit 2). A leading positional is the `.ctrace` path. */
+function parseViewerArgs(
+  rest: string[],
+  options: Record<string, { type: "string" | "boolean" }>,
+): { values: Record<string, unknown>; positionals: string[] } {
+  try {
+    const { values, positionals } = parseArgs({ args: rest, options, allowPositionals: true });
+    return { values: values as Record<string, unknown>, positionals: positionals as string[] };
+  } catch (err) {
+    throw usageErrorFromParse(err);
+  }
+}
+
+/** `ctxdiff export [--run PATH] [--out FILE.html]`: write a self-contained HTML
+ * dashboard beside the trace (or to `--out`) and print the path. */
+function cmdExport(rest: string[]): number {
+  const { values, positionals } = parseViewerArgs(rest, {
+    run: { type: "string" },
+    out: { type: "string" },
+  });
+  const explicit = (values.run as string | undefined) ?? (positionals[0] as string | undefined);
+  const path = resolveRunPath(explicit);
+  if (path === null) {
+    process.stderr.write("no .ctrace here — did the run capture?\n");
+    return 1;
+  }
+  try {
+    const out = exportHtml(path, values.out as string | undefined);
+    process.stdout.write(out + "\n");
+    return 0;
+  } catch (err) {
+    process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
+    return 1;
+  }
+}
+
+/** `ctxdiff view [--run PATH] [--no-open]`: export the dashboard to a temp file,
+ * print its path, and open it in the browser unless `--no-open`. */
+function cmdView(rest: string[]): number {
+  const { values, positionals } = parseViewerArgs(rest, {
+    run: { type: "string" },
+    "no-open": { type: "boolean" },
+  });
+  const explicit = (values.run as string | undefined) ?? (positionals[0] as string | undefined);
+  const path = resolveRunPath(explicit);
+  if (path === null) {
+    process.stderr.write("no .ctrace here — did the run capture?\n");
+    return 1;
+  }
+  const tmp = join(tmpdir(), `ctxdiff-${randomUUID()}.html`);
+  let out: string;
+  try {
+    out = exportHtml(path, tmp);
+  } catch (err) {
+    process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
+    return 1;
+  }
+  process.stdout.write(out + "\n");
+  if (!values["no-open"]) openInBrowser(out);
+  return 0;
+}
+
+/** `ctxdiff demo [--out FILE] [--no-open] [--keep]`: build a sample multi-agent
+ * trace (no API keys, no network) and open its dashboard. Placement: `--out`
+ * writes there (+ its `.html` sibling); `--keep` writes `./ctxdiff-demo.{ctrace,
+ * html}`; otherwise tempfiles. Mirrors Python `_cmd_demo`. */
+function cmdDemo(rest: string[]): number {
+  const { values } = parseViewerArgs(rest, {
+    out: { type: "string" },
+    "no-open": { type: "boolean" },
+    keep: { type: "boolean" },
+  });
+  let ctracePath: string;
+  let htmlPath: string;
+  if (values.out) {
+    ctracePath = values.out as string;
+    htmlPath = ctracePath.replace(/\.[^.]*$/, "") + ".html";
+  } else if (values.keep) {
+    ctracePath = join(process.cwd(), "ctxdiff-demo.ctrace");
+    htmlPath = join(process.cwd(), "ctxdiff-demo.html");
+  } else {
+    const id = randomUUID();
+    ctracePath = join(tmpdir(), `ctxdiff-${id}.ctrace`);
+    htmlPath = join(tmpdir(), `ctxdiff-${id}.html`);
+  }
+
+  let out: string;
+  try {
+    buildDemoTrace(ctracePath);
+    out = exportHtml(ctracePath, htmlPath);
+  } catch (err) {
+    process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
+    return 1;
+  }
+
+  process.stdout.write(`sample trace  -> ${ctracePath}\n`);
+  process.stdout.write(`dashboard     -> ${out}\n`);
+  process.stdout.write(
+    "This is a sample multi-agent research-pipeline run (no API keys, " +
+      "no network) — it shows turn-by-turn diffs, token/schema-bloat " +
+      "detection, a cache-prefix break, and two agents on one timeline.\n",
+  );
+  if (!values["no-open"]) openInBrowser(out);
+  process.stdout.write(
+    'Trace your own agent next: const tracer = trace.init("my-agent"); ' +
+      "const client = tracer.wrap(new OpenAI());\n",
+  );
+  return 0;
+}
+
 const USAGE =
   "usage: ctxdiff <command> [options]\n" +
   "\n" +
@@ -251,6 +399,9 @@ const USAGE =
   "  tokens [--turn N]        token heatmap + schema-bloat report\n" +
   "  cache                    prefix-stability report + wasted-spend estimate\n" +
   "  runs                     list .ctrace files in the working directory\n" +
+  "  view                     open a self-contained HTML dashboard in your browser\n" +
+  "  export [--out FILE]      write a self-contained HTML dashboard for a run\n" +
+  "  demo                     build a sample dashboard — no API keys, no setup\n" +
   "\n" +
   "common options: [--agent A] [--run PATH | positional PATH]\n";
 
@@ -269,6 +420,12 @@ export function main(argv: string[]): number {
         return cmdCache(rest);
       case "runs":
         return cmdRuns();
+      case "export":
+        return cmdExport(rest);
+      case "view":
+        return cmdView(rest);
+      case "demo":
+        return cmdDemo(rest);
       default:
         process.stdout.write(USAGE);
         return 2;
