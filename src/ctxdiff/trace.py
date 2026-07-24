@@ -3,6 +3,7 @@
 call while behaving exactly like the original client."""
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 import uuid
@@ -51,6 +52,21 @@ _BOTOCORE_CLASSES = {"BedrockRuntime": "bedrock"}
 # (see `__getattr__`) when it is encountered exactly one step before the
 # create path, so the call is still tracked and recorded.
 _TRANSPARENT_HOPS = ("with_raw_response", "with_streaming_response")
+
+# google-genai's `genai.Client` mirrors its ENTIRE sync surface under a `.aio`
+# namespace instead of shipping a separate async client class — the same
+# client exposes both `client.models.generate_content` (sync) and
+# `client.aio.models.generate_content` (async). `.aio` is a transparent hop
+# like `_TRANSPARENT_HOPS` above, but structurally different: it sits at the
+# very FRONT of the create path (the client root) rather than one step before
+# it, so it needs its own constant and its own root-only gate in
+# `__getattr__` — recognized ONLY at path == () (the client root) AND only
+# for the gemini provider (whose create_path this hop actually leads to);
+# gating on provider keeps an unrelated `.aio` attribute on some other SDK's
+# client (which would never have a `.models.generate_content` at the end of
+# it) a plain, unwrapped pass-through rather than getting swept into
+# transparent-hop wrapping it doesn't belong to.
+_TRANSPARENT_ROOT_HOPS = ("aio",)
 
 
 def _detect_provider(client: object) -> str:
@@ -240,8 +256,11 @@ class _ClientProxy:
         SDK response-wrapper hop (`with_raw_response`/`with_streaming_response`)
         encountered exactly one step before create, treat it as transparent —
         keep wrapping WITHOUT advancing the path, so the create step right
-        after it still lands on the tracked path. Otherwise return the raw
-        attribute — full pass-through."""
+        after it still lands on the tracked path. If `name` is `aio`
+        encountered at the client ROOT on a gemini-provider proxy, treat it as
+        transparent the same way (see `_TRANSPARENT_ROOT_HOPS`) — google-genai's
+        async surface hangs off `.aio` instead of a separate client class.
+        Otherwise return the raw attribute — full pass-through."""
         target = object.__getattribute__(self, "_ctx_target")
         path = object.__getattribute__(self, "_ctx_path")
         tracer = object.__getattribute__(self, "_ctx_tracer")
@@ -274,6 +293,18 @@ class _ClientProxy:
                 and path == create_path[:len(path)]):
             return _ClientProxy(attr, path, tracer, create_path,
                                 recorder, agent, provider)
+        # Gemini's `.aio` root hop: recognized ONLY at path == () (the client
+        # root, before any traversal has happened) and ONLY when this proxy's
+        # provider is gemini (whose create_path — ("models",
+        # "generate_content") — is what `.aio` actually leads to). Keep the
+        # SAME `path` (still empty) so the immediately-following `.models`
+        # access advances toward create_path exactly as it would from the
+        # sync client root.
+        if (name in _TRANSPARENT_ROOT_HOPS
+                and path == ()
+                and provider == "gemini"):
+            return _ClientProxy(attr, path, tracer, create_path,
+                                recorder, agent, provider)
         return attr
 
 
@@ -284,27 +315,70 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
     (never delaying or altering the host's request/response), measure latency,
     then hand the (kwargs, response) to the tracer along with this wrap's
     recorder/agent/provider. On host error, record the failed call and re-raise
-    the host's exception unchanged."""
+    the host's exception unchanged.
+
+    Async-aware via CALL-TIME awaitable detection, not definition-time
+    `inspect.iscoroutinefunction`: `AsyncOpenAI`/`AsyncAnthropic` (and any
+    other async SDK client) wrap their `create` methods behind descriptors/
+    bound-method machinery, so `iscoroutinefunction(client.chat.completions
+    .create)` returns False even though CALLING it returns a coroutine —
+    definition-time detection is unreliable for these SDKs. Instead,
+    `real_create(*args, **kwargs)` is always invoked first exactly as in the
+    sync path (for an async SDK this only constructs a coroutine object
+    without running any of its body — safe even though it isn't awaited
+    here); if the result `inspect.isawaitable(...)`, an async closure is
+    returned that awaits the coroutine, records with latency measured to
+    AWAIT COMPLETION (not coroutine creation, which is near-instant and would
+    under-report the real call latency), and returns the awaited response —
+    otherwise the original synchronous record-and-return path below runs
+    unchanged, so sync clients pay zero extra cost or behavior change."""
     def interceptor(*args, **kwargs):
         """Stand in for the provider's completion method. What: times and
         forwards the call unchanged, reports it to the tracer, and returns
-        (or re-raises) exactly what the real call produced. How: `real_create`
-        is invoked first with the caller's own args/kwargs so the host request
-        is never delayed, inspected, or altered; on success the response and
-        latency are handed to `tracer._on_create` before returning it; on
-        failure the call is still reported (with `error` set, no response)
-        and the original exception is re-raised unchanged so the host sees
-        its own error, not a ctxdiff one."""
+        (or re-raises) exactly what the real call produced — synchronously
+        for sync SDKs, or as an awaitable for async ones (see the enclosing
+        docstring). How: `real_create` is invoked first with the caller's own
+        args/kwargs so the host request is never delayed, inspected, or
+        altered; a plain exception here means either a sync SDK raised
+        immediately, or an async SDK raised before even returning a
+        coroutine — either way it's the host's own error, recorded and
+        re-raised unchanged. Otherwise, if the result is awaitable, control
+        hands off to `_record_after_await` (below) instead of recording now
+        — recording an async call before it has actually run would report a
+        call that hasn't happened yet, with no response/usage to extract."""
         start = time.perf_counter()
         try:
-            response = real_create(*args, **kwargs)
+            result = real_create(*args, **kwargs)
         except Exception as exc:  # host's own LLM error
             latency_ms = int((time.perf_counter() - start) * 1000)
             tracer._on_create(kwargs, None, latency_ms, type(exc).__name__,
                               recorder, agent, provider)
             raise
+
+        if inspect.isawaitable(result):
+            async def _record_after_await():
+                """Await the host's own coroutine/awaitable, then record
+                success or failure with latency measured to THIS await's
+                completion — the async mirror of the sync path below, one
+                await later. Any exception here is the HOST's async error
+                (e.g. the real HTTP call inside `AsyncOpenAI.create` failing);
+                it is recorded then re-raised unchanged, same contract as the
+                sync branch above."""
+                try:
+                    response = await result
+                except Exception as exc:  # host's own async LLM error
+                    latency_ms = int((time.perf_counter() - start) * 1000)
+                    tracer._on_create(kwargs, None, latency_ms, type(exc).__name__,
+                                      recorder, agent, provider)
+                    raise
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                tracer._on_create(kwargs, response, latency_ms, None,
+                                  recorder, agent, provider)
+                return response
+            return _record_after_await()
+
         latency_ms = int((time.perf_counter() - start) * 1000)
-        tracer._on_create(kwargs, response, latency_ms, None,
+        tracer._on_create(kwargs, result, latency_ms, None,
                           recorder, agent, provider)
-        return response
+        return result
     return interceptor

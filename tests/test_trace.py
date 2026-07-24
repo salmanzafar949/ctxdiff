@@ -1,3 +1,4 @@
+import asyncio
 import time
 import pytest
 from ctxdiff import trace
@@ -389,4 +390,209 @@ def test_wrap_is_fail_open_if_recording_breaks(tmp_path, monkeypatch):
     # (record itself is fail-open, but this guards the interceptor wiring too.)
     resp = wrapped.chat.completions.create(model="gpt-4o", messages=[])
     assert resp is not None
+    t.close()
+
+
+# --- Async client support -------------------------------------------------
+# All async tests below use `asyncio.run()` around plain sync `def test_...`
+# functions rather than pytest-asyncio (no new test dependency needed) — the
+# interceptor's own async closure is what's under test, not the test runner.
+
+
+class _AsyncUsage:
+    prompt_tokens = 7; completion_tokens = 2; total_tokens = 9
+class _AsyncResp:
+    usage = _AsyncUsage()
+
+
+class _FakeAsyncCompletions:
+    """Stand-in for an AsyncOpenAI-style client.chat.completions whose
+    create() is a coroutine function — mirrors `_FakeCompletions` but awaits a
+    small sleep first (the way a real network call would), so `latency_ms`
+    has something non-trivial to measure at AWAIT-COMPLETION time rather than
+    at coroutine-construction time."""
+    def __init__(self): self.calls = []
+    async def create(self, **kwargs):
+        await asyncio.sleep(0.01)
+        self.calls.append(kwargs)
+        return _AsyncResp()
+
+
+class _FakeAsyncChat:
+    def __init__(self): self.completions = _FakeAsyncCompletions()
+
+
+class _FakeAsyncOpenAI:
+    """Duck-typed AsyncOpenAI client: same module/path shape as `_FakeOpenAI`,
+    but `create()` is a coroutine function — this is what call-time awaitable
+    detection must pick up, since `inspect.iscoroutinefunction` on the real
+    SDKs' bound `create` methods returns False (they're wrapped descriptors),
+    so definition-time detection would miss this."""
+    __module__ = "openai"
+    def __init__(self): self.chat = _FakeAsyncChat()
+
+
+def test_wrap_async_create_passes_through_and_records(tmp_path):
+    """An async wrapped client: the real (awaited) response passes through
+    unchanged, the call lands on disk with usage + blocks exactly like the
+    sync path, and `latency_ms` reflects time spent AWAITING the coroutine
+    (>= the fake's own 0.01s sleep) — not the near-instant time to merely
+    construct it."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncOpenAI()
+    wrapped = t.wrap(client)
+
+    resp = asyncio.run(wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi async"}]))
+    assert isinstance(resp, _AsyncResp)                # real awaited response passed through
+    assert len(client.chat.completions.calls) == 1     # real async create actually ran
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+    assert calls[0].latency_ms >= 10  # >= the fake's 0.01s sleep, in whole ms
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert blocks[0].block.text == "hi async"
+    ct.close()
+
+
+class _BoomingAsyncCompletions:
+    """Stand-in for an async client.chat.completions whose create() always
+    raises BoomError AFTER an await point, simulating the underlying async
+    LLM call itself failing (not a sync setup error before any await)."""
+    async def create(self, **kwargs):
+        await asyncio.sleep(0)
+        raise BoomError("the host's own async LLM error")
+
+
+class _BoomingAsyncChat:
+    def __init__(self): self.completions = _BoomingAsyncCompletions()
+
+
+class _BoomingAsyncOpenAI:
+    """Duck-typed AsyncOpenAI client whose completion call always fails."""
+    __module__ = "openai"
+    def __init__(self): self.chat = _BoomingAsyncChat()
+
+
+def test_wrap_async_reraises_host_error_and_records_it(tmp_path):
+    """On a host-side ASYNC LLM error (raised after the await), the
+    interceptor must (1) re-raise the host's own exception unchanged and (2)
+    still record the call, with `error` set to the exception's type name and
+    `usage` None — the async mirror of
+    `test_wrap_reraises_host_error_and_records_it`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    wrapped = t.wrap(_BoomingAsyncOpenAI())
+    with pytest.raises(BoomError):
+        asyncio.run(wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}]))
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    assert calls[0].usage is None
+    ct.close()
+
+
+def test_wrap_async_is_fail_open_if_recording_breaks(tmp_path, monkeypatch):
+    """If recording raises internally on the ASYNC path, the awaited host
+    call must still return normally — the async mirror of
+    `test_wrap_is_fail_open_if_recording_breaks`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    wrapped = t.wrap(_FakeAsyncOpenAI())
+    monkeypatch.setattr(t._recorder, "record",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    resp = asyncio.run(wrapped.chat.completions.create(model="gpt-4o", messages=[]))
+    assert resp is not None
+    t.close()
+
+
+def test_wrap_async_client_carries_agent_attribution(tmp_path):
+    """`wrap(async_client, agent=...)` composes with async interception: the
+    recorded call carries the agent name exactly like the sync path."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    wrapped = t.wrap(_FakeAsyncOpenAI(), agent="researcher")
+    asyncio.run(wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}]))
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert calls[0].agent == "researcher"
+    ct.close()
+
+
+class _FakeAsyncModels:
+    """Stand-in for `client.aio.models`, with an async generate_content()."""
+    def __init__(self): self.calls = []
+    async def generate_content(self, **kwargs):
+        await asyncio.sleep(0.01)
+        self.calls.append(kwargs)
+        return _Resp()
+
+
+class _FakeAsyncGeminiNamespace:
+    """Stand-in for `client.aio` itself — one level above `.models`."""
+    def __init__(self): self.models = _FakeAsyncModels()
+
+
+class _FakeGeminiClientWithAio:
+    """Duck-typed google-genai client exposing BOTH the sync `.models`
+    surface and the async `.aio.models` mirror, the way the real
+    `genai.Client` does (one client, two namespaces, not two client
+    classes)."""
+    __module__ = "google.genai.client"
+    def __init__(self):
+        self.models = _FakeModels()
+        self.aio = _FakeAsyncGeminiNamespace()
+
+
+def test_wrap_gemini_aio_path_is_detected_and_captured(tmp_path):
+    """`client.aio.models.generate_content(...)` is detected via the `.aio`
+    root hop (recognized only at the client root, gated on provider ==
+    'gemini') and recorded exactly like the sync `.models.generate_content`
+    path, including the async latency/response handling."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClientWithAio()
+    wrapped = t.wrap(client)
+
+    resp = asyncio.run(wrapped.aio.models.generate_content(
+        model="gemini-2.0-flash", contents="hi via aio"))
+    assert isinstance(resp, _Resp)
+    assert len(client.aio.models.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_run().provider == "gemini"
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert blocks[0].block.text == "hi via aio"
+    ct.close()
+
+
+class _FakeOpenAIWithRealAioAttr:
+    """Duck-typed OpenAI-style client (provider != gemini) that ALSO happens
+    to carry a top-level `.aio` attribute of its own — proves the `.aio`
+    transparent-hop is gated on provider (not just structural root position),
+    so an unrelated same-named attribute on a non-gemini client is never
+    swept into wrapping it doesn't belong to."""
+    __module__ = "openai"
+    def __init__(self):
+        self.chat = _FakeChat()
+        self.aio = object()  # sentinel; must stay raw, unwrapped
+
+
+def test_wrap_aio_on_non_gemini_client_passes_through_raw(tmp_path):
+    """No-over-wrapping guard for the `.aio` root hop: on a non-gemini
+    client, `.aio` reached at the root must remain the raw, unwrapped
+    attribute — identical to the `with_raw_response` guard test above."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeOpenAIWithRealAioAttr()
+    wrapped = t.wrap(client)
+    assert wrapped.aio is client.aio
     t.close()

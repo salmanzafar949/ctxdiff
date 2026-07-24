@@ -51,7 +51,6 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 **What it doesn't do (yet):**
 
 - ⏳ **Streaming usage** — streamed calls are captured, but token `usage` isn't (the response is a stream object at record time).
-- ⏳ **Async clients** — `AsyncOpenAI` / `AsyncAnthropic` aren't intercepted yet.
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
 - ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
@@ -289,6 +288,17 @@ tracer.close()
 ```
 
 `tracer.path` tells you where the trace was written. Call `tracer.close()` when the run is done to close the store cleanly.
+
+### Async clients
+
+`wrap()` transparently intercepts async clients too — `AsyncOpenAI`, `AsyncAnthropic`, and `genai.Client(...).aio` — via call-time awaitable detection, so `await`ed calls are captured exactly like sync ones, no extra config needed:
+
+```python
+client = tracer.wrap(AsyncOpenAI())
+resp = await client.chat.completions.create(model="gpt-4o", messages=[...])
+```
+
+(Bedrock stays sync-only — boto3 has no first-party async client.)
 
 ### Semantic tagging
 
@@ -545,7 +555,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, async clients, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
 
 ---
 
