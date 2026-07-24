@@ -38,6 +38,8 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 > ```
 > A realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
 
+**Jump to:** [How it's different](#how-its-different) · [Features](#features) · [Install](#install) · [Quickstart](#quickstart) · [The CLI](#the-cli) · [HTML dashboard](#html-dashboard) · [Supported providers](#supported-providers) · [How it works](#how-it-works) · [Usage guide](#usage-guide) · [Provider recipes](#provider-recipes) · [The `.ctrace` format](#the-ctrace-format) · [Design principles](#design-principles) · [Roadmap](#roadmap) · [Development](#development)
+
 ---
 
 ## How it's different
