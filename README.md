@@ -26,6 +26,10 @@ client.chat.completions.create(
 tracer.close()                          # writes ./customer-support-agent-<id>.ctrace
 ```
 
+Then `ctxdiff view` opens the self-contained dashboard — here debugging a **multi-agent** run (researcher + writer), with agent filtering, turn-by-turn diffs, an agent handoff, and light/dark themes:
+
+![ctxdiff dashboard — a multi-agent run: agent chips and filtering, git-style turn diffs, token allocation, cache-break attribution, light and dark themes](assets/ctxdiff-dashboard-agents.gif)
+
 ---
 
 ## Features
