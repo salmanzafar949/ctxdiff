@@ -180,6 +180,105 @@ def test_wrap_treats_with_raw_response_as_transparent_hop(tmp_path):
     assert wrapped.with_raw_response is client.with_raw_response
 
 
+class _FakeModels:
+    """Stand-in for client.models with a recording generate_content()."""
+    def __init__(self): self.calls = []
+    def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return _Resp()
+
+
+class _FakeGeminiClient:
+    """Duck-typed google-genai client: its class lives under
+    'google.genai.client', the same dotted-prefix path the real SDK uses, so
+    detection must match via `_DOTTED_PREFIXES` (root 'google' alone is too
+    broad to map to gemini)."""
+    __module__ = "google.genai.client"
+    def __init__(self): self.models = _FakeModels()
+
+
+def test_wrap_detects_gemini_via_dotted_prefix_and_records(tmp_path):
+    """A fake client whose module is 'google.genai.client' (root 'google', not
+    in _ADAPTERS directly) is detected as gemini via the dotted-prefix
+    fallback, and a call through `.models.generate_content(...)` is recorded
+    to the .ctrace exactly like the other providers."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClient()
+    wrapped = t.wrap(client)
+    resp = wrapped.models.generate_content(model="gemini-2.0-flash", contents="hi")
+    assert isinstance(resp, _Resp)
+    assert len(client.models.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_run().provider == "gemini"
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert blocks[0].block.text == "hi"
+    ct.close()
+
+
+class _FakeBedrockRuntime:
+    """Duck-typed boto3 bedrock-runtime client: class name 'BedrockRuntime'
+    living under module 'botocore.client' — the same module EVERY boto3
+    client shares (s3, ec2, ...), so detection must key off the class name,
+    not the module, once the botocore root is confirmed."""
+    __module__ = "botocore.client"
+    def __init__(self): self.calls = []
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+                "usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4}}
+
+
+_FakeBedrockRuntime.__name__ = "BedrockRuntime"
+
+
+class _FakeS3:
+    """Duck-typed boto3 S3 client: same shared module root ('botocore.client')
+    as bedrock-runtime, but a class name NOT in `_BOTOCORE_CLASSES` — proves
+    an unrecognized botocore client still raises rather than silently
+    matching bedrock."""
+    __module__ = "botocore.client"
+
+
+_FakeS3.__name__ = "S3"
+
+
+def test_wrap_detects_bedrock_via_botocore_class_name_and_records(tmp_path):
+    """A fake client whose module is 'botocore.client' (root 'botocore', not
+    in `_ADAPTERS`/`_DOTTED_PREFIXES` at all) but whose class name is
+    'BedrockRuntime' is detected as bedrock via the class-name fallback, and
+    a call through `.converse(...)` is recorded to the .ctrace exactly like
+    the other providers."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeBedrockRuntime()
+    wrapped = t.wrap(client)
+    resp = wrapped.converse(modelId="anthropic.claude-3-haiku",
+                            messages=[{"role": "user", "content": [{"text": "hi"}]}])
+    assert resp["output"]["message"]["content"][0]["text"] == "hi"
+    assert len(client.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_run().provider == "bedrock"
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert blocks[0].block.text == "hi"
+    ct.close()
+
+
+def test_wrap_raises_for_unrecognized_botocore_client():
+    """A botocore client with a class name NOT in `_BOTOCORE_CLASSES` (e.g.
+    S3) must still raise ValueError — the botocore root alone is never
+    sufficient to assume bedrock."""
+    t = trace.init("agent", path="unused.ctrace")
+    with pytest.raises(ValueError, match="unrecognized boto3 client class"):
+        t.wrap(_FakeS3())
+
+
 def test_wrap_is_fail_open_if_recording_breaks(tmp_path, monkeypatch):
     """If recording raises internally, the host call still returns normally."""
     t = trace.init("agent", path=str(tmp_path / "r.ctrace"))

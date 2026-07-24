@@ -1,9 +1,10 @@
 """Shared fixtures for the real-SDK eval suite. What: stubs HTTP with respx so
-every test in this directory exercises genuine `openai`/`anthropic` SDK code
-paths with zero network calls. How: the `pytest.importorskip` calls below make
-the whole `tests/eval/` directory SKIP (not error) when the `eval` extra isn't
-installed, so the default `dev` test run (`pytest -q` against just `openai`-
-free installs) stays green regardless of whether these optional deps exist."""
+every test in this directory exercises genuine `openai`/`anthropic`/
+`google-genai` SDK code paths with zero network calls. How: the
+`pytest.importorskip` calls below make the whole `tests/eval/` directory SKIP
+(not error) when the `eval` extra isn't installed, so the default `dev` test
+run (`pytest -q` against just `openai`-free installs) stays green regardless
+of whether these optional deps exist."""
 from __future__ import annotations
 
 import pytest
@@ -15,6 +16,7 @@ import pytest
 respx = pytest.importorskip("respx")
 openai = pytest.importorskip("openai")
 anthropic = pytest.importorskip("anthropic")
+genai = pytest.importorskip("google.genai")
 
 
 @pytest.fixture
@@ -66,6 +68,26 @@ def canned_anthropic_response(text: str = "Hello there!", input_tokens: int = 12
         "stop_reason": "end_turn",
         "stop_sequence": None,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
+
+
+def canned_gemini_response(text: str = "Hello there!", prompt_token_count: int = 10,
+                          candidates_token_count: int = 5) -> dict:
+    """Build the exact Gemini `generate_content` JSON shape confirmed against
+    real `google-genai` 2.14.0 `GenerateContentResponse` parsing (Step-0
+    probe). `totalTokenCount` is always the sum of the two counts so callers
+    never have to keep three numbers in sync by hand."""
+    return {
+        "candidates": [{
+            "content": {"parts": [{"text": text}], "role": "model"},
+            "finishReason": "STOP",
+        }],
+        "usageMetadata": {
+            "promptTokenCount": prompt_token_count,
+            "candidatesTokenCount": candidates_token_count,
+            "totalTokenCount": prompt_token_count + candidates_token_count,
+        },
+        "modelVersion": "gemini-2.0-flash",
     }
 
 

@@ -32,6 +32,77 @@ def test_extract_blocks_handles_multipart_content():
     assert "look at this" in blocks[0].text
 
 
+def test_extract_blocks_tool_calls_only_emits_content_part_no_empty_message():
+    """An assistant message with content=None and tool_calls present must
+    NOT emit an empty-text 'message' block — the tool_call part(s) ARE the
+    message. Exactly one content_part block per tool call, role mirrors the
+    message's role, text is stable JSON of the tool_call dict containing the
+    function name."""
+    kwargs = {"messages": [{
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city":"Dubai"}'},
+        }],
+    }]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 1
+    assert blocks[0].kind == "content_part"
+    assert blocks[0].role == "assistant"
+    assert "get_weather" in blocks[0].text
+
+
+def test_extract_blocks_content_and_tool_calls_both_present():
+    """When a message has both non-empty content and tool_calls, content is
+    emitted first (mirrors wire payload order), then one block per tool call."""
+    kwargs = {"messages": [{
+        "role": "assistant",
+        "content": "Let me check that for you.",
+        "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{}"},
+        }],
+    }]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 2
+    assert blocks[0].kind == "message"
+    assert blocks[0].text == "Let me check that for you."
+    assert blocks[1].kind == "content_part"
+    assert blocks[1].role == "assistant"
+    assert "get_weather" in blocks[1].text
+
+
+def test_extract_blocks_legacy_function_call_handled():
+    """The legacy single-dict `function_call` field is handled the same way
+    as `tool_calls`: emitted as a content_part block, no empty message block
+    when content is None."""
+    kwargs = {"messages": [{
+        "role": "assistant",
+        "content": None,
+        "function_call": {"name": "get_weather", "arguments": '{"city":"Dubai"}'},
+    }]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 1
+    assert blocks[0].kind == "content_part"
+    assert blocks[0].role == "assistant"
+    assert "get_weather" in blocks[0].text
+
+
+def test_extract_blocks_tool_calls_entry_not_a_dict_never_raises():
+    """Defensive duck-typing: a tool_calls entry that isn't a dict is still
+    serialized (stable JSON of whatever it is) rather than raising."""
+    kwargs = {"messages": [{
+        "role": "assistant",
+        "content": None,
+        "tool_calls": ["not-a-dict"],
+    }]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 1
+    assert blocks[0].kind == "content_part"
+    assert "not-a-dict" in blocks[0].text
+
+
 def test_extract_params_drops_content_keys():
     """params keep model/temperature but never messages/tools (block content
     is stored as blocks, not duplicated into params)."""

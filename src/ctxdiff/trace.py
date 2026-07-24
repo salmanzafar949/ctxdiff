@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from ctxdiff.capture.anthropic import AnthropicAdapter
+from ctxdiff.capture.bedrock import BedrockAdapter
+from ctxdiff.capture.gemini import GeminiAdapter
 from ctxdiff.capture.openai import OpenAIAdapter
 from ctxdiff.capture.recorder import Recorder
 from ctxdiff.models import Block
@@ -18,7 +20,28 @@ from ctxdiff.store.ctrace import CTrace
 _log = logging.getLogger("ctxdiff")
 
 # Provider detection maps a client's top-level module to an adapter factory.
-_ADAPTERS = {"openai": OpenAIAdapter, "anthropic": AnthropicAdapter}
+_ADAPTERS = {"openai": OpenAIAdapter, "anthropic": AnthropicAdapter, "gemini": GeminiAdapter,
+             "bedrock": BedrockAdapter}
+
+# Some SDKs don't own their top-level module root — `google-genai`'s client
+# lives under `google.genai...`, but the bare root `google` is shared with
+# unrelated packages (google.cloud, google.protobuf, ...) and must NOT map to
+# an adapter blindly. For those, detection falls back to matching a known
+# DOTTED prefix of the full module path instead of just its root, so only
+# `google.genai` (and its submodules) resolve to gemini while any other
+# `google.*` package still falls through to the "unrecognized" error.
+_DOTTED_PREFIXES = {"google.genai": "gemini"}
+
+# boto3's `bedrock-runtime` client (and every OTHER boto3 client — s3, ec2,
+# ...) lives under the shared module root/prefix "botocore.client": botocore
+# generates one generically-named `BaseClient` subclass per service at
+# runtime, all living in that same module, so neither the root-map nor the
+# dotted-prefix map above can distinguish them — every boto3 service would
+# collide on "botocore". Detection falls back a THIRD time here, keyed on the
+# client's CLASS NAME instead of its module, and only consulted once the
+# module root is confirmed to be "botocore" so this narrow class-name check
+# never fires for unrelated same-named classes from other packages.
+_BOTOCORE_CLASSES = {"BedrockRuntime": "bedrock"}
 
 # SDK response-wrapper hops that sit BETWEEN a resource and its `.create`
 # method without changing which HTTP call gets made — e.g. LangChain's
@@ -33,11 +56,33 @@ _TRANSPARENT_HOPS = ("with_raw_response", "with_streaming_response")
 def _detect_provider(client: object) -> str:
     """Infer the provider from the client's module path (e.g. an OpenAI client's
     class lives under the 'openai' package). Raises if unrecognized so wrap()
-    fails loudly at setup time — not silently at record time."""
+    fails loudly at setup time — not silently at record time.
+
+    Three-stage lookup: first the module's top-level root (works for openai/
+    anthropic, whose packages are dedicated to one provider). When that
+    misses, try matching a dotted prefix from `_DOTTED_PREFIXES` — needed for
+    SDKs like google-genai whose module root ('google') is shared across
+    unrelated packages, so root-only matching would be too broad. When THAT
+    also misses and the root is specifically 'botocore' (boto3's generated
+    clients all share this one module regardless of AWS service — s3,
+    ec2, bedrock-runtime, ... — so root/prefix matching can't tell them
+    apart), fall back to a class-name check against `_BOTOCORE_CLASSES`; any
+    other botocore client (e.g. S3) still falls through to the error below,
+    with a hint that only bedrock-runtime is supported from boto3."""
     module = type(client).__module__ or ""
     root = module.split(".", 1)[0]
     if root in _ADAPTERS:
         return root
+    for prefix, provider in _DOTTED_PREFIXES.items():
+        if module == prefix or module.startswith(prefix + "."):
+            return provider
+    if root == "botocore":
+        class_name = type(client).__name__
+        if class_name in _BOTOCORE_CLASSES:
+            return _BOTOCORE_CLASSES[class_name]
+        raise ValueError(
+            f"ctxdiff: unrecognized boto3 client class '{class_name}'; "
+            f"only bedrock-runtime is supported from boto3")
     raise ValueError(
         f"ctxdiff: unrecognized client module '{module}'; "
         f"supported providers: {sorted(_ADAPTERS)}")

@@ -2,12 +2,12 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Status: M1 · capture + store](https://img.shields.io/badge/status-M1%20%C2%B7%20capture%20%2B%20store-orange.svg)](#status)
+[![Status: v1 · capture → diff → tokens → cache → viewer](https://img.shields.io/badge/status-v1%20%C2%B7%20capture%20%E2%86%92%20diff%20%E2%86%92%20tokens%20%E2%86%92%20cache%20%E2%86%92%20viewer-brightgreen.svg)](#status)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
 
-`ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI or Anthropic client in one line, run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
+`ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI, Anthropic, Gemini, or Bedrock client in one line, run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
 
 > Prompt wording is ~10% of the battle. The other 90% is **context engineering** — what the model sees, in what order, at what cost. When an agent misbehaves at turn 8, `ctxdiff` answers the three questions a raw JSON log can't: *what exactly did the model see, what changed since turn 7, and what did it cost?*
 
@@ -30,17 +30,17 @@ tracer.close()                          # writes ./customer-support-agent-<id>.c
 
 ## Status
 
-`ctxdiff` is built in milestones. **Available today (M1): capture + store** — the foundation everything else reads from.
+`ctxdiff` was built in milestones; **v1 is complete** — capture, the diff/tokens/cache analyzers, and the HTML viewer all ship today.
 
 | Milestone | What it adds | State |
 |-----------|--------------|-------|
 | **M1 — Capture + Store** | One-line SDK wrapping, content-hashed `.ctrace` traces, fail-open capture, redaction, token counting | ✅ **available now** |
-| M2 — CLI diff | `ctxdiff diff --turn 7 --turn 8` — git-style added/evicted/modified context | 🔜 planned |
-| M3 — Token heatmap | Token allocation per turn, "schema bloat" detection | 🔜 planned |
-| M4 — Cache profiler | Prompt-cache prefix-break detection + wasted-spend estimate | 🔜 planned |
-| M5 — Web viewer | Local viewer with a time-travel scrubber + self-contained HTML export | 🔜 planned |
+| **M2 — CLI diff** | `ctxdiff diff --turn 7 --turn 8` — git-style added/evicted/modified context | ✅ **available now** |
+| **M3 — Token heatmap** | `ctxdiff tokens` — token allocation per turn, "schema bloat" detection | ✅ **available now** |
+| **M4 — Cache profiler** | `ctxdiff cache` — prompt-cache prefix-break detection + wasted-spend estimate | ✅ **available now** |
+| **M5 — Web viewer** | `ctxdiff view` / `ctxdiff export` — time-travel scrubber + self-contained HTML export | ✅ **available now** |
 
-This README documents **M1** — the capture and storage layer, and the Python API for reading traces back. The `ctxdiff diff` / `tokens` / `cache` / `view` commands land in later milestones.
+See [The CLI](#the-cli) below for every subcommand, with real sample output.
 
 ---
 
@@ -60,7 +60,7 @@ The only runtime dependency is [`tiktoken`](https://github.com/openai/tiktoken) 
 To run the real-SDK evaluation suite, install the optional extra:
 
 ```bash
-pip install -e ".[eval]"   # openai, anthropic, langchain, respx — for tests only
+pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
 ```
 
 ---
@@ -112,6 +112,96 @@ sqlite3 support-agent-*.ctrace "SELECT seq, usage FROM call ORDER BY seq;"
 
 ---
 
+## The CLI
+
+Every subcommand reads a `.ctrace`; `--run PATH` picks which one, and defaults to the most recently modified `*.ctrace` in the current directory when omitted — the common case (one run in the working dir) needs no flag at all. Color is automatic (git-style ANSI) and turns off whenever stdout isn't a real terminal, or when [`NO_COLOR`](https://no-color.org) is set — the output below has `NO_COLOR=1` so it pastes cleanly.
+
+### `ctxdiff diff --turn N --turn M`
+
+Git-style block diff between two turns: added (`+`, green), evicted (`−`, red), and modified (`~`, yellow, with an inline char-level diff) blocks, with unchanged blocks folded into one summary line.
+
+```
+$ ctxdiff diff --turn 1 --turn 2
+── turn 1 → turn 2 · 3 blocks changed · +56 −26 tokens ──
+~ [system·system] You are a support agent. Be precise. Current time: 2026-07-24T10:00:0[-0-]{+4+}Z
++ [history·assistant] 'Checking that for you.'  +5 tok
++ [rag·user] 'Context: Refund policy: 30 days from delivery, unworn items only. Also…'  +25 tok
+= 3 unchanged blocks · 138 tok
+```
+
+### `ctxdiff tokens [--turn N]`
+
+Token allocation per turn as a proportional bar chart, one label slice per row, biggest spender first; reconciles against provider-reported usage when available (`Δ` line); appends a schema-bloat warning when a registered tool schema is never invoked anywhere in the run.
+
+```
+$ ctxdiff tokens
+turn 1 · 164 tokens
+  ████████████████████████       tool_schema       133 tok   81.1%
+  █████                          system             26 tok   15.9%
+  █                              user                5 tok    3.0%
+  provider reports 55 prompt tokens · Δ -109
+
+turn 3 · 255 tokens
+  ████████████████               tool_schema       133 tok   52.2%
+  ██████                         history            50 tok   19.6%
+  ████                           user               32 tok   12.5%
+  ███                            system             26 tok   10.2%
+  ██                             tool_output        14 tok    5.5%
+  provider reports 85 prompt tokens · Δ -170
+
+⚠ schema bloat: issue_refund — 1 of 2 registered tools never used this run — 77 tok (37.7% of avg context) spent on dead schemas every call
+```
+
+A call whose total mixes any `estimate`-method blocks in with exact ones is marked `(~approx)` next to its token total — never presented as exact when it isn't.
+
+### `ctxdiff cache`
+
+Prefix-stability report across every consecutive turn pair: finds where the provider's byte-for-byte cache prefix breaks, attributes it to the responsible block, and estimates the wasted re-billed spend — price-free, since per-token discounts vary by provider and change over time.
+
+```
+$ ctxdiff cache
+⚠ warning: [system·modified] breaks the prefix on every turn (2/2 pairs)
+  'You are a support agent. Be precise. Current time: 2026-07-24T10:00:04Z'
+  modified system block — first difference at char 69: '0' → '4'
+
+stable prefix (min): 133 tokens
+re-billed: 183 tokens
+183 tokens re-billed across 2 turns that a stable prefix would have served from cache (cached input is typically billed at a fraction of the full input price — check your provider's current rates)
+hint: a dynamic value inside an early system block breaks the prefix every turn — move volatile content below the stable blocks
+```
+
+A run with a stable prefix throughout prints a single green `✓ prefix stable across all N turn pairs` line instead.
+
+### `ctxdiff runs`
+
+Lists every `*.ctrace` in the working directory with its project, provider, and turn count — a quick "what runs do I have here" before picking one with `--run`.
+
+### `ctxdiff export [--out FILE.html]` / `ctxdiff view [--no-open]`
+
+Write (`export`) or write-and-open (`view`) the self-contained HTML dashboard — see [HTML dashboard](#html-dashboard) below.
+
+---
+
+## HTML dashboard
+
+`ctxdiff view` opens a local time-travel dashboard for a run in your browser; `ctxdiff export --out run.html` writes the same dashboard to a path you choose, without opening anything — the one you attach to a bug ticket. Both call the same exporter, so they're always in sync.
+
+The output is **one self-contained `.html` file**: the page, styles, script, and the entire run's data are embedded in a single JSON island — no CDN, no font, no image, no external request of any kind (asserted in tests: the file contains no `http://`/`https://` substring anywhere). It opens from a `file://` URL, works offline, and is safe to email or attach to an issue tracker.
+
+Seven panels, all reading from the same precomputed analyzer output the CLI uses (one source of truth — the dashboard never re-implements diff/token/cache logic in JavaScript):
+
+- **Scrubber** — a turn-by-turn strip across the top; click a bar or use ← → to jump between turns.
+- **Turn diff** — the selected turn's added/evicted/modified blocks vs. the previous turn.
+- **Token allocation** — the selected turn's label breakdown, same data as `ctxdiff tokens`.
+- **Cache alignment** — every prefix break found across the run, same data as `ctxdiff cache`.
+- **Blocks** — the full block list for the selected turn (role, kind, label, token count, an 8-char content-hash prefix).
+- **Growth** — context size across turns, so a run that balloons is visible at a glance.
+- **Header stats** — project, provider, run start time, distinct-vs-total block counts (the dedup story).
+
+Block text is written into the page as a JSON island and rendered with `textContent` at view time — never `innerHTML` — so a captured block containing `</script>` or literal HTML markup can never execute or break out of the tag, even though it's shown verbatim. The one deliberate redaction on export: each call's stored `params` is reduced to `{"model": ...}` — sampling settings, API keys, or anything else that might have ridden along in `params` never makes it into the shareable file (block text redaction is still governed by your own `redact()` hook, applied earlier at capture time).
+
+---
+
 ## Supported providers
 
 `ctxdiff` detects the provider from the client you pass to `wrap()` and applies the matching adapter. Detection keys off the client's module, so anything built on the OpenAI or Anthropic SDK works — including Azure and OpenAI-compatible OSS endpoints.
@@ -121,6 +211,8 @@ sqlite3 support-agent-*.ctrace "SELECT seq, usage FROM call ORDER BY seq;"
 | **OpenAI** | `openai.OpenAI(...)` | Chat Completions |
 | **Azure OpenAI** | `openai.AzureOpenAI(...)` | Same adapter, zero config |
 | **Anthropic / Claude** | `anthropic.Anthropic(...)` | Messages API |
+| **Google Gemini** | `google.genai.Client(...)` | Generate Content API (`models.generate_content`) |
+| **AWS Bedrock** | `boto3.client("bedrock-runtime")` | Converse API (`client.converse(...)`) |
 | **Open-source models** | `openai.OpenAI(base_url="http://localhost:11434/v1", ...)` | Any OpenAI-compatible endpoint — Ollama, vLLM, LM Studio, Together, Groq, … |
 | **LangChain** | `langchain_openai.ChatOpenAI(...)` | Via client injection — see [LangChain](#langchain) |
 
@@ -128,7 +220,7 @@ Passing an unrecognized client raises immediately, so misconfiguration fails lou
 
 ```python
 tracer.wrap(some_unknown_client)
-# ValueError: ctxdiff: unrecognized client module '...'; supported providers: ['anthropic', 'openai']
+# ValueError: ctxdiff: unrecognized client module '...'; supported providers: ['anthropic', 'bedrock', 'gemini', 'openai']
 ```
 
 ---
@@ -147,14 +239,19 @@ tracer.wrap(some_unknown_client)
      │        · every message / content part / tool schema is a content-hashed "block"
      │        · identical blocks are stored once, referenced per call (dedup)
      ▼
-[ READ ]      CTrace.open(path) → runs, calls, blocks   (analyzers land in M2–M5)
+[ READ ]      CTrace.open(path) → runs, calls, blocks
+     ▼
+[ ANALYZE ]   diff_turns / analyze_run / analyze_cache — pure functions the
+     │        CLI and HTML viewer both call, so every number agrees
+     ▼
+[ RENDER ]    the CLI (colored text) or `ctxdiff view`/`export` (HTML)
 ```
 
 **Capture is deliberately dumb; interpretation lives downstream.** The proxy records what was actually sent on the wire and nothing more. Whether a block is "a RAG chunk" or "history" is decided by labels, not baked into capture — so the recorder has no opinions to get wrong, and re-analysis of an old trace never needs a re-run.
 
 ### The block model
 
-The smallest independently-diffable unit of context is a **block**: one message, one content part, or one tool schema. Each block's identity is `sha256(role + kind + text)`, so a stable system prompt reused across 40 turns is stored **once** and referenced 40 times. Diffing two turns (M2) then reduces to comparing two ordered lists of hashes.
+The smallest independently-diffable unit of context is a **block**: one message, one content part, or one tool schema. Each block's identity is `sha256(role + kind + text)`, so a stable system prompt reused across 40 turns is stored **once** and referenced 40 times. Diffing two turns then reduces to comparing two ordered lists of hashes.
 
 ---
 
@@ -263,7 +360,7 @@ except RateLimitError:
 Every block records a `token_count` and an honest `token_method`:
 
 - **OpenAI-family** → exact counts via `tiktoken` (`token_method="tiktoken"`).
-- **Anthropic** → a documented estimate, since there's no public local tokenizer (`token_method="estimate"`).
+- **Anthropic, Gemini, Bedrock** → a documented estimate, since none publishes a local tokenizer (`token_method="estimate"`).
 
 Estimates are always labeled as such — never presented as exact. If `tiktoken` is unavailable for any reason, counting degrades to an estimate rather than dropping the capture, and never reaches the network at record time.
 
@@ -304,6 +401,35 @@ client.messages.create(
     max_tokens=1024,
     system="You are a support agent.",
     messages=[{"role": "user", "content": "What's your refund window?"}],
+)
+```
+
+### Google Gemini
+
+The Gemini adapter handles `google-genai`'s shape: `config.system_instruction`/`config.tools` (a single bag that also carries sampling params like `temperature`) and `contents` (a string, or a list of role/parts entries).
+
+```python
+from google import genai
+client = tracer.wrap(genai.Client(api_key="..."))
+client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents="What's your refund window?",
+    config={"system_instruction": "You are a support agent."},
+)
+```
+
+### AWS Bedrock
+
+The Bedrock adapter handles boto3's `bedrock-runtime` Converse API: `system` (a list of `{"text": ...}` blocks, never a bare string), `messages`, `toolConfig.tools`, and `inferenceConfig`'s sampling fields — detection keys off the client's *class name* (`BedrockRuntime`), since every boto3 service client shares the same `botocore.client` module.
+
+```python
+import boto3
+client = tracer.wrap(boto3.client("bedrock-runtime", region_name="us-east-1"))
+client.converse(
+    modelId="anthropic.claude-3-haiku-20240307-v1:0",
+    system=[{"text": "You are a support agent."}],
+    messages=[{"role": "user", "content": [{"text": "What's your refund window?"}]}],
+    inferenceConfig={"maxTokens": 256},
 )
 ```
 
@@ -373,14 +499,14 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-M1 (this release) is the capture + store foundation. Next:
+v1 is complete: capture across OpenAI, Anthropic, Gemini, and Bedrock (plus Azure and OpenAI-compatible OSS endpoints via the OpenAI adapter), the diff/tokens/cache analyzers, and the CLI + HTML viewer all ship today. Next:
 
-- **M2 — CLI diff:** `ctxdiff diff --turn N --turn M` renders added / evicted / modified context blocks in a git-style view.
-- **M3 — Token heatmap:** `ctxdiff tokens` shows where the budget went and flags unused tool-schema "bloat."
-- **M4 — Cache profiler:** `ctxdiff cache` finds what breaks the provider prompt-cache prefix and estimates the wasted spend.
-- **M5 — Web viewer:** `ctxdiff view` opens a local time-travel scrubber; `ctxdiff export` emits a self-contained HTML snapshot for bug tickets.
-
-Also tracked: streaming-usage capture, async clients, a native LangChain callback integration, and populating `run.models`.
+- **VS Code extension** — embeds the same self-contained viewer used by `ctxdiff view`/`export`, inline in the editor.
+- **Live tail** — file-watch a `.ctrace` while the agent is still running, instead of post-run-only analysis.
+- **Background recording** — capture a long-lived process's runs without an explicit `tracer.close()` per session.
+- **Streaming usage capture** — today, a streamed completion (`streaming=True`) is captured but its token `usage` is not, since the interceptor sees the stream before it's consumed.
+- **A native LangChain callback integration** — replacing today's client-injection recipe with a first-class callback handler.
+- **Populating `run.models`** — currently left empty; models are tracked per-call in `params`, not yet rolled up onto the run.
 
 ---
 
@@ -394,7 +520,7 @@ pip install -e ".[eval]"    # + real provider SDKs and respx
 pytest tests/eval           # real-SDK integration tests (HTTP stubbed, no network, no keys)
 ```
 
-The eval suite drives the real `openai`, `anthropic`, and `langchain` SDKs with their HTTP transport stubbed, so it needs no API keys and makes no network calls. It skips cleanly if the `eval` extra isn't installed.
+The eval suite drives the real `openai`, `anthropic`, `google-genai`, `boto3`, and `langchain` SDKs with their HTTP transport stubbed (`respx` for httpx-based SDKs, `botocore.stub.Stubber` for boto3), so it needs no API keys and makes no network calls. It skips cleanly if the `eval` extra isn't installed.
 
 ---
 
