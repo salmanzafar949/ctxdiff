@@ -354,17 +354,22 @@ def render_cache_report(report: CacheReport) -> str:
     return "\n".join(lines)
 
 
-def render_runs_list(rows: list[tuple[str, str, str, int, str]]) -> str:
+def render_runs_list(rows: list[tuple[str, str, str, int, str]],
+                     empty: str = "no .ctrace files in the current directory") -> str:
     """Render `ctxdiff runs`' listing. Each row is
-    (filename, project, provider, turn_count, agents); prints one line per row,
-    or a friendly message when the working directory has no `.ctrace` files.
+    (label, project, provider, turn_count, agents) — the label being a filename
+    when listing a directory of traces and a short session id when listing a
+    configured database, which is why it is not named after either. Prints one
+    line per row, or `empty` when there is nothing to list; the caller supplies
+    that message because "no .ctrace files in the current directory" would be
+    the wrong answer for a user whose traces live in Postgres.
     `agents` is a comma-joined list of the distinct agent names in the trace,
     or '-' when the run has no named agents (a single-agent/pre-v2 run)."""
     if not rows:
-        return "no .ctrace files in the current directory"
+        return empty
     lines = [
-        f"{filename}  project={project}  provider={provider}  turns={n_calls}"
+        f"{label}  project={project}  provider={provider}  turns={n_calls}"
         f"  agents={agents}"
-        for filename, project, provider, n_calls, agents in rows
+        for label, project, provider, n_calls, agents in rows
     ]
     return "\n".join(lines)

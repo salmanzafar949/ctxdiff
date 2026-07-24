@@ -24,7 +24,7 @@ from ctxdiff.analyze.differ import (
     filter_calls,
 )
 from ctxdiff.models import CallBlock
-from ctxdiff.store.ctrace import Call, CTrace
+from ctxdiff.store.base import Call, Store
 
 # --- value types -------------------------------------------------------------
 
@@ -384,7 +384,7 @@ def _analyze_group(
     return breaks, dynamic_flags, stable_tokens_per_pair, rebilled_total
 
 
-def analyze_cache(ct: CTrace, agent: str | None = None) -> CacheReport:
+def analyze_cache(ct: Store, agent: str | None = None) -> CacheReport:
     """Analyze a run for cache-prefix stability (spec §6.4), agent-aware.
 
     Grouping semantics (the correctness fix this feature exposes): cache

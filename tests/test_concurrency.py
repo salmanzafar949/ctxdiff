@@ -420,3 +420,56 @@ def test_close_is_idempotent(tmp_path):
     wrapped.chat.completions.create(model="gpt-4o", messages=[])
     t.close()
     t.close()  # no raise
+
+
+# --- (e) one tracer, many threads wrapping at once ---------------------------
+
+def test_concurrent_wraps_create_exactly_one_session_and_one_writer(tmp_path):
+    """Several threads calling `wrap()` on the SAME tracer at the same instant
+    must produce ONE session and ONE writer thread.
+
+    The lazy setup used to be an unguarded `if self._ct is None:` — a
+    check-then-act with a wide window — so N threads that all found it None
+    each opened a session and started a writer. The visible damage: N run rows
+    for one logical run (so `ctxdiff runs` shows phantom sessions), N writer
+    threads and N connections against a store that thinks it is serving N
+    agents, and a `close()` that shuts down only the LAST one — leaking the
+    rest, and, on a networked store, their server-side connections too.
+
+    This is the ordinary shape of an agent framework: one tracer at module
+    scope, worker threads each wrapping their own client."""
+    path = str(tmp_path / "r.ctrace")
+    # Writer threads other tests deliberately left wedged are not this test's
+    # business, so only threads that appear DURING it are counted.
+    before = {th.ident for th in threading.enumerate()}
+    t = trace.init("racewrap", path=path)
+
+    n = 8
+    barrier = threading.Barrier(n)
+    proxies = []
+    lock = threading.Lock()
+
+    def wrap_one(_i):
+        barrier.wait(10)                    # release all threads together
+        proxy = t.wrap(_FakeSyncOpenAI())
+        with lock:
+            proxies.append(proxy)
+        proxy.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(wrap_one, range(n)))
+    t.close()
+
+    leaked = [th for th in threading.enumerate()
+              if th.name == "ctxdiff-writer" and th.ident not in before
+              and th.is_alive()]
+    assert leaked == []                     # one writer, and it stopped on close
+
+    ct = CTrace.open(path)
+    try:
+        sessions = ct.list_sessions()
+        assert len(sessions) == 1           # ONE session, not one per thread
+        assert sessions[0].turn_count == n  # ...holding every thread's call
+    finally:
+        ct.close()

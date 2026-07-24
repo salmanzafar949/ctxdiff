@@ -14,6 +14,15 @@ dependencies = ["tiktoken>=0.7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Storage backends. The core stays dependency-light (tiktoken only) and both
+# drivers are imported LAZILY, at connect time, so these extras are optional in
+# the real sense: without them ctxdiff still runs, and a store configured for a
+# backend whose extra is missing prints an install hint instead of crashing.
+postgres = ["psycopg[binary]>=3.1"]
+# PyMySQL over mysqlclient: pure Python (no compiler or MySQL client headers at
+# install time) and the same `%s` paramstyle as psycopg 3, which is what lets
+# both adapters share one set of parameterized statements.
+mysql = ["PyMySQL>=1.1"]
 eval = ["openai>=1.0", "anthropic>=0.30", "langchain-openai", "langchain-core", "respx>=0.21", "httpx", "google-genai>=1.0", "boto3>=1.34"]
 
 [project.scripts]

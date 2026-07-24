@@ -12,7 +12,7 @@ from typing import Callable
 
 from ctxdiff.capture.base import Adapter
 from ctxdiff.models import Block, CallBlock, basic_label, content_hash
-from ctxdiff.store.ctrace import CTrace
+from ctxdiff.store.base import Store
 from ctxdiff.tokenize.counter import count_tokens
 
 _log = logging.getLogger("ctxdiff")
@@ -43,17 +43,22 @@ class PersistJob:
 
 
 class Recorder:
-    """Records calls into a CTrace using a provider adapter. Holds an optional
-    redaction hook applied to every block just before it is stored."""
+    """Records calls into a `Store` using a provider adapter. Holds an optional
+    redaction hook applied to every block just before it is stored.
 
-    def __init__(self, ctrace: CTrace, adapter: Adapter,
+    The store is the PROTOCOL (`ctxdiff.store.base.Store`), not a concrete
+    class: whether the run is landing in a local `.ctrace`, Postgres or MySQL,
+    this code is identical — `persist()` calls the same `record_call`."""
+
+    def __init__(self, store: Store | None, adapter: Adapter,
                  redact: Callable[[Block], Block] | None):
         """Wire the three collaborators `record()` needs: the store to write
-        to, the provider-specific adapter that knows how to pull blocks/
-        params/usage out of raw request/response objects, and an optional
-        redaction hook. How: just stores the references; no I/O happens
-        until `record()` is called."""
-        self._ct = ctrace
+        to (any `Store` implementation, or None when store setup already failed
+        and capture is degraded fail-open), the provider-specific adapter that
+        knows how to pull blocks/params/usage out of raw request/response
+        objects, and an optional redaction hook. How: just stores the
+        references; no I/O happens until `record()` is called."""
+        self._ct = store
         self._adapter = adapter
         self._redact = redact
         # One-time-warning state for persist failures (mirrors _Writer._degrade):
@@ -133,9 +138,10 @@ class Recorder:
     def persist(self, job: PersistJob, quiet: bool = False) -> None:
         """Phase 2 of recording — runs on the single WRITER thread. What: writes
         one already-built `PersistJob` to the store in a single transaction.
-        How: a thin pass-through to `CTrace.record_call`; because every write
-        for a run funnels through one writer thread, this is the ONLY place the
-        connection is used for writing, so SQLite's thread-affinity holds even
+        How: a thin pass-through to the store's `record_call`; because every
+        write for a run funnels through one writer thread, this is the ONLY
+        place the connection is used for writing, so SQLite's thread-affinity
+        (and a network driver's single-cursor-at-a-time expectation) holds even
         though the connection was opened on a different thread. Fail-open: a
         failed write is swallowed — a broken store must never take down the
         writer loop or, by extension, the host — and warned AT MOST ONCE for the

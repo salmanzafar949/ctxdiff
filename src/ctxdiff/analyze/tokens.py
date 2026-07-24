@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from ctxdiff.analyze.differ import distinct_agents, filter_calls
 from ctxdiff.models import CallBlock
-from ctxdiff.store.ctrace import Call, CTrace
+from ctxdiff.store.base import Call, Store
 
 # --- value types -------------------------------------------------------------
 
@@ -369,7 +369,7 @@ def detect_bloat(all_calls_with_blocks: list[list[CallBlock]]) -> BloatReport | 
     )
 
 
-def analyze_run(ct: CTrace, agent: str | None = None) -> RunTokens:
+def analyze_run(ct: Store, agent: str | None = None) -> RunTokens:
     """Convenience wrapper: load the run's calls (filtered to `agent` when
     given, else all), attribute each call's tokens, run bloat detection once
     across the analyzed calls, and compute the per-agent token breakdown

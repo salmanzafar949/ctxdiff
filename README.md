@@ -67,7 +67,7 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 > ```
 > `demo` builds a sample multi-agent trace and opens this dashboard — a realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off. Both SDKs produce a byte-identical dashboard.
 
-**Jump to:** [How it's different](#how-its-different) · [Features](#features) · [Install](#install) · [Quickstart](#quickstart) · [The CLI](#the-cli) · [HTML dashboard](#html-dashboard) · [Supported providers](#supported-providers) · [How it works](#how-it-works) · [Usage guide](#usage-guide) · [Provider recipes](#provider-recipes) · [The `.ctrace` format](#the-ctrace-format) · [Design principles](#design-principles) · [Roadmap](#roadmap) · [Development](#development)
+**Jump to:** [How it's different](#how-its-different) · [Features](#features) · [Install](#install) · [Quickstart](#quickstart) · [The CLI](#the-cli) · [HTML dashboard](#html-dashboard) · [Storage backends](#storage-backends) · [Supported providers](#supported-providers) · [How it works](#how-it-works) · [Usage guide](#usage-guide) · [Provider recipes](#provider-recipes) · [The `.ctrace` format](#the-ctrace-format) · [Design principles](#design-principles) · [Roadmap](#roadmap) · [Development](#development)
 
 ---
 
@@ -102,6 +102,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 - 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request dashboard with a turn scrubber, diff panel, token heatmap, cache findings, and block inspector — safe to attach to a bug ticket.
 - 🏷️ **[Semantic tagging](#semantic-tagging)** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
 - 🤝 **[Multi-agent runs](#multi-agent-runs)** — `tracer.wrap(client, agent="researcher")` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters on `diff`/`tokens`/`cache`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
+- 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `ctxdiff.configure(store=PostgresStore(dsn=...))` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, drivers are optional extras, and a dead database degrades capture without ever touching your agent.
 - 🔒 **[Privacy first](#redaction)** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **[Honest numbers](#token-counting)** — exact `tiktoken` counts for OpenAI; estimates are always *marked* as estimates, never passed off as precise.
 
@@ -133,6 +134,13 @@ Install from source, or with the real-SDK eval extra:
 ```bash
 git clone https://github.com/salmanzafar949/ctxdiff && cd ctxdiff && pip install -e .
 pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
+```
+
+Storage is a local `.ctrace` file by default, with nothing extra to install. To keep traces in a database you already run, add the matching extra — see [Storage backends](#storage-backends):
+
+```bash
+pip install 'ctxdiff[postgres]'   # psycopg 3
+pip install 'ctxdiff[mysql]'      # PyMySQL
 ```
 </details>
 
@@ -299,7 +307,7 @@ A run with a stable prefix throughout prints a single green `✓ prefix stable a
 
 ### `ctxdiff runs`
 
-Lists every `*.ctrace` in the working directory with its project, provider, and turn count — a quick "what runs do I have here" before picking one with `--run`.
+Lists every `*.ctrace` in the working directory with its project, provider, and turn count — a quick "what runs do I have here" before picking one with `--run`. With a [database configured](#storage-backends) it lists that store's sessions instead, like every other read command.
 
 ### `ctxdiff export [--out FILE.html]` / `ctxdiff view [--no-open]`
 
@@ -324,6 +332,85 @@ Seven panels, all reading from the same precomputed analyzer output the CLI uses
 - **Header stats** — project, provider, run start time, distinct-vs-total block counts (the dedup story).
 
 Block text is written into the page as a JSON island and rendered with `textContent` at view time — never `innerHTML` — so a captured block containing `</script>` or literal HTML markup can never execute or break out of the tag, even though it's shown verbatim. The one deliberate redaction on export: each call's stored `params` is reduced to `{"model": ...}` — sampling settings, API keys, or anything else that might have ridden along in `params` never makes it into the shareable file (block text redaction is still governed by your own `redact()` hook, applied earlier at capture time).
+
+---
+
+## Storage backends
+
+By default `ctxdiff` is **local-first and zero-config**: `trace.init("my-agent")` writes `./my-agent.ctrace`, a plain SQLite file you can open, query, email or attach to a ticket. Nothing to install, nothing to run, no server. That default never changes on its own — everything below is opt-in.
+
+When you'd rather keep traces in a database you already run (a shared team dashboard, an agent fleet across many containers, a place where `.ctrace` files can't live), point `ctxdiff` at it **once** and every later `trace.init()` follows:
+
+```python
+import ctxdiff
+from ctxdiff import PostgresStore
+
+ctxdiff.configure(store=PostgresStore(dsn="postgresql://user:pw@db.internal/agents"))
+
+# ...from here on, unchanged:
+tracer = ctxdiff.trace.init("support-agent")
+client = tracer.wrap(OpenAI())
+```
+
+Or set an environment variable and change **no code at all**:
+
+```bash
+export CTXDIFF_STORE=postgresql://user:pw@db.internal/agents   # PostgreSQL
+export CTXDIFF_STORE=mysql://user:pw@db.internal/agents        # MySQL / MariaDB
+export CTXDIFF_STORE=sqlite:///var/lib/ctxdiff/agents.ctrace   # one SQLite file
+export CTXDIFF_STORE=~/traces                                  # a directory: ~/traces/<project>.ctrace
+```
+
+The value is a **location**, not a backend name: `CTXDIFF_STORE=postgres` is rejected with a message showing the URL form, rather than quietly creating a local SQLite file called `postgres`.
+
+### The three backends
+
+| Backend | Install | Configure with |
+|---|---|---|
+| **SQLite** (default) | — built in | nothing, or `SQLiteStore(path=...)` |
+| **PostgreSQL** | `pip install 'ctxdiff[postgres]'` | `PostgresStore(dsn="postgresql://...")` |
+| **MySQL / MariaDB** | `pip install 'ctxdiff[mysql]'` | `MySQLStore(dsn="mysql://...")` |
+
+The drivers ([`psycopg`](https://www.psycopg.org/psycopg3/) 3 and [PyMySQL](https://github.com/PyMySQL/PyMySQL)) are **optional extras, imported lazily at connect time**. `ctxdiff`'s core still has exactly one runtime dependency (`tiktoken`), importing `ctxdiff` never imports a database driver, and a store configured for a backend whose extra isn't installed tells you what to install instead of crashing.
+
+### Tables are created for you
+
+On first connect the adapter runs `CREATE TABLE IF NOT EXISTS` for its four tables — `ctxdiff_run`, `ctxdiff_call`, `ctxdiff_block`, `ctxdiff_call_block` — in whatever database the DSN points at. **There is no migration step.** The tables are prefixed because they live in a database you share with your own application, and connecting again is a harmless no-op.
+
+It's the same logical model as a `.ctrace` file, in every backend: sessions, calls, content-hashed blocks stored **once** and referenced by position, and call→block membership. Analyzers can't tell the difference — the same conformance suite runs against all three, against real PostgreSQL and MySQL servers as well as SQLite.
+
+Same *semantics*, too, not just the same shape:
+
+- **Sessions are ordered by write order**, never by `started_at`. Several containers writing into one database will disagree about the clock; ordering by an insert-order column (SQLite's `rowid`, `BIGSERIAL`, `AUTO_INCREMENT`) means "the newest session" is the one written last on every backend, and stays stable between reads.
+- **Keys compare byte-exactly.** MySQL's default collation is case-insensitive, which would make two content hashes differing only in case the same block; ctxdiff pins `ascii_bin` on its id/hash columns so content-addressed dedup means what it says.
+- **Free-text columns are unbounded** on every backend, so a 400-character provider error or tag label stores rather than rejecting the call.
+
+### Reading from a database
+
+The CLI and the dashboard read from the configured store too. With `CTXDIFF_STORE` set (or after `configure()`), the read commands analyze the **newest session** in the database rather than looking for a `.ctrace` in the working directory:
+
+```bash
+ctxdiff tokens                   # newest session in the configured store
+ctxdiff diff --turn 7 --turn 8
+ctxdiff runs                     # every session in the store, oldest first
+ctxdiff export --out run.html    # same self-contained dashboard
+```
+
+`--run PATH` always wins: a path names a file, so it reads that `.ctrace` even when a database is configured. The same rule applies on the write side — `trace.init(project, path=...)` is always a local file.
+
+### A database is never allowed to break your agent
+
+The [fail-open guarantee](#fail-open-guarantee) covers a networked store completely, and matters more there than for a local file:
+
+- **No database I/O ever happens on your call path.** Not the writes, and not the connect either: the session is opened by the run's single background writer thread, so `tracer.wrap()` returns immediately even against a database that is slow, wedged, or not there at all.
+- **Connects and statements are bounded** (5s connect, 10s statement, by default — both configurable), with TCP keepalives and `tcp_user_timeout` so a server that completes its handshake and then stops answering can't wedge the writer either. `tracer.close()` is bounded by the same statement timeout.
+- **A dead database degrades capture, never the run.** If the store can't be reached or created, `ctxdiff` logs **one** warning, records nothing, and your calls run exactly as if `ctxdiff` weren't there. It never silently falls back to writing a local file you didn't ask for.
+- **A connection killed mid-run is reopened.** A pooler recycle, a failover or a database restart costs the write that was in flight, not the rest of the run.
+- **A typo'd DSN behaves the same way** — a misconfigured trace destination is a tracing problem, and tracing problems must not take down the program being traced.
+
+### Writing your own backend
+
+`Store` and `StoreBackend` (`ctxdiff.store.base`) are small runtime-checkable protocols — seven methods and two, respectively. Anything satisfying them can be passed to `configure(store=...)`; no base class, no registration.
 
 ---
 
@@ -506,7 +593,7 @@ run total · in 18,400 tok · out 640 tok (5/6 calls reported usage)
 
 ### Reading a trace back
 
-Traces are read through the `CTrace` API. A run has calls (one per LLM request, in `seq` order); each call has ordered blocks.
+Traces are read through the `CTrace` API. A run has calls (one per LLM request, in `seq` order); each call has ordered blocks. The same calls work against any backend — `CTrace` is just the SQLite implementation of the `Store` protocol, so a `PostgresStore(...).open_reader()` handle reads identically (see [Storage backends](#storage-backends)).
 
 ```python
 from ctxdiff.store.ctrace import CTrace

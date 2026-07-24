@@ -30,6 +30,7 @@ from ctxdiff.analyze.cache import CacheReport, analyze_cache
 from ctxdiff.analyze.differ import TurnDiff, diff_turns, distinct_agents
 from ctxdiff.analyze.tokens import RunTokens, analyze_run
 from ctxdiff.store.ctrace import CTrace
+from ctxdiff.store.base import Store
 from ctxdiff.viewer.template import render_page
 
 # How much of a diff entry's block text to embed as its snippet, and how much
@@ -173,7 +174,7 @@ def _serialize_cache(cr: CacheReport) -> dict:
 # --- payload assembly ----------------------------------------------------------
 
 
-def build_payload(ct: CTrace) -> dict:
+def build_payload(ct: Store) -> dict:
     """Assemble every fact the dashboard renders into one JSON-serializable
     dict (spec §7.2, amended). Pure: it reads from `ct` and the three analyzers
     and returns a dict — no filesystem, no template, no HTML.
@@ -296,21 +297,39 @@ def export_html(ctrace_path: str, out_path: str | None = None) -> str:
     return the written path. `out_path` overrides the destination; by default
     the file is written as `<trace-stem>.html` right next to the trace. Opens
     the trace read-only, builds the payload, embeds it in the page template
-    (title = "ctxdiff — {project}"), and writes UTF-8."""
+    (title = "ctxdiff — {project}"), and writes UTF-8.
+
+    The file-specific half of exporting: it resolves the default output path
+    from the TRACE's own path (which only a file-backed store has) and owns the
+    handle's lifetime, then hands the open store to `export_store` — which is
+    what a networked backend uses instead."""
     ct = CTrace.open(ctrace_path)
     try:
-        payload = build_payload(ct)
+        if out_path is None:
+            stem = os.path.splitext(os.path.basename(ctrace_path))[0]
+            out_path = os.path.join(
+                os.path.dirname(os.path.abspath(ctrace_path)), f"{stem}.html")
+        return export_store(ct, out_path)
     finally:
         ct.close()
 
+
+def export_store(ct: Store, out_path: str | None = None) -> str:
+    """Export an ALREADY-OPEN store handle to a self-contained HTML dashboard
+    and return the written path — the backend-agnostic export path, used when
+    the trace lives in Postgres/MySQL and there is no file to name.
+
+    The caller owns the handle (this never closes it), because the caller is the
+    one that knows whether the same handle is about to be used again. With no
+    `out_path`, the dashboard is written as `./<project>.html`, the only
+    sensible default when the source has no filename to borrow one from."""
+    payload = build_payload(ct)
     project = payload["run"]["project"]
     document = render_page(project_title=html.escape(f"ctxdiff — {project}"),
                            data_json=_embed_json(payload))
 
     if out_path is None:
-        stem = os.path.splitext(os.path.basename(ctrace_path))[0]
-        out_path = os.path.join(
-            os.path.dirname(os.path.abspath(ctrace_path)), f"{stem}.html")
+        out_path = f"{project}.html"
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(document)

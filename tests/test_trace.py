@@ -51,12 +51,19 @@ def test_wrap_passes_through_and_records(tmp_path):
 
 def test_wrap_detects_provider_from_client(tmp_path):
     """Provider is inferred from the client's module so the right adapter and
-    run.provider are used without the caller specifying it."""
+    run.provider are used without the caller specifying it.
+
+    Read after `close()`, not straight after `wrap()`: the session is opened on
+    the writer thread (so no store I/O ever sits on the host's call path — see
+    `_DeferredStore`), which makes its creation asynchronous. `close()` is the
+    point at which every write for the run, including that first one, is
+    guaranteed flushed."""
     t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
     t.wrap(_FakeOpenAI())
+    t.close()
     ct = CTrace.open(str(tmp_path / "r.ctrace"))
     assert ct.get_run().provider == "openai"
-    ct.close(); t.close()
+    ct.close()
 
 
 def test_wrap_backfills_run_models_from_the_call(tmp_path):

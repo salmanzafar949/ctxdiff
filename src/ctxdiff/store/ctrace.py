@@ -7,19 +7,30 @@ here.
 Project-scoped model: one file per PROJECT, appended to over time. Each
 `trace.init()` opens the project DB (creating it if absent) and inserts a NEW
 `run` row — one session. A single-session file (one `run` row) is simply the
-degenerate case and reads identically to before."""
+degenerate case and reads identically to before.
+
+`CTrace` is the DEFAULT implementation of the backend-independent `Store`
+protocol (`ctxdiff.store.base`) — local-first, zero-config, and what every
+existing user keeps getting unless they explicitly configure another backend.
+It satisfies the protocol structurally (no base class, no behavior change); the
+row dataclasses it returns now live in `base.py` and are re-exported here so
+`from ctxdiff.store.ctrace import Call, CTrace, Run, Session` still works."""
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from ctxdiff import __version__
 from ctxdiff.models import Block, CallBlock
+from ctxdiff.store.base import (  # noqa: F401 — re-exported for import compat
+    Call,
+    EmptyStoreError,
+    Run,
+    Session,
+    parse_started_at,
+)
 from ctxdiff.store.schema import DDL, SCHEMA_VERSION
 
 # started_at is passed in by the caller (the tracer) rather than read from the
@@ -38,79 +49,13 @@ _WRITE_BACKOFF_START = 0.05  # seconds; doubles each retry, capped by _WRITE_BAC
 _WRITE_BACKOFF_MAX = 0.5
 
 
-def parse_started_at(value: str) -> datetime:
-    """Parse a session's stored `started_at` into a tz-AWARE UTC datetime,
-    tolerant of BOTH formats a file may carry: the canonical UTC-with-offset
-    string new sessions write (`...+00:00`, or a trailing `Z`) AND a legacy
-    naive/UTC-without-offset string older rows used. A naive value is assumed
-    to be UTC and coerced to aware, so downstream local-timezone rendering is
-    always unambiguous regardless of which format produced the row. Any value
-    ISO-parsing can't make sense of raises ValueError to the caller."""
-    # `fromisoformat` accepts a trailing 'Z' only on 3.11+; normalize it first
-    # so both spellings of UTC round-trip identically.
-    text = value.strip()
-    if text.endswith("Z") or text.endswith("z"):
-        text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        # Legacy naive row: it was written as UTC, so stamp UTC onto it rather
-        # than letting it be interpreted in the reader's local zone.
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-@dataclass(frozen=True)
-class Run:
-    """One agent execution, as stored in the `run` table."""
-    id: str
-    project: str
-    started_at: str
-    provider: str
-    models: list[str]
-    ctxdiff_version: str
-
-
-@dataclass(frozen=True)
-class Session:
-    """A one-line summary of one session (one `run` row) in a project DB, as
-    returned by `CTrace.list_sessions()` — the shape an agent/session picker
-    (built in a later workstream) lists from. `agents` is the set of distinct
-    agent labels seen on this session's calls, in first-appearance order ([]
-    for a single-agent/pre-v2 session); `turn_count` is how many calls it
-    holds. `started_at` is the raw stored string — use `parse_started_at()` for
-    a tz-aware datetime to render in local time."""
-    id: str
-    project: str
-    started_at: str
-    provider: str
-    models: list[str]
-    agents: list[str]
-    turn_count: int
-
-
-@dataclass(frozen=True)
-class Call:
-    """One LLM request/response ('turn'), as stored in the `call` table.
-    `agent`/`step`/`provider` are the v2 attribution fields (all nullable): the
-    agent that made the call, the sticky step label active at the time, and the
-    provider it went through. They surface as None for a v1 file read under v2
-    code, and default to None so pre-v2 callers/tests can construct a Call
-    without them."""
-    id: str
-    run_id: str
-    seq: int
-    params: dict
-    usage: dict | None
-    latency_ms: int | None
-    error: str | None
-    agent: str | None = None
-    step: str | None = None
-    provider: str | None = None
-
-
 class CTrace:
-    """A handle to one `.ctrace` file. Construct via `create()` (new run) or
-    `open()` (existing run); never call the initializer directly."""
+    """A handle to one session in one `.ctrace` file — ctxdiff's DEFAULT `Store`
+    implementation (see `ctxdiff.store.base.Store`), which it satisfies
+    structurally rather than by inheritance so nothing about the local-first
+    path changed when the protocol was introduced. Construct via `create()` (new
+    file, one run) or `open_or_create_session()` (append a session) or `open()`
+    (read); never call the initializer directly."""
 
     def __init__(self, conn: sqlite3.Connection, run_id: str):
         """Wrap an already-open, already-initialized connection for one run.
@@ -354,7 +299,7 @@ class CTrace:
             row = conn.execute(
                 "SELECT id, schema_version FROM run ORDER BY rowid DESC LIMIT 1").fetchone()
             if row is None:
-                raise ValueError(f"{path}: not a ctrace file (no run row)")
+                raise EmptyStoreError(f"{path}: not a ctrace file (no run row)")
             run_id, version = row
             if version > SCHEMA_VERSION:
                 raise ValueError(
