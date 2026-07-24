@@ -723,3 +723,634 @@ def test_wrap_async_responses_create_is_intercepted(tmp_path):
     blocks = ct.get_call_blocks(calls[0].id)
     assert blocks[0].block.text == "hi async responses"
     ct.close()
+
+
+# --- Streaming usage capture -------------------------------------------------
+# `kwargs.get("stream")` truthy routes the interceptor to `_StreamProxy`/
+# `_AsyncStreamProxy` instead of recording at call-time (see trace.py's
+# module docstring). These fakes mirror the REAL openai.Stream/
+# AsyncStream/anthropic.Stream shape confirmed against the real SDKs
+# (tests/eval/test_wrap_streaming.py, and the Phase 12 Step-0 probe): a
+# generator-backed object with __iter__/__next__ (or __aiter__/__anext__),
+# .close(), context-manager support, and a passthrough attribute.
+
+
+class _StreamUsage:
+    """Stand-in for a ChatCompletionChunk's `.usage` — only present, per
+    real SDK behavior, on the FINAL chunk of a stream (see capture/openai.py)."""
+    def __init__(self, prompt_tokens, completion_tokens, total_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
+
+
+class _StreamChunk:
+    """Stand-in for one ChatCompletionChunk: content plus an optional usage."""
+    def __init__(self, content, usage=None):
+        self.content = content
+        self.usage = usage
+
+
+class _FakeSyncStream:
+    """Stand-in for openai.Stream/anthropic.Stream: a plain iterator over
+    pre-built chunks, exposing close(), context-manager support, and a
+    passthrough attribute (`.response`) so `_StreamProxy`'s forwarding can
+    be tested."""
+    def __init__(self, chunks):
+        self._chunks = iter(chunks)
+        self.closed = False
+        self.close_calls = 0
+        self.response = "raw-http-response-sentinel"
+
+    def __iter__(self): return self
+    def __next__(self): return next(self._chunks)
+
+    def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+class _RaisingSyncStream:
+    """Stand-in for a sync stream that yields `raise_after` normal chunks
+    then RAISES mid-generation — the PROVIDER's own stream dying partway
+    through (a dropped connection, a mid-response API error, ...), not
+    anything ctxdiff does. Otherwise identical in shape to `_FakeSyncStream`
+    (close(), context-manager support) so it exercises the exact same
+    forwarding paths, just with a failure instead of a clean StopIteration."""
+    def __init__(self, chunks, raise_after):
+        self._chunks = list(chunks)
+        self._raise_after = raise_after
+        self._i = 0
+        self.closed = False
+        self.close_calls = 0
+
+    def __iter__(self): return self
+
+    def __next__(self):
+        if self._i >= self._raise_after:
+            raise BoomError("stream died mid-generation")
+        chunk = self._chunks[self._i]
+        self._i += 1
+        return chunk
+
+    def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+class _FakeAsyncStream:
+    """Async mirror of `_FakeSyncStream`."""
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self._i = 0
+        self.closed = False
+        self.close_calls = 0
+        self.response = "raw-http-response-sentinel"
+
+    def __aiter__(self): return self
+
+    async def __anext__(self):
+        if self._i >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._i]
+        self._i += 1
+        return chunk
+
+    async def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+        return False
+
+
+class _RaisingAsyncStream:
+    """Async mirror of `_RaisingSyncStream`: yields `raise_after` normal
+    chunks then RAISES mid-generation."""
+    def __init__(self, chunks, raise_after):
+        self._chunks = list(chunks)
+        self._raise_after = raise_after
+        self._i = 0
+        self.closed = False
+        self.close_calls = 0
+
+    def __aiter__(self): return self
+
+    async def __anext__(self):
+        if self._i >= self._raise_after:
+            raise BoomError("async stream died mid-generation")
+        chunk = self._chunks[self._i]
+        self._i += 1
+        return chunk
+
+    async def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+        return False
+
+
+class _FakeStreamingCompletions:
+    """Stand-in for client.chat.completions whose create() returns a
+    pre-built fake stream when stream=True (mirroring the real SDK) — the
+    stream to return is set on the instance before the call, since each
+    test builds its own exact chunk sequence."""
+    def __init__(self):
+        self.calls = []
+        self.next_stream = None
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.next_stream
+
+
+class _FakeStreamingChat:
+    def __init__(self): self.completions = _FakeStreamingCompletions()
+
+
+class _FakeStreamingOpenAI:
+    __module__ = "openai"
+    def __init__(self): self.chat = _FakeStreamingChat()
+
+
+def test_stream_yields_chunks_unchanged_and_records_once_with_usage(tmp_path):
+    """Full consumption of a sync stream: every chunk the caller receives is
+    IDENTICAL and IN ORDER to what the fake stream produced, and after
+    iteration completes, exactly one call is recorded, with usage folded
+    from the final chunk."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [
+        _StreamChunk("Hello"),
+        _StreamChunk(" there"),
+        _StreamChunk(None, usage=_StreamUsage(10, 2, 12)),
+    ]
+    client.chat.completions.next_stream = _FakeSyncStream(chunks)
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}],
+        stream=True, stream_options={"include_usage": True})
+    received = list(stream)
+    assert received == chunks  # identical objects, in order — nothing dropped/reordered
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    ct.close()
+
+
+def test_stream_double_iteration_does_not_double_record(tmp_path):
+    """Exhausting the stream, then calling .close() on it afterward, does NOT
+    record a second call — the _finalized guard covers finalize triggered
+    from more than one completion path."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_stream = _FakeSyncStream([_StreamChunk("hi")])
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    list(stream)     # exhausts -> finalizes once
+    stream.close()   # a second completion signal -> must be a no-op
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert len(ct.get_calls()) == 1
+    ct.close()
+
+
+def test_stream_partial_consumption_then_close_records_partial_usage(tmp_path):
+    """Consuming only SOME chunks, then calling .close() before reaching the
+    usage-bearing chunk, records the call once with usage=None (the honest
+    reflection of what was actually accumulated before abandonment)."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [
+        _StreamChunk("Hello"),
+        _StreamChunk(" there"),
+        _StreamChunk(None, usage=_StreamUsage(10, 2, 12)),
+    ]
+    client.chat.completions.next_stream = _FakeSyncStream(chunks)
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    first = next(stream)
+    assert first is chunks[0]
+    stream.close()
+    assert client.chat.completions.next_stream.closed  # real close() was forwarded to
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None
+    ct.close()
+
+
+def test_stream_context_manager_triggers_finalize_on_exit(tmp_path):
+    """`with wrapped_stream as s:` both forwards to the wrapped stream's own
+    __enter__/__exit__ (closing its real connection) and triggers finalize
+    on block exit."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hello"), _StreamChunk(None, usage=_StreamUsage(5, 1, 6))]
+    client.chat.completions.next_stream = _FakeSyncStream(chunks)
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    with stream as s:
+        received = list(s)
+    assert received == chunks
+    assert client.chat.completions.next_stream.closed
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+    ct.close()
+
+
+def test_stream_no_usage_records_usage_none_not_a_crash(tmp_path):
+    """A stream with NO usage-bearing chunk at all (e.g. OpenAI chat without
+    stream_options={"include_usage": True} — the honest documented gap) is
+    still fully consumable and still recorded, with usage=None."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_stream = _FakeSyncStream(
+        [_StreamChunk("Hello"), _StreamChunk(" there")])
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    received = list(stream)
+    assert len(received) == 2
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None
+    ct.close()
+
+
+def test_stream_passthrough_attribute_forwards_to_wrapped_stream(tmp_path):
+    """__getattr__ forwards attributes not defined on the proxy (e.g.
+    `.response`) straight to the wrapped stream — same transparency contract
+    `_ClientProxy` already gives the client itself."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_stream = _FakeSyncStream([_StreamChunk("hi")])
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    assert stream.response == "raw-http-response-sentinel"
+    list(stream)
+    t.close()
+
+
+def test_stream_fail_open_accumulate_usage_raises_chunks_still_delivered(tmp_path, monkeypatch):
+    """If the adapter's accumulate_stream_usage raises on every chunk, the
+    caller must still receive every chunk, unchanged and in order — the
+    hardest fail-open constraint. The call still ends up recorded (with
+    usage=None, since nothing could be accumulated)."""
+    from ctxdiff.capture.openai import OpenAIAdapter
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hello"), _StreamChunk(None, usage=_StreamUsage(1, 1, 2))]
+    client.chat.completions.next_stream = _FakeSyncStream(chunks)
+
+    monkeypatch.setattr(OpenAIAdapter, "accumulate_stream_usage",
+                        lambda self, chunk, state: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    received = list(stream)
+    assert received == chunks  # every chunk still delivered despite accumulate() blowing up
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None
+    ct.close()
+
+
+def test_stream_fail_open_record_raises_iteration_still_completes(tmp_path, monkeypatch):
+    """If recorder.record itself raises at finalize time, iteration must
+    still complete normally for the caller — same fail-open contract the
+    non-streaming path already has
+    (test_wrap_is_fail_open_if_recording_breaks)."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_stream = _FakeSyncStream(
+        [_StreamChunk("Hello"), _StreamChunk(None, usage=_StreamUsage(1, 1, 2))])
+
+    monkeypatch.setattr(t._recorder, "record",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    received = list(stream)  # must not raise
+    assert len(received) == 2
+
+
+def test_stream_mid_error_records_error_and_reraises_unchanged(tmp_path):
+    """A stream that yields K good chunks then RAISES mid-generation (the
+    provider's own stream dying partway through): the K chunks are delivered
+    to the caller unchanged before the raise, the ORIGINAL exception
+    propagates unchanged (not swallowed, not wrapped), and the call is
+    recorded EXACTLY ONCE with `error == 'BoomError'` — a mid-stream failure
+    must never look like a silently-successful call that merely has no
+    usage."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hello"), _StreamChunk(" there")]
+    client.chat.completions.next_stream = _RaisingSyncStream(chunks, raise_after=2)
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    received = []
+    with pytest.raises(BoomError):
+        for c in stream:
+            received.append(c)
+    assert received == chunks  # both good chunks delivered before the raise
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    assert calls[0].usage is None  # nothing accumulated before the failure
+    ct.close()
+
+
+def test_stream_mid_error_preserves_usage_accumulated_before_failure(tmp_path):
+    """Usage accumulated from chunks BEFORE the failure is preserved on the
+    error-recorded call — a stream that dies mid-generation AFTER already
+    reporting some usage still reflects what was actually captured, not a
+    blanket None."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hello", usage=_StreamUsage(10, 2, 12))]
+    client.chat.completions.next_stream = _RaisingSyncStream(chunks, raise_after=1)
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    with pytest.raises(BoomError):
+        list(stream)
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert calls[0].error == "BoomError"
+    assert calls[0].usage == {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    ct.close()
+
+
+def test_stream_context_manager_mid_error_records_error_exactly_once(tmp_path):
+    """`with wrapped_stream as s:` around a mid-stream error: __next__'s
+    deterministic finalize records `error='BoomError'` at the moment of
+    failure; __exit__'s own finalize call afterward (`with` always calls
+    __exit__ when an exception propagates through the block) is a no-op
+    under the `_finalized` guard — not a double record, and not an
+    accidental overwrite back to error=None. The real stream's own
+    __exit__/close() is still forwarded to."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _RaisingSyncStream([_StreamChunk("Hello")], raise_after=1)
+    client.chat.completions.next_stream = real_stream
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    with pytest.raises(BoomError):
+        with stream as s:
+            for c in s:
+                pass
+    assert real_stream.closed  # __exit__ still forwarded to the real stream
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    ct.close()
+
+
+def test_stream_abandoned_without_close_is_recorded_via_del(tmp_path, capsys):
+    """A stream the caller never exhausts, closes, or uses as a context
+    manager is still recorded on garbage collection (__del__), best-effort,
+    with whatever partial usage was accumulated (here: none, since it was
+    never consumed at all) — and no exception or traceback escapes/leaks to
+    stderr from that best-effort GC-time path (the `quiet=True` +
+    `except BaseException` contract on `__del__`)."""
+    import gc
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeStreamingOpenAI()
+    wrapped = t.wrap(client)
+    client.chat.completions.next_stream = _FakeSyncStream(
+        [_StreamChunk("Hello"), _StreamChunk(None, usage=_StreamUsage(1, 1, 2))])
+
+    stream = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+    del stream
+    gc.collect()  # must not raise or print a traceback
+
+    t.close()
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "Exception ignored" not in captured.err
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None
+    ct.close()
+
+
+# --- Async stream equivalents ------------------------------------------------
+
+
+class _FakeAsyncStreamingCompletions:
+    def __init__(self):
+        self.calls = []
+        self.next_stream = None
+
+    async def create(self, **kwargs):
+        await asyncio.sleep(0)
+        self.calls.append(kwargs)
+        return self.next_stream
+
+
+class _FakeAsyncStreamingChat:
+    def __init__(self): self.completions = _FakeAsyncStreamingCompletions()
+
+
+class _FakeAsyncStreamingOpenAI:
+    __module__ = "openai"
+    def __init__(self): self.chat = _FakeAsyncStreamingChat()
+
+
+def test_async_stream_yields_chunks_unchanged_and_records_once_with_usage(tmp_path):
+    """Async mirror of
+    test_stream_yields_chunks_unchanged_and_records_once_with_usage."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hi"), _StreamChunk(None, usage=_StreamUsage(4, 2, 6))]
+    client.chat.completions.next_stream = _FakeAsyncStream(chunks)
+
+    async def run():
+        stream = await wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}],
+            stream=True, stream_options={"include_usage": True})
+        return [c async for c in stream]
+
+    received = asyncio.run(run())
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+    ct.close()
+
+
+def test_async_stream_context_manager_triggers_finalize_on_exit(tmp_path):
+    """`async with wrapped_stream as s:` forwards to the wrapped stream and
+    triggers finalize on block exit — async mirror of the sync context-
+    manager test."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hi"), _StreamChunk(None, usage=_StreamUsage(3, 1, 4))]
+    client.chat.completions.next_stream = _FakeAsyncStream(chunks)
+
+    async def run():
+        stream = await wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+        async with stream as s:
+            return [c async for c in s]
+
+    received = asyncio.run(run())
+    assert received == chunks
+    assert client.chat.completions.next_stream.closed
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    ct.close()
+
+
+def test_async_stream_fail_open_accumulate_raises_chunks_still_delivered(tmp_path, monkeypatch):
+    """Async mirror of the sync fail-open accumulate test."""
+    from ctxdiff.capture.openai import OpenAIAdapter
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hi"), _StreamChunk(None, usage=_StreamUsage(1, 1, 2))]
+    client.chat.completions.next_stream = _FakeAsyncStream(chunks)
+
+    monkeypatch.setattr(OpenAIAdapter, "accumulate_stream_usage",
+                        lambda self, chunk, state: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    async def run():
+        stream = await wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+        return [c async for c in stream]
+
+    received = asyncio.run(run())
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_calls()[0].usage is None
+    ct.close()
+
+
+def test_async_stream_mid_error_records_error_and_reraises_unchanged(tmp_path):
+    """Async mirror of test_stream_mid_error_records_error_and_reraises_unchanged."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hi"), _StreamChunk(" there")]
+    client.chat.completions.next_stream = _RaisingAsyncStream(chunks, raise_after=2)
+
+    async def run():
+        stream = await wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+        received = []
+        with pytest.raises(BoomError):
+            async for c in stream:
+                received.append(c)
+        return received
+
+    received = asyncio.run(run())
+    assert received == chunks
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    assert calls[0].usage is None
+    ct.close()
+
+
+def test_async_stream_context_manager_mid_error_records_error_exactly_once(tmp_path):
+    """Async mirror of test_stream_context_manager_mid_error_records_error_exactly_once:
+    `async with wrapped_stream as s:` around a mid-stream error records
+    error='BoomError' exactly once, and the real stream's own __aexit__ is
+    still forwarded to."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamingOpenAI()
+    wrapped = t.wrap(client)
+    real_stream = _RaisingAsyncStream([_StreamChunk("Hi")], raise_after=1)
+    client.chat.completions.next_stream = real_stream
+
+    async def run():
+        stream = await wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+        with pytest.raises(BoomError):
+            async with stream as s:
+                async for c in s:
+                    pass
+
+    asyncio.run(run())
+    assert real_stream.closed
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].error == "BoomError"
+    ct.close()

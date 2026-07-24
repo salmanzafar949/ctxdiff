@@ -34,14 +34,20 @@ class Recorder:
                latency_ms: int | None, error: str | None,
                tagged: list[tuple[str, str]],
                agent: str | None = None, step: str | None = None,
-               provider: str | None = None) -> None:
+               provider: str | None = None, quiet: bool = False) -> None:
         """Build and store one call from its request kwargs and response. Every
         step runs inside a catch-all: any failure is logged once and swallowed,
         leaving the host application's own call path untouched (fail-open).
         `tagged` is a list of (label, needle) pairs used to override labels.
         `agent`/`step`/`provider` are the v2 attribution fields threaded through
         to the store unchanged (they flow inside this guarded path so capturing
-        them can never break the host, per the fail-open contract)."""
+        them can never break the host, per the fail-open contract). `quiet`
+        (default False; set only by a stream proxy's best-effort `__del__`
+        finalize — see trace.py) suppresses the trailing `exc_info=True`
+        warning log below on failure: at GC/interpreter-shutdown time (module
+        globals possibly already torn down, the store possibly already
+        closed) that log call is pure noise at best and must never itself
+        misbehave, so this one caller opts out of it rather than risk it."""
         try:
             raw = self._adapter.extract_blocks(kwargs)
             params = self._adapter.extract_params(kwargs)
@@ -73,8 +79,9 @@ class Recorder:
                                  call_blocks=call_blocks,
                                  agent=agent, step=step, provider=provider)
         except Exception:  # noqa: BLE001 — fail-open is the whole point
-            _log.warning("ctxdiff: failed to record call seq=%s (tracing skipped)",
-                         seq, exc_info=True)
+            if not quiet:
+                _log.warning("ctxdiff: failed to record call seq=%s (tracing skipped)",
+                             seq, exc_info=True)
 
     def _safe_redact(self, block: Block) -> Block:
         """Apply the redaction hook, but never let a throwing redactor break

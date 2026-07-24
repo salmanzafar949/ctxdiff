@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ctxdiff"
-version = "0.3.1"
+version = "0.4.0"
 description = "git diff for your agent's context window — a context-window debugger for LLM agents"
 readme = "README.md"
 requires-python = ">=3.10"
