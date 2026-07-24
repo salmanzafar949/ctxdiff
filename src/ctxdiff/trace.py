@@ -41,7 +41,6 @@ import queue
 import threading
 import time
 import types
-import uuid
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -317,11 +316,19 @@ class _Writer:
 
 def init(project: str, redact: Callable[[Block], Block] | None = None,
          path: str | None = None) -> "Tracer":
-    """Create a Tracer for one run. `project` names the run; `redact` is an
-    optional per-block scrubber applied before storage; `path` is where the
-    .ctrace is written (defaults to ./<project>-<uuid>.ctrace in the cwd)."""
+    """Create a Tracer that opens the project's `.ctrace` and starts a NEW
+    SESSION in it. `project` names the project; `redact` is an optional per-block
+    scrubber applied before storage.
+
+    Project-scoped storage (v0.6): `path` defaults to a STABLE
+    `./<project>.ctrace` in the cwd — NOT a per-run `<project>-<uuid>.ctrace`.
+    The first `wrap()` opens that file if it already exists and APPENDS a new
+    session (a fresh `run` row) to it, or creates it if absent; so every
+    `trace.init(project)` accumulates one more session in the same project DB
+    rather than scattering a file per run. An explicit `path=` works the same
+    way — it appends when the file already exists."""
     if path is None:
-        path = f"{project}-{uuid.uuid4().hex[:8]}.ctrace"
+        path = f"{project}.ctrace"
     return Tracer(project=project, redact=redact, path=path)
 
 
@@ -359,6 +366,12 @@ class Tracer:
         # for backward compat: tests monkeypatch t._recorder.build to prove the
         # interceptor wiring is fail-open even when recording is broken)
         self._writer: _Writer | None = None     # single writer thread (lazy, per wrap)
+        # One-time guard for the store-setup fail-open path in wrap(): if the
+        # project store can't be created/opened (e.g. a persistent lock under
+        # heavy concurrent session creation), we degrade fail-open and warn at
+        # most once for the run rather than raising into the host.
+        self._setup_lock = threading.Lock()
+        self._setup_warned = False
         self._seq = itertools.count(1)          # thread-safe monotonic turn index
         # Per-execution-context capture state (see docstring). Defaults: no
         # pending tags (empty tuple) and no sticky step (None).
@@ -393,14 +406,35 @@ class Tracer:
             # a bogus [""] — CTrace.record_call()/note_model() backfill the
             # real model(s) as calls come in (see store/ctrace.py).
             model = ""
+            # Canonical UTC-with-offset (`...+00:00`) so downstream local-time
+            # rendering is always unambiguous — see store.parse_started_at.
             started = datetime.now(timezone.utc).isoformat()
-            self._ct = CTrace.create(self.path, project=self._project,
-                                     provider=provider, model=model,
-                                     started_at=started)
-            # Start the single writer thread that will own this connection and
-            # perform every persist for the run — created exactly once, with
-            # the store, on the first wrap (see `_Writer`).
-            self._writer = _Writer(self._ct)
+            # open_or_create_session APPENDS a new session (run row) to an
+            # existing project DB, or creates the file — the project-scoped
+            # write path (see store/ctrace.py). The connection it returns carries
+            # WAL + busy_timeout for safe concurrent multi-writer access.
+            #
+            # Fail-open guard (the last line of defence): store setup already
+            # sets busy_timeout first and retries on a transient lock, but if it
+            # STILL raises (any OperationalError/other exception — e.g. a
+            # genuinely stuck lock under extreme concurrent creation on the same
+            # project file), that must NEVER escape into the host and lose the
+            # whole session hard. We degrade fail-open: leave `_ct`/`_writer` as
+            # None, warn once, and fall through to return a proxy whose calls run
+            # normally but record nothing — every recording path short-circuits
+            # on `self._writer is None` in `_on_create`.
+            try:
+                self._ct = CTrace.open_or_create_session(
+                    self.path, project=self._project, provider=provider,
+                    model=model, started_at=started)
+                # Start the single writer thread that will own this connection
+                # and perform every persist for the run — created exactly once,
+                # with the store, on the first wrap (see `_Writer`).
+                self._writer = _Writer(self._ct)
+            except Exception:  # noqa: BLE001 — store setup must never break the host
+                self._ct = None
+                self._writer = None
+                self._warn_setup_degraded()
         recorder = Recorder(self._ct, adapter, self._redact)
         if self._recorder is None:
             # Keep the first recorder reachable as t._recorder (see __init__).
@@ -414,6 +448,20 @@ class Tracer:
         paths = getattr(adapter, "create_paths", None) or (adapter.create_path,)
         return _ClientProxy(client, (), self, paths,
                             recorder, agent, provider, adapter)
+
+    def _warn_setup_degraded(self) -> None:
+        """Emit the capture-degradation warning AT MOST ONCE for the run when
+        store setup in `wrap()` fails and capture falls back to fail-open (record
+        nothing). Mirrors `_Writer._degrade`'s one-time semantics with a
+        lock-guarded flag so repeated wraps on a broken store can't spam the
+        host's logs. `exc_info=True` captures the underlying setup error (e.g.
+        the stuck-lock OperationalError) for diagnosis without ever re-raising."""
+        with self._setup_lock:
+            if self._setup_warned:
+                return
+            self._setup_warned = True
+        _log.warning("ctxdiff: capture degraded (store setup failed); this run "
+                     "will not be recorded", exc_info=True)
 
     def tag(self, label: str, items: list) -> None:
         """Buffer semantic tags for the NEXT recorded call only, in the CURRENT

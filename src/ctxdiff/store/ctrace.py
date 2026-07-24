@@ -1,12 +1,22 @@
-"""Read/write access to a `.ctrace` file — a plain SQLite database holding one
-run, its calls, and content-addressed blocks. Writers dedup blocks by hash;
-readers reconstruct ordered CallBlocks. No analysis lives here."""
+"""Read/write access to a `.ctrace` file — a plain SQLite database that is a
+project DB holding one OR MANY sessions (each session is one `run` row), their
+calls, and content-addressed blocks. Writers dedup blocks by hash; readers
+reconstruct ordered CallBlocks and can list/select sessions. No analysis lives
+here.
+
+Project-scoped model: one file per PROJECT, appended to over time. Each
+`trace.init()` opens the project DB (creating it if absent) and inserts a NEW
+`run` row — one session. A single-session file (one `run` row) is simply the
+degenerate case and reads identically to before."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from ctxdiff import __version__
 from ctxdiff.models import Block, CallBlock
@@ -14,6 +24,39 @@ from ctxdiff.store.schema import DDL, SCHEMA_VERSION
 
 # started_at is passed in by the caller (the tracer) rather than read from the
 # clock here, so the store stays a pure I/O layer and is trivially testable.
+
+# Multi-writer knobs. Multiple Tracers in one process AND multiple processes may
+# write the same project DB concurrently. WAL (set at create/open time) lets
+# readers run while one writer commits; `busy_timeout` makes SQLite BLOCK an
+# incoming writer for up to this long waiting for the lock instead of failing
+# instantly; the bounded retry loop below is the last line of defence on top of
+# that, so a brief contention degrades fail-open (drop + warn upstream) rather
+# than raising into the host or hanging.
+_BUSY_TIMEOUT_MS = 5000
+_WRITE_MAX_ATTEMPTS = 6      # total tries before giving up (fail-open upstream)
+_WRITE_BACKOFF_START = 0.05  # seconds; doubles each retry, capped by _WRITE_BACKOFF_MAX
+_WRITE_BACKOFF_MAX = 0.5
+
+
+def parse_started_at(value: str) -> datetime:
+    """Parse a session's stored `started_at` into a tz-AWARE UTC datetime,
+    tolerant of BOTH formats a file may carry: the canonical UTC-with-offset
+    string new sessions write (`...+00:00`, or a trailing `Z`) AND a legacy
+    naive/UTC-without-offset string older rows used. A naive value is assumed
+    to be UTC and coerced to aware, so downstream local-timezone rendering is
+    always unambiguous regardless of which format produced the row. Any value
+    ISO-parsing can't make sense of raises ValueError to the caller."""
+    # `fromisoformat` accepts a trailing 'Z' only on 3.11+; normalize it first
+    # so both spellings of UTC round-trip identically.
+    text = value.strip()
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        # Legacy naive row: it was written as UTC, so stamp UTC onto it rather
+        # than letting it be interpreted in the reader's local zone.
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -25,6 +68,24 @@ class Run:
     provider: str
     models: list[str]
     ctxdiff_version: str
+
+
+@dataclass(frozen=True)
+class Session:
+    """A one-line summary of one session (one `run` row) in a project DB, as
+    returned by `CTrace.list_sessions()` — the shape an agent/session picker
+    (built in a later workstream) lists from. `agents` is the set of distinct
+    agent labels seen on this session's calls, in first-appearance order ([]
+    for a single-agent/pre-v2 session); `turn_count` is how many calls it
+    holds. `started_at` is the raw stored string — use `parse_started_at()` for
+    a tz-aware datetime to render in local time."""
+    id: str
+    project: str
+    started_at: str
+    provider: str
+    models: list[str]
+    agents: list[str]
+    turn_count: int
 
 
 @dataclass(frozen=True)
@@ -99,17 +160,35 @@ class CTrace:
         whole run is created under them."""
         conn = sqlite3.connect(path, check_same_thread=False)
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.executescript(DDL)
+            # busy_timeout FIRST — before WAL/foreign_keys/DDL, which all take a
+            # write lock and would otherwise fail INSTANTLY with "database is
+            # locked" under concurrent creation on the same file. Set ahead of
+            # everything else, it makes those very statements block-and-wait for
+            # the lock instead (see open_or_create_session for the full story).
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             run_id = uuid.uuid4().hex
             models = [model] if model else []
-            conn.execute(
-                "INSERT INTO run VALUES (?,?,?,?,?,?,?)",
-                (run_id, project, started_at, provider,
-                 json.dumps(models), __version__, SCHEMA_VERSION),
-            )
-            conn.commit()
+
+            def _setup():
+                # The whole setup (WAL enable + DDL + run INSERT) can still
+                # surface a transient "database is locked" under heavy
+                # multi-writer contention even with busy_timeout, so it runs
+                # through the same bounded locked-retry as record_call. Made
+                # safe to re-run: a leading rollback drops any partial state
+                # from a prior locked attempt, WAL is idempotent, the DDL is
+                # IF NOT EXISTS, and the INSERT is wrapped in its own
+                # transaction so a failed attempt leaves no half-written row.
+                conn.rollback()
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.executescript(DDL)
+                with conn:
+                    conn.execute(
+                        "INSERT INTO run VALUES (?,?,?,?,?,?,?)",
+                        (run_id, project, started_at, provider,
+                         json.dumps(models), __version__, SCHEMA_VERSION),
+                    )
+            cls._with_write_retry(_setup)
         except Exception:
             # DDL/insert failed after the connection was opened; close it so
             # we don't leak a file handle/lock on the way out.
@@ -118,19 +197,130 @@ class CTrace:
         return cls(conn, run_id)
 
     @classmethod
+    def open_or_create_session(cls, path: str, project: str, provider: str,
+                               model: str, started_at: str = "") -> "CTrace":
+        """Start a NEW session in the project DB at `path`, creating the file if
+        it doesn't exist yet — the project-scoped write entry point the tracer
+        uses on its first `wrap()`. What: opens (or creates) the connection with
+        the full write configuration, ensures the schema is present, then inserts
+        ONE fresh `run` row (a new session with its own uuid id and `started_at`)
+        and returns a CTrace bound to it. Every call this Tracer records lands
+        against that session's run id, so many sessions coexist in one file.
+
+        How append works with zero special-casing: the DDL is all
+        `CREATE TABLE IF NOT EXISTS`, so running it against an already-populated
+        project DB is a harmless no-op — the single code path both creates a
+        brand-new file and appends to an existing one. The only guard is a schema
+        gate: if the file already holds rows from a NEWER schema than this build
+        understands, we refuse to append (mirroring `open()`'s rejection) rather
+        than write a mixed-version file.
+
+        Connection config mirrors `create()` — `check_same_thread=False` (the
+        writer thread, not this creating thread, owns the connection), WAL, and
+        `busy_timeout` — plus the same config is what makes concurrent writers
+        (other Tracers here, other processes elsewhere) block-and-wait on the
+        lock instead of failing instantly; the writer's `record_call` adds a
+        bounded retry on top (see `_with_write_retry`)."""
+        conn = sqlite3.connect(path, check_same_thread=False)
+        try:
+            # busy_timeout FIRST — before ANY lock-taking statement. This is the
+            # crux of the concurrent-creation fix: `PRAGMA journal_mode = WAL`
+            # and the `IF NOT EXISTS` DDL both acquire a write lock, and when a
+            # dozen processes race to create the SAME project file at once (all
+            # from a barrier) whichever ones lose the lock would otherwise raise
+            # "database is locked" INSTANTLY — straight out into the host via
+            # `Tracer.wrap`. Setting busy_timeout ahead of them makes those
+            # statements block-and-wait for the lock instead of failing.
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            run_id = uuid.uuid4().hex
+            models = [model] if model else []
+
+            def _setup():
+                # The ENTIRE setup — WAL enable, DDL, schema-version gate, and
+                # the session INSERT — runs under the same bounded locked-retry
+                # as record_call, because busy_timeout alone doesn't cover every
+                # transient (a WAL write-write conflict can still surface
+                # "database is locked" under heavy contention). Made safe to
+                # re-run: a leading rollback clears any partial state from a
+                # prior locked attempt, WAL is idempotent, the DDL is
+                # IF NOT EXISTS, the version gate is a pure read, and the INSERT
+                # is wrapped in its own transaction so a failed attempt leaves
+                # no half-written run row. A non-lock error (e.g. the newer-
+                # schema ValueError below) propagates immediately, unretried.
+                conn.rollback()
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.executescript(DDL)  # IF NOT EXISTS — no-op on an existing DB
+                # Refuse to append into a file written by a newer ctxdiff.
+                row = conn.execute(
+                    "SELECT MAX(schema_version) FROM run").fetchone()
+                existing_version = row[0] if row else None
+                if existing_version is not None and existing_version > SCHEMA_VERSION:
+                    raise ValueError(
+                        f"{path}: schema version {existing_version} is newer than "
+                        f"supported {SCHEMA_VERSION} — upgrade ctxdiff to write this file")
+                with conn:
+                    conn.execute(
+                        "INSERT INTO run VALUES (?,?,?,?,?,?,?)",
+                        (run_id, project, started_at, provider,
+                         json.dumps(models), __version__, SCHEMA_VERSION),
+                    )
+            cls._with_write_retry(_setup)
+        except Exception:
+            conn.close()
+            raise
+        return cls(conn, run_id)
+
+    @staticmethod
+    def _with_write_retry(fn):
+        """Run a write `fn` (a zero-arg callable wrapping one transaction),
+        retrying a bounded number of times when SQLite reports the database is
+        locked. Why on top of `busy_timeout`: busy_timeout already blocks the
+        writer while another connection holds the lock, but under heavy
+        multi-writer contention SQLite can still surface `OperationalError:
+        database is locked` (e.g. a WAL write-write conflict); a few short
+        exponential-backoff retries clear those transients. Bounded on both axes
+        — a fixed attempt cap and a capped per-sleep — so a genuinely stuck lock
+        gives up (re-raising for the caller's fail-open guard to drop+warn)
+        rather than hanging. Non-lock OperationalErrors and all other exceptions
+        propagate immediately, unretried. Because each `fn` is a self-contained
+        transaction that rolls back on failure, a retry re-runs it cleanly with
+        no partial-write risk."""
+        delay = _WRITE_BACKOFF_START
+        for attempt in range(_WRITE_MAX_ATTEMPTS):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == _WRITE_MAX_ATTEMPTS - 1:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, _WRITE_BACKOFF_MAX)
+
+    @classmethod
     def open(cls, path: str) -> "CTrace":
-        """Open an existing `.ctrace` read/write, accepting ANY schema version
-        this build understands (v1 and v2). A v1 file is read as-is and NEVER
-        migrated on open — a debugger must not rewrite the evidence it inspects;
-        its missing agent/step/provider columns simply surface as None. Only a
-        file whose version is NEWER than supported is rejected, with a clear
-        ValueError telling the reader to upgrade rather than letting a
-        mismatched read fail obscurely later."""
+        """Open an existing project `.ctrace` read/write, accepting ANY schema
+        version this build understands (v1 and v2). A v1 file is read as-is and
+        NEVER migrated on open — a debugger must not rewrite the evidence it
+        inspects; its missing agent/step/provider columns simply surface as
+        None. Only a file whose version is NEWER than supported is rejected, with
+        a clear ValueError telling the reader to upgrade rather than letting a
+        mismatched read fail obscurely later.
+
+        A project DB may hold MANY sessions; the returned handle is bound to the
+        NEWEST session (last-inserted `run` row) so a session-less read analyzes
+        the run the user JUST made, not the first one ever recorded into this
+        accumulating project file. A single-session/v1 file is unaffected —
+        newest == the only row. Multi-session consumers select a specific run via
+        `list_sessions()` plus the `session_id=` reader arguments rather than
+        relying on this default binding. `busy_timeout` is set FIRST (before any
+        other statement) so reads don't fail instantly against a file a live
+        writer is concurrently committing to."""
         conn = sqlite3.connect(path)
         try:
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA foreign_keys = ON")
             row = conn.execute(
-                "SELECT id, schema_version FROM run LIMIT 1").fetchone()
+                "SELECT id, schema_version FROM run ORDER BY rowid DESC LIMIT 1").fetchone()
             if row is None:
                 raise ValueError(f"{path}: not a ctrace file (no run row)")
             run_id, version = row
@@ -167,34 +357,40 @@ class CTrace:
         hypothetical write against a v1 handle degrades to the v1 shape rather
         than raising on a missing column."""
         call_id = uuid.uuid4().hex
-        with self._conn:  # transaction: all-or-nothing
-            if self._has_v2_cols:
-                self._conn.execute(
-                    "INSERT INTO call VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (call_id, self._run_id, seq, json.dumps(params),
-                     json.dumps(usage) if usage is not None else None,
-                     latency_ms, error, agent, step, provider),
-                )
-            else:
-                self._conn.execute(
-                    "INSERT INTO call VALUES (?,?,?,?,?,?,?)",
-                    (call_id, self._run_id, seq, json.dumps(params),
-                     json.dumps(usage) if usage is not None else None,
-                     latency_ms, error),
-                )
-            for cb in call_blocks:
-                b = cb.block
-                # INSERT OR IGNORE: first writer of a hash wins; repeats are
-                # no-ops, which is exactly content-addressed dedup.
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO block VALUES (?,?,?,?,?,?)",
-                    (b.content_hash, b.role, b.kind, b.text,
-                     b.token_count, b.token_method),
-                )
-                self._conn.execute(
-                    "INSERT INTO call_block VALUES (?,?,?,?,?)",
-                    (call_id, b.content_hash, cb.position, cb.label, cb.label_source),
-                )
+
+        def _txn():
+            with self._conn:  # transaction: all-or-nothing
+                if self._has_v2_cols:
+                    self._conn.execute(
+                        "INSERT INTO call VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (call_id, self._run_id, seq, json.dumps(params),
+                         json.dumps(usage) if usage is not None else None,
+                         latency_ms, error, agent, step, provider),
+                    )
+                else:
+                    self._conn.execute(
+                        "INSERT INTO call VALUES (?,?,?,?,?,?,?)",
+                        (call_id, self._run_id, seq, json.dumps(params),
+                         json.dumps(usage) if usage is not None else None,
+                         latency_ms, error),
+                    )
+                for cb in call_blocks:
+                    b = cb.block
+                    # INSERT OR IGNORE: first writer of a hash wins; repeats are
+                    # no-ops, which is exactly content-addressed dedup.
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO block VALUES (?,?,?,?,?,?)",
+                        (b.content_hash, b.role, b.kind, b.text,
+                         b.token_count, b.token_method),
+                    )
+                    self._conn.execute(
+                        "INSERT INTO call_block VALUES (?,?,?,?,?)",
+                        (call_id, b.content_hash, cb.position, cb.label, cb.label_source),
+                    )
+        # One self-contained transaction, retried on a transient lock under
+        # concurrent multi-writer access (see `_with_write_retry`); a rolled-back
+        # attempt re-runs cleanly, so no partial write can result.
+        self._with_write_retry(_txn)
         # Roll this call's model up onto the run — the fix for the
         # long-standing `run.models == ['']` gap: the run's model is only
         # ever really known per-call, so every write here is a chance to
@@ -216,32 +412,81 @@ class CTrace:
             return
         self._models_seen.add(model)
         self._models.append(model)
-        with self._conn:  # single-statement transaction
-            self._conn.execute(
-                "UPDATE run SET models = ? WHERE id = ?",
-                (json.dumps(self._models), self._run_id),
-            )
+
+        def _txn():
+            with self._conn:  # single-statement transaction
+                self._conn.execute(
+                    "UPDATE run SET models = ? WHERE id = ?",
+                    (json.dumps(self._models), self._run_id),
+                )
+        self._with_write_retry(_txn)  # retry on transient lock (multi-writer)
 
     # --- reading -----------------------------------------------------------
 
-    def get_run(self) -> Run:
-        """Return the run row as a Run, decoding the models JSON array."""
+    def list_sessions(self) -> list[Session]:
+        """List every session (every `run` row) in this project DB, oldest first,
+        each as a `Session` summary: id, project, started_at, provider, models,
+        the set of agents seen on its calls (first-appearance order), and its
+        turn (call) count. This is the reader half of the project-scoped model —
+        a single-session file simply returns a one-element list.
+
+        How: three cheap queries assembled in Python rather than one big join, so
+        turn counts and agent sets stay correct and easy to reason about. The
+        per-run turn count comes from a `GROUP BY run_id` COUNT; the agent sets
+        come from scanning `(run_id, agent)` in seq order and deduping per run to
+        preserve first-appearance order — but only when the v2 `agent` column
+        exists (a v1 file has no agents, so every session reports `[]`)."""
+        runs = self._conn.execute(
+            "SELECT id, project, started_at, provider, models "
+            "FROM run ORDER BY rowid").fetchall()
+
+        counts: dict[str, int] = {}
+        for run_id, n in self._conn.execute(
+                "SELECT run_id, COUNT(*) FROM call GROUP BY run_id").fetchall():
+            counts[run_id] = n
+
+        agents: dict[str, list[str]] = {}
+        if self._has_v2_cols:
+            for run_id, agent in self._conn.execute(
+                    "SELECT run_id, agent FROM call "
+                    "WHERE agent IS NOT NULL ORDER BY run_id, seq").fetchall():
+                seen = agents.setdefault(run_id, [])
+                if agent not in seen:
+                    seen.append(agent)
+
+        return [
+            Session(id=r[0], project=r[1], started_at=r[2], provider=r[3],
+                    models=json.loads(r[4]), agents=agents.get(r[0], []),
+                    turn_count=counts.get(r[0], 0))
+            for r in runs
+        ]
+
+    def get_run(self, session_id: str | None = None) -> Run:
+        """Return one session's `run` row as a Run, decoding the models JSON
+        array. `session_id` selects which session in a multi-session project DB;
+        it defaults to the handle's bound session (the newest — see `open()`), so
+        a single-session file needs no argument and reads exactly as before."""
+        run_id = session_id or self._run_id
         r = self._conn.execute(
             "SELECT id, project, started_at, provider, models, ctxdiff_version "
-            "FROM run WHERE id = ?", (self._run_id,)).fetchone()
+            "FROM run WHERE id = ?", (run_id,)).fetchone()
         return Run(id=r[0], project=r[1], started_at=r[2], provider=r[3],
                    models=json.loads(r[4]), ctxdiff_version=r[5])
 
-    def get_calls(self) -> list[Call]:
-        """Return all calls for this run ordered by turn sequence. Selects the
-        v2 agent/step/provider columns only when they exist (a v1 file lacks
-        them); for a v1 file those three fields surface as None on every Call,
-        so downstream code needs no special-casing."""
+    def get_calls(self, session_id: str | None = None) -> list[Call]:
+        """Return all calls for ONE session ordered by turn sequence.
+        `session_id` selects the session (defaults to the bound one — see
+        `get_run()`), so a project DB's sessions read in isolation while a
+        single-session file is unchanged. Selects the v2 agent/step/provider
+        columns only when they exist (a v1 file lacks them); for a v1 file those
+        three fields surface as None on every Call, so downstream code needs no
+        special-casing."""
+        run_id = session_id or self._run_id
         base = "id, run_id, seq, params, usage, latency_ms, error"
         if self._has_v2_cols:
             rows = self._conn.execute(
                 f"SELECT {base}, agent, step, provider "
-                "FROM call WHERE run_id = ? ORDER BY seq", (self._run_id,)).fetchall()
+                "FROM call WHERE run_id = ? ORDER BY seq", (run_id,)).fetchall()
             return [
                 Call(id=r[0], run_id=r[1], seq=r[2], params=json.loads(r[3]),
                      usage=json.loads(r[4]) if r[4] is not None else None,
@@ -251,7 +496,7 @@ class CTrace:
             ]
         rows = self._conn.execute(
             f"SELECT {base} FROM call WHERE run_id = ? ORDER BY seq",
-            (self._run_id,)).fetchall()
+            (run_id,)).fetchall()
         return [
             Call(id=r[0], run_id=r[1], seq=r[2], params=json.loads(r[3]),
                  usage=json.loads(r[4]) if r[4] is not None else None,
