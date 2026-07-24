@@ -1,0 +1,47 @@
+{
+  "name": "ctxdiff",
+  "version": "0.1.0",
+  "description": "Local-first context-window debugger for LLM agents — JS/TS capture SDK. Wraps an OpenAI client and records each call's context into a .ctrace file that opens in the Python ctxdiff viewer.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Salman Zafar",
+  "homepage": "https://github.com/salmanzafar/ctxdiff",
+  "keywords": ["llm", "openai", "context", "debugger", "observability", "tracing", "agents"],
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsup && node scripts/fix-node-sqlite.mjs && tsc --emitDeclarationOnly --outDir dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "gpt-tokenizer": "^3.4.0"
+  },
+  "peerDependencies": {
+    "openai": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "openai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "openai": "^6.49.0",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
