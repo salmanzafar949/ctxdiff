@@ -1,29 +1,134 @@
-"""OpenAI Chat Completions adapter. Reads the request kwargs a caller passes to
-`client.chat.completions.create(...)` — plain dicts/lists — and the response
-object, with no dependency on the openai SDK itself."""
+"""OpenAI adapter, covering BOTH completion methods the SDK exposes: the
+established Chat Completions API (`client.chat.completions.create(...)`) and
+its successor, the Responses API (`client.responses.create(...)`, what the
+Agents SDK builds on) — plain dicts/lists for kwargs, with no dependency on
+the openai SDK itself. The two request shapes are disjoint (`messages` vs
+`input`/`instructions`) so `extract_blocks`/`extract_params` dispatch on which
+keys are present; `extract_usage` duck-types both response usage shapes."""
 from __future__ import annotations
 
 import json
 
 from ctxdiff.models import RawBlock
 
-# Request keys that carry block *content* rather than sampling params; excluded
-# from params so content is never stored twice.
-_CONTENT_KEYS = {"messages", "tools"}
+# Request keys that carry block *content* rather than sampling params for the
+# Chat Completions shape; excluded from params so content is never stored
+# twice.
+_CHAT_CONTENT_KEYS = {"messages", "tools"}
+
+# Same idea for the Responses shape: `input`/`instructions` carry the
+# conversation content and `tools` the schemas, all extracted into blocks —
+# `previous_response_id` is deliberately NOT here (see extract_params) since
+# it's chain-linkage metadata, not content.
+_RESPONSES_CONTENT_KEYS = {"input", "instructions", "tools"}
+
+# Part types within a Responses `input` content list whose "text" field is the
+# human-readable payload; anything else falls back to stable JSON of the part.
+_RESPONSES_TEXT_PART_TYPES = {"input_text", "output_text"}
+
+
+def _is_responses_shape(kwargs: dict) -> bool:
+    """Distinguish the Responses request shape from Chat Completions. How:
+    the two are disjoint on the wire — Chat Completions always sends
+    `messages`; Responses never does, using `input`/`instructions` instead —
+    so presence of either of the latter (and absence of `messages`) is
+    sufficient. Kwargs with neither key (e.g. a nearly-empty test payload)
+    default to the chat shape, preserving all pre-existing behavior for
+    Chat-Completions-only callers."""
+    return "messages" not in kwargs and ("input" in kwargs or "instructions" in kwargs)
 
 
 class OpenAIAdapter:
-    """Normalize OpenAI chat requests into the block model."""
+    """Normalize OpenAI chat AND responses requests into the block model."""
 
     provider = "openai"
-    create_path = ("chat", "completions", "create")
+    create_path = ("chat", "completions", "create")  # kept for backward compat
+    create_paths = (("chat", "completions", "create"), ("responses", "create"))
 
     def extract_blocks(self, kwargs: dict) -> list[RawBlock]:
-        """Flatten a request into ordered RawBlocks: tool schemas first (they
-        occupy the front of the context window), then each message. A message
-        with list content becomes one 'content_part' block per part; otherwise
-        one 'message' block. Tool schemas are serialized to JSON so their text
-        is stable and diffable.
+        """Dispatch to the Responses extractor when the kwargs shape says so;
+        otherwise run the original Chat Completions extraction, byte-for-byte
+        unchanged (see `_extract_chat_blocks`)."""
+        if _is_responses_shape(kwargs):
+            return self._extract_responses_blocks(kwargs)
+        return self._extract_chat_blocks(kwargs)
+
+    def _extract_responses_blocks(self, kwargs: dict) -> list[RawBlock]:
+        """Flatten a Responses-API request into ordered RawBlocks:
+        `instructions` FIRST (a system message occupying the front of the
+        context, mirroring how Chat Completions' system message is
+        conventionally first), then `tools` (already flat — Responses tool
+        schemas are NOT nested under a "function" key the way Chat
+        Completions' are — serialized to stable JSON same as the chat path),
+        then `input` in wire order.
+
+        `input` is either a plain string (one user message block) or a list
+        of items, each handled defensively so a malformed/unexpected item
+        shape never raises:
+          - a dict with a "role" key is a message item: string content is one
+            'message' block; list content is one 'content_part' block per
+            part (using the part's own "text" for input_text/output_text
+            parts, else stable JSON of the part) — role is passed through
+            as-is from the wire.
+          - {"type": "function_call", ...} is the model's own tool
+            invocation, echoed back on later turns — recorded as an
+            'assistant' 'content_part' block (stable JSON).
+          - {"type": "function_call_output", ...} is the caller feeding a
+            tool's result back in — recorded as a 'tool' 'content_part'
+            block (stable JSON).
+          - anything else (unrecognized item shape) falls back to a 'user'
+            'content_part' block of stable JSON, so an unfamiliar/future item
+            type is captured rather than dropped or raising."""
+        blocks: list[RawBlock] = []
+        instructions = kwargs.get("instructions")
+        if instructions:
+            blocks.append(RawBlock(role="system", kind="message", text=instructions))
+        for tool in kwargs.get("tools") or []:
+            blocks.append(RawBlock(
+                role="system", kind="tool_schema",
+                text=json.dumps(tool, sort_keys=True, ensure_ascii=False)))
+        input_ = kwargs.get("input")
+        if isinstance(input_, str):
+            blocks.append(RawBlock(role="user", kind="message", text=input_))
+        elif isinstance(input_, list):
+            for item in input_:
+                blocks.extend(self._extract_responses_input_item(item))
+        return blocks
+
+    def _extract_responses_input_item(self, item: object) -> list[RawBlock]:
+        """Extract the block(s) for one entry of a Responses `input` list. See
+        `_extract_responses_blocks` for the shape rules; kept as its own
+        method purely for readability (one item's worth of dispatch logic)."""
+        if isinstance(item, dict) and "role" in item:
+            role = item.get("role", "user")
+            content = item.get("content")
+            if isinstance(content, list):
+                out = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in _RESPONSES_TEXT_PART_TYPES:
+                        text = part.get("text", "")
+                    else:
+                        text = json.dumps(part, sort_keys=True, ensure_ascii=False)
+                    out.append(RawBlock(role=role, kind="content_part", text=text))
+                return out
+            return [RawBlock(role=role, kind="message", text=content or "")]
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            return [RawBlock(role="assistant", kind="content_part",
+                             text=json.dumps(item, sort_keys=True, ensure_ascii=False))]
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            return [RawBlock(role="tool", kind="content_part",
+                             text=json.dumps(item, sort_keys=True, ensure_ascii=False))]
+        # Defensive fallback: any other shape (unrecognized item type, or not
+        # even a dict) is still captured rather than dropped or raising.
+        return [RawBlock(role="user", kind="content_part",
+                         text=json.dumps(item, sort_keys=True, ensure_ascii=False))]
+
+    def _extract_chat_blocks(self, kwargs: dict) -> list[RawBlock]:
+        """Flatten a Chat Completions request into ordered RawBlocks: tool
+        schemas first (they occupy the front of the context window), then
+        each message. A message with list content becomes one 'content_part'
+        block per part; otherwise one 'message' block. Tool schemas are
+        serialized to JSON so their text is stable and diffable.
 
         Order mirrors the wire payload: for a given message, its content
         block(s) come first, then one 'content_part' block per entry in
@@ -72,8 +177,15 @@ class OpenAIAdapter:
 
     def extract_params(self, kwargs: dict) -> dict:
         """Return every request kwarg except the content-bearing keys, so the
-        stored params capture model/sampling settings without duplicating blocks."""
-        return {k: v for k, v in kwargs.items() if k not in _CONTENT_KEYS}
+        stored params capture model/sampling settings without duplicating
+        blocks. Which keys count as content-bearing depends on the request
+        shape: Chat Completions drops `messages`/`tools`; Responses drops
+        `input`/`instructions`/`tools` but DELIBERATELY KEEPS
+        `previous_response_id` — it isn't content, it's meaningful chain
+        linkage between calls (which prior response this one continues from),
+        so it belongs in params alongside model/sampling settings."""
+        content_keys = _RESPONSES_CONTENT_KEYS if _is_responses_shape(kwargs) else _CHAT_CONTENT_KEYS
+        return {k: v for k, v in kwargs.items() if k not in content_keys}
 
     def extract_usage(self, response: object) -> dict | None:
         """Pull provider-reported usage off `response.usage` (duck-typed) into a
@@ -89,7 +201,16 @@ class OpenAIAdapter:
         consume the body or interfere with a caller (e.g. LangChain) parsing
         it again later. Any failure during this fallback is swallowed —
         extract_usage runs inside the fail-open recorder, but stays
-        defensive here too rather than relying solely on that outer guard."""
+        defensive here too rather than relying solely on that outer guard.
+
+        Two naming families: Chat Completions reports
+        prompt_tokens/completion_tokens/total_tokens; Responses reports
+        input_tokens/output_tokens/total_tokens (confirmed: neither usage
+        object carries the other family's attributes — `getattr(...,
+        default=None)` cleanly distinguishes them). Both are duck-typed here
+        so ONE adapter method serves both request shapes; if a usage object
+        somehow carried both (never observed, but not assumed impossible),
+        the prompt_tokens family wins, deterministically."""
         usage = getattr(response, "usage", None)
         if usage is None:
             parse = getattr(response, "parse", None)
@@ -100,8 +221,26 @@ class OpenAIAdapter:
                     usage = None
         if usage is None:
             return None
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if prompt_tokens is not None or completion_tokens is not None:
+            return {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+        input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        if input_tokens is not None or output_tokens is not None:
+            return {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+        # Neither family present (e.g. a usage-less stub in a test): preserve
+        # the pre-Responses default shape rather than returning an empty dict.
         return {
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
             "total_tokens": getattr(usage, "total_tokens", None),
         }

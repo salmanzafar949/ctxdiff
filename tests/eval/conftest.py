@@ -55,6 +55,30 @@ def canned_openai_response(content: str = "Hello there!", prompt_tokens: int = 1
     }
 
 
+def canned_responses_response(text: str = "Hello there!", input_tokens: int = 10,
+                              output_tokens: int = 5, response_id: str = "resp_x") -> dict:
+    """Build the exact OpenAI Responses-API JSON shape confirmed against real
+    `openai` 2.47.0 `Response` parsing (Step-0 probe for the Responses-API
+    capture work). `total_tokens` is always the sum of the two counts, same
+    convention as the other canned-response helpers in this file."""
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-4o",
+        "status": "completed",
+        "output": [{
+            "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }],
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+    }
+
+
 def canned_anthropic_response(text: str = "Hello there!", input_tokens: int = 12,
                               output_tokens: int = 6) -> dict:
     """Build the exact Anthropic Messages JSON shape confirmed against real

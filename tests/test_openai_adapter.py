@@ -149,3 +149,136 @@ def test_extract_usage_parse_fallback_failure_degrades_to_none():
     class BoomRawResponse:
         def parse(self): raise RuntimeError("boom")
     assert OpenAIAdapter().extract_usage(BoomRawResponse()) is None
+
+
+# --- Responses API ----------------------------------------------------------
+# The Responses shape (`input`/`instructions`/flat `tools`) is disjoint from
+# Chat Completions' (`messages`/nested `tools`) so these tests use kwargs
+# shaped like `client.responses.create(...)` calls; the chat-path tests above
+# are untouched, proving the two shapes don't interfere with each other.
+
+
+def test_extract_blocks_responses_instructions_first_then_tools_then_input():
+    """Ordering contract: instructions (system message) FIRST, then flat tool
+    schemas, then the input — regardless of kwarg dict insertion order."""
+    kwargs = {
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+        "instructions": "be terse",
+    }
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert [(b.role, b.kind) for b in blocks] == [
+        ("system", "message"), ("system", "tool_schema"), ("user", "message"),
+    ]
+    assert blocks[0].text == "be terse"
+    assert "lookup" in blocks[1].text
+    assert blocks[2].text == "hi"
+
+
+def test_extract_blocks_responses_input_as_plain_string():
+    """A plain-string `input` becomes exactly one 'user'/'message' block."""
+    blocks = OpenAIAdapter().extract_blocks({"model": "gpt-4o", "input": "hello there"})
+    assert len(blocks) == 1
+    assert blocks[0].role == "user" and blocks[0].kind == "message"
+    assert blocks[0].text == "hello there"
+
+
+def test_extract_blocks_responses_input_list_message_item_plain_content():
+    """A message item in the `input` list with plain string content becomes
+    one 'message' block, role passed through as-is."""
+    kwargs = {"model": "gpt-4o", "input": [{"role": "assistant", "content": "sure"}]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 1
+    assert blocks[0].role == "assistant" and blocks[0].kind == "message"
+    assert blocks[0].text == "sure"
+
+
+def test_extract_blocks_responses_input_list_message_item_content_parts():
+    """A message item whose content is a list of parts yields one
+    'content_part' block per part; input_text/output_text parts use their own
+    "text" field, other part shapes fall back to stable JSON."""
+    kwargs = {"model": "gpt-4o", "input": [
+        {"role": "user", "content": [
+            {"type": "input_text", "text": "look at this"},
+            {"type": "input_image", "image_url": "http://x"},
+        ]},
+    ]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 2
+    assert blocks[0].kind == "content_part" and blocks[0].role == "user"
+    assert blocks[0].text == "look at this"
+    assert "input_image" in blocks[1].text
+
+
+def test_extract_blocks_responses_function_call_and_output_items():
+    """Typed items in `input`: `function_call` maps to an 'assistant'
+    'content_part' block, `function_call_output` maps to a 'tool'
+    'content_part' block — both stable JSON of the whole item."""
+    kwargs = {"model": "gpt-4o", "input": [
+        {"type": "function_call", "call_id": "c1", "name": "get_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "sunny"},
+    ]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 2
+    assert blocks[0].role == "assistant" and blocks[0].kind == "content_part"
+    assert "get_weather" in blocks[0].text
+    assert blocks[1].role == "tool" and blocks[1].kind == "content_part"
+    assert "sunny" in blocks[1].text
+
+
+def test_extract_blocks_responses_unrecognized_item_never_raises():
+    """Defensive fallback: an `input` list item that is neither a message dict
+    nor a recognized typed item is still captured (stable JSON, role 'user',
+    kind 'content_part') rather than dropped or raising — including a
+    non-dict entry."""
+    kwargs = {"model": "gpt-4o", "input": [
+        {"type": "reasoning", "summary": []},
+        "a bare string item",
+    ]}
+    blocks = OpenAIAdapter().extract_blocks(kwargs)
+    assert len(blocks) == 2
+    assert all(b.role == "user" and b.kind == "content_part" for b in blocks)
+    assert "reasoning" in blocks[0].text
+    assert "a bare string item" in blocks[1].text
+
+
+def test_extract_params_responses_keeps_model_and_previous_response_id_drops_content():
+    """Responses params keep model/sampling settings AND `previous_response_id`
+    (chain linkage, not content) but never leak input/instructions/tools."""
+    kwargs = {
+        "model": "gpt-4o", "temperature": 0.2,
+        "input": "hi", "instructions": "be terse",
+        "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+        "previous_response_id": "resp_prev",
+    }
+    params = OpenAIAdapter().extract_params(kwargs)
+    assert params == {"model": "gpt-4o", "temperature": 0.2, "previous_response_id": "resp_prev"}
+    assert "input" not in params and "instructions" not in params and "tools" not in params
+
+
+def test_extract_usage_reads_input_output_tokens_family():
+    """Responses-shaped usage (input_tokens/output_tokens/total_tokens, no
+    prompt_tokens/completion_tokens attributes at all) is duck-typed into the
+    input_tokens family, not silently coerced into the prompt_tokens shape."""
+    class Usage:
+        def __init__(self): self.input_tokens = 10; self.output_tokens = 5; self.total_tokens = 15
+    class Resp:
+        usage = Usage()
+    u = OpenAIAdapter().extract_usage(Resp())
+    assert u == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert "prompt_tokens" not in u
+
+
+def test_extract_usage_prefers_prompt_tokens_family_when_both_present():
+    """If a usage object somehow carried BOTH families, prompt_tokens wins —
+    deterministic, documented tie-break."""
+    class Usage:
+        def __init__(self):
+            self.prompt_tokens = 10; self.completion_tokens = 5
+            self.input_tokens = 999; self.output_tokens = 999
+            self.total_tokens = 15
+    class Resp:
+        usage = Usage()
+    u = OpenAIAdapter().extract_usage(Resp())
+    assert u == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}

@@ -161,7 +161,14 @@ class Tracer:
         if self._recorder is None:
             # Keep the first recorder reachable as t._recorder (see __init__).
             self._recorder = recorder
-        return _ClientProxy(client, (), self, adapter.create_path,
+        # Resolve once, here at wrap-time: adapters with more than one
+        # completion method (e.g. OpenAI's chat.completions.create AND
+        # responses.create) expose plural `create_paths`; single-path
+        # adapters don't define it at all, so fall back to the singular
+        # `create_path` wrapped in a 1-tuple. `_ClientProxy` only ever deals
+        # in the plural form from here on.
+        paths = getattr(adapter, "create_paths", None) or (adapter.create_path,)
+        return _ClientProxy(client, (), self, paths,
                             recorder, agent, provider)
 
     def tag(self, label: str, items: list) -> None:
@@ -223,48 +230,65 @@ class Tracer:
 
 class _ClientProxy:
     """A transparent proxy that forwards attribute access to the wrapped target,
-    following the adapter's `create_path` down to the completion method — which
-    it replaces with an interceptor. Anything off that path is returned as-is,
-    so the wrapped client is behaviorally identical to the original."""
+    following the adapter's create path(s) down to the completion method(s) —
+    which it replaces with an interceptor. Anything off those paths is returned
+    as-is, so the wrapped client is behaviorally identical to the original.
+
+    Multi-path: `create_paths` is a TUPLE of paths (usually length 1). An
+    adapter like OpenAI's, which exposes two independent completion methods
+    sharing one request/response shape (`chat.completions.create` and
+    `responses.create`), resolves to a 2-tuple at wrap-time (see
+    `Tracer.wrap`); every path-matching check below tests against ANY member
+    of that tuple rather than a single path, so both methods get intercepted
+    off the SAME proxy tree with no per-provider special-casing here."""
 
     def __init__(self, target: object, path: tuple[str, ...],
-                 tracer: "Tracer", create_path: tuple[str, ...],
+                 tracer: "Tracer", create_paths: tuple[tuple[str, ...], ...],
                  recorder: "Recorder", agent: str | None, provider: str | None):
         """Store this proxy's bookkeeping: the wrapped object, how far along
         the path to the completion method this proxy sits, the owning tracer,
-        that target path, and the per-wrap recording context — the Recorder
-        (built from THIS client's provider adapter), the agent name, and the
-        provider — which travel with the proxy so the interceptor records
-        through the right adapter and attributes each call correctly. How:
-        stored via `object.__setattr__` under `_ctx_`-prefixed names (a plain
-        naming convention — NOT Python name-mangling, which only applies to
-        `__dunder`-style names) so that `__getattr__` forwarding below can't
-        accidentally shadow or recurse into real client attributes of the same
-        name."""
+        the tuple of target paths, and the per-wrap recording context — the
+        Recorder (built from THIS client's provider adapter), the agent name,
+        and the provider — which travel with the proxy so the interceptor
+        records through the right adapter and attributes each call correctly.
+        How: stored via `object.__setattr__` under `_ctx_`-prefixed names (a
+        plain naming convention — NOT Python name-mangling, which only
+        applies to `__dunder`-style names) so that `__getattr__` forwarding
+        below can't accidentally shadow or recurse into real client
+        attributes of the same name."""
         object.__setattr__(self, "_ctx_target", target)
         object.__setattr__(self, "_ctx_path", path)
         object.__setattr__(self, "_ctx_tracer", tracer)
-        object.__setattr__(self, "_ctx_create_path", create_path)
+        object.__setattr__(self, "_ctx_create_paths", create_paths)
         object.__setattr__(self, "_ctx_recorder", recorder)
         object.__setattr__(self, "_ctx_agent", agent)
         object.__setattr__(self, "_ctx_provider", provider)
 
     def __getattr__(self, name: str):
-        """Resolve `name` on the wrapped target. If the new path IS the create
-        path, return the interceptor. If it is a prefix of the create path, wrap
-        the intermediate object so traversal continues. If `name` is a known
-        SDK response-wrapper hop (`with_raw_response`/`with_streaming_response`)
-        encountered exactly one step before create, treat it as transparent —
-        keep wrapping WITHOUT advancing the path, so the create step right
-        after it still lands on the tracked path. If `name` is `aio`
-        encountered at the client ROOT on a gemini-provider proxy, treat it as
-        transparent the same way (see `_TRANSPARENT_ROOT_HOPS`) — google-genai's
-        async surface hangs off `.aio` instead of a separate client class.
-        Otherwise return the raw attribute — full pass-through."""
+        """Resolve `name` on the wrapped target. If the new path IS one of the
+        create paths, return the interceptor. If it is a prefix of ANY create
+        path, wrap the intermediate object so traversal continues. If `name`
+        is a known SDK response-wrapper hop (`with_raw_response`/
+        `with_streaming_response`) encountered exactly one step before ANY
+        create path, treat it as transparent — keep wrapping WITHOUT
+        advancing the path, so the create step right after it still lands on
+        a tracked path. If `name` is `aio` encountered at the client ROOT on a
+        gemini-provider proxy, treat it as transparent the same way (see
+        `_TRANSPARENT_ROOT_HOPS`) — google-genai's async surface hangs off
+        `.aio` instead of a separate client class. Otherwise return the raw
+        attribute — full pass-through.
+
+        Multi-path: every check below tests `new_path`/`path` against ANY
+        member of `create_paths` rather than a single path, since an adapter
+        like OpenAI's resolves to more than one independent completion method
+        (`chat.completions.create` and `responses.create`) sharing this same
+        proxy tree from the client root. None of the existing single-path
+        gating is weakened — a 1-tuple behaves identically to the old
+        singular `create_path`."""
         target = object.__getattribute__(self, "_ctx_target")
         path = object.__getattribute__(self, "_ctx_path")
         tracer = object.__getattribute__(self, "_ctx_tracer")
-        create_path = object.__getattribute__(self, "_ctx_create_path")
+        create_paths = object.__getattribute__(self, "_ctx_create_paths")
         recorder = object.__getattribute__(self, "_ctx_recorder")
         agent = object.__getattribute__(self, "_ctx_agent")
         provider = object.__getattribute__(self, "_ctx_provider")
@@ -272,12 +296,13 @@ class _ClientProxy:
         attr = getattr(target, name)
         new_path = path + (name,)
 
-        if new_path == create_path:
+        if new_path in create_paths:
             return _make_interceptor(attr, tracer, recorder, agent, provider)
-        # Is new_path a prefix of create_path? If so keep wrapping (carrying
-        # this wrap's recording context down to the completion method).
-        if new_path == create_path[:len(new_path)]:
-            return _ClientProxy(attr, new_path, tracer, create_path,
+        # Is new_path a prefix of ANY create path? If so keep wrapping
+        # (carrying this wrap's recording context down to the completion
+        # method that new_path is heading towards).
+        if any(new_path == cp[:len(new_path)] for cp in create_paths):
+            return _ClientProxy(attr, new_path, tracer, create_paths,
                                 recorder, agent, provider)
         # Transparent SDK hop: e.g. LangChain calls
         # `client.chat.completions.with_raw_response.create(...)` rather than
@@ -287,11 +312,14 @@ class _ClientProxy:
         # in the tree, so unrelated same-named attributes never get
         # over-wrapped) and keep the SAME `path` — not `new_path` — so the
         # immediately-following `.create` access still computes
-        # `path + ("create",) == create_path` and is intercepted normally.
+        # `path + ("create",) == <that create path>` and is intercepted
+        # normally. "One step before" is checked against EVERY create path,
+        # not just the first, so this generalizes cleanly to adapters with
+        # more than one.
         if (name in _TRANSPARENT_HOPS
-                and len(path) == len(create_path) - 1
-                and path == create_path[:len(path)]):
-            return _ClientProxy(attr, path, tracer, create_path,
+                and any(len(path) == len(cp) - 1 and path == cp[:len(path)]
+                        for cp in create_paths)):
+            return _ClientProxy(attr, path, tracer, create_paths,
                                 recorder, agent, provider)
         # Gemini's `.aio` root hop: recognized ONLY at path == () (the client
         # root, before any traversal has happened) and ONLY when this proxy's
@@ -303,7 +331,7 @@ class _ClientProxy:
         if (name in _TRANSPARENT_ROOT_HOPS
                 and path == ()
                 and provider == "gemini"):
-            return _ClientProxy(attr, path, tracer, create_path,
+            return _ClientProxy(attr, path, tracer, create_paths,
                                 recorder, agent, provider)
         return attr
 

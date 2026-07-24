@@ -596,3 +596,112 @@ def test_wrap_aio_on_non_gemini_client_passes_through_raw(tmp_path):
     wrapped = t.wrap(client)
     assert wrapped.aio is client.aio
     t.close()
+
+
+# --- Multi-path proxy: OpenAI's chat.completions.create + responses.create -
+# These prove `_ClientProxy` tracks MORE THAN ONE create path off the same
+# proxy tree (see trace.py's `create_paths`), not just a single path per wrap.
+
+
+class _FakeResponses:
+    """Stand-in for client.responses with a recording create()."""
+    def __init__(self): self.calls = []
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _Resp()
+
+
+class _FakeOpenAIWithBothPaths:
+    """Duck-typed OpenAI client exposing BOTH `chat.completions.create` and
+    `responses.create` off the same client root, the way the real openai SDK
+    does — proof that a single wrap() intercepts both independently."""
+    __module__ = "openai"
+    def __init__(self):
+        self.chat = _FakeChat()
+        self.responses = _FakeResponses()
+
+
+def test_wrap_multi_path_intercepts_both_chat_and_responses(tmp_path):
+    """A single wrap() over a client exposing both completion methods records
+    a call made through EITHER path, each landing on the .ctrace independently
+    — the core proof that `create_paths` (plural) works, not just the first
+    path an adapter declares."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeOpenAIWithBothPaths()
+    wrapped = t.wrap(client)
+
+    resp1 = wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "via chat"}])
+    resp2 = wrapped.responses.create(model="gpt-4o", input="via responses")
+    assert isinstance(resp1, _Resp) and isinstance(resp2, _Resp)
+    assert len(client.chat.completions.calls) == 1
+    assert len(client.responses.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 2
+    texts = [cb.block.text for c in calls for cb in ct.get_call_blocks(c.id)]
+    assert "via chat" in texts
+    assert "via responses" in texts
+    ct.close()
+
+
+def test_wrap_with_raw_response_hop_still_works_for_chat_path(tmp_path):
+    """Regression: the `with_raw_response` transparent hop (used by LangChain
+    for the chat path) must still be intercepted correctly now that the proxy
+    tracks MULTIPLE create paths instead of one — proves the multi-path
+    change didn't weaken this existing gating."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeOpenAIWithRawHop()
+    wrapped = t.wrap(client)
+
+    resp = wrapped.chat.completions.with_raw_response.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    assert isinstance(resp, _Resp)
+    assert len(client.chat.completions.with_raw_response.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert len(ct.get_calls()) == 1
+    ct.close()
+
+
+class _FakeAsyncResponses:
+    """Stand-in for an AsyncOpenAI-style client.responses whose create() is a
+    coroutine function — proves Responses async composes for free through
+    the same call-time awaitable detection as chat completions."""
+    def __init__(self): self.calls = []
+    async def create(self, **kwargs):
+        await asyncio.sleep(0.01)
+        self.calls.append(kwargs)
+        return _AsyncResp()
+
+
+class _FakeAsyncOpenAIWithResponses:
+    """Duck-typed AsyncOpenAI client exposing only the async responses.create
+    path (the chat path isn't needed for this test)."""
+    __module__ = "openai"
+    def __init__(self): self.responses = _FakeAsyncResponses()
+
+
+def test_wrap_async_responses_create_is_intercepted(tmp_path):
+    """`AsyncOpenAI.responses.create(...)` — a coroutine function on the
+    SECOND declared create path — is intercepted exactly like the async chat
+    path: real response passes through, call lands on disk with usage."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncOpenAIWithResponses()
+    wrapped = t.wrap(client)
+
+    resp = asyncio.run(wrapped.responses.create(model="gpt-4o", input="hi async responses"))
+    assert isinstance(resp, _AsyncResp)
+    assert len(client.responses.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert blocks[0].block.text == "hi async responses"
+    ct.close()
