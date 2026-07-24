@@ -51,6 +51,22 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: js/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The cross-language conformance tests (js/test/conformance.test.ts) skip
+      # themselves unless <repo>/venv/bin/python exists — and `venv/` is
+      # gitignored, so on a bare runner every parity assertion silently
+      # no-op'd and a JS/Python format regression could merge green. Build the
+      # venv the tests look for and install the Python SDK into it so those
+      # tests actually RUN. `working-directory: .` overrides the job-level
+      # `js` default: the venv must live at the REPO ROOT, where the tests
+      # resolve it (`resolve(process.cwd(), "..")`).
+      - name: Install the Python SDK into ./venv (for cross-language conformance)
+        working-directory: .
+        run: |
+          python -m venv venv
+          ./venv/bin/pip install -e .
       - run: npm ci
       - run: npm run build
       - run: npm test
