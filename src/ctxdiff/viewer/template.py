@@ -388,9 +388,16 @@ function renderHeader(){
   // never fabricate an "in 0 / out 0" from a run with no provider numbers.
   const u = DATA.stats.usage || {};
   const cov = u.coverage || [0, 0];
-  const items = [ r.provider || "?", (r.models || []).join(", ") || "?",
-                  r.started_at || "?", CALLS.length + " turns",
-                  fmt(total) + " tokens" ];
+  // The model segment is OMITTED entirely (not rendered as "?") when
+  // r.models is empty — a run whose calls never reported a model (or, pre-
+  // capture, one with no calls yet) should show "openai · <started> · ..."
+  // rather than a dangling " · ? · " placeholder for a field that simply
+  // has no value to show.
+  const modelsStr = (r.models || []).join(", ");
+  const items = [ r.provider || "?" ];
+  if(modelsStr) items.push(modelsStr);
+  items.push(r.started_at || "?", CALLS.length + " turns",
+             fmt(total) + " tokens");
   if(cov[0] > 0){
     items.push("in " + fmt(u.input) + " \\u00b7 out " + fmt(u.output) +
                " (" + cov[0] + "/" + cov[1] + " reported)");

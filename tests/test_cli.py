@@ -647,3 +647,63 @@ def test_diff_agent_accepts_owned_turns(tmp_path, capsys):
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "turn 1 → turn 3" in out
+
+
+# --- `ctxdiff demo` -------------------------------------------------------------
+
+
+def test_demo_out_writes_ctrace_and_html_and_prints_both_paths(tmp_path, capsys):
+    """`ctxdiff demo --no-open --out FILE.ctrace` writes FILE.ctrace and a
+    self-contained FILE.html beside it, and prints both paths."""
+    out_ctrace = str(tmp_path / "d.ctrace")
+    out_html = str(tmp_path / "d.html")
+
+    exit_code = main(["demo", "--no-open", "--out", out_ctrace])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert os.path.exists(out_ctrace)
+    assert os.path.exists(out_html)
+    assert out_ctrace in captured.out
+    assert out_html in captured.out
+
+    html_text = open(out_html, encoding="utf-8").read()
+    assert "http://" not in html_text
+    assert "https://" not in html_text
+
+
+def test_demo_default_uses_tempfile_and_exits_zero(tmp_path, monkeypatch, capsys):
+    """`ctxdiff demo --no-open` with no --out/--keep succeeds via a tempfile
+    pair, exits 0, and prints paths ending in .ctrace/.html."""
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["demo", "--no-open"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert ".ctrace" in out
+    assert ".html" in out
+
+
+def test_demo_keep_writes_fixed_filenames_in_cwd(tmp_path, monkeypatch, capsys):
+    """`ctxdiff demo --no-open --keep` writes ./ctxdiff-demo.ctrace and
+    ./ctxdiff-demo.html in the current directory."""
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["demo", "--no-open", "--keep"])
+
+    assert exit_code == 0
+    assert (tmp_path / "ctxdiff-demo.ctrace").exists()
+    assert (tmp_path / "ctxdiff-demo.html").exists()
+
+
+def test_demo_prints_a_nudge_toward_tracing_a_real_agent(tmp_path, capsys):
+    """The output nudges the user toward `trace.init`/`tracer.wrap` for their
+    own agent, not just the sample."""
+    out_ctrace = str(tmp_path / "d.ctrace")
+
+    main(["demo", "--no-open", "--out", out_ctrace])
+
+    out = capsys.readouterr().out
+    assert "trace.init" in out
+    assert "tracer.wrap" in out

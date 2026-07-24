@@ -63,6 +63,13 @@ class CTrace:
         self._run_id = run_id
         self._call_cols = {row[1] for row in conn.execute("PRAGMA table_info(call)")}
         self._has_v2_cols = {"agent", "step", "provider"} <= self._call_cols
+        # In-memory mirror of the run's `models` column, seeded once here so
+        # `note_model` can gate on a cheap set-membership check instead of a
+        # SELECT on every call. Order matches first-seen order in the DB.
+        row = conn.execute(
+            "SELECT models FROM run WHERE id = ?", (run_id,)).fetchone()
+        self._models: list[str] = json.loads(row[0]) if row else []
+        self._models_seen = set(self._models)
 
     # --- construction ------------------------------------------------------
 
@@ -71,16 +78,24 @@ class CTrace:
                started_at: str = "") -> "CTrace":
         """Create a fresh `.ctrace` at `path`, apply the schema, and write the
         single run row. Foreign keys are enabled so referential integrity holds.
-        `started_at` defaults to empty (the tracer supplies a real timestamp)."""
+        `started_at` defaults to empty (the tracer supplies a real timestamp).
+
+        `models` starts as `[model]` when a real model id is passed, but as an
+        EMPTY list when `model` is falsy (None/""): the run's model is really a
+        per-CALL fact (`wrap()` doesn't know it yet at run-creation time — see
+        trace.py), so seeding a placeholder here would just store a bogus
+        blank string forever if no call ever arrives. `note_model()` is what
+        actually populates `models` from real call params as they come in."""
         conn = sqlite3.connect(path)
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.executescript(DDL)
             run_id = uuid.uuid4().hex
+            models = [model] if model else []
             conn.execute(
                 "INSERT INTO run VALUES (?,?,?,?,?,?,?)",
                 (run_id, project, started_at, provider,
-                 json.dumps([model]), __version__, SCHEMA_VERSION),
+                 json.dumps(models), __version__, SCHEMA_VERSION),
             )
             conn.commit()
         except Exception:
@@ -168,7 +183,32 @@ class CTrace:
                     "INSERT INTO call_block VALUES (?,?,?,?,?)",
                     (call_id, b.content_hash, cb.position, cb.label, cb.label_source),
                 )
+        # Roll this call's model up onto the run — the fix for the
+        # long-standing `run.models == ['']` gap: the run's model is only
+        # ever really known per-call, so every write here is a chance to
+        # backfill it. `model`/`modelId` covers openai/anthropic/gemini
+        # (which all name the param "model") and bedrock (which names it
+        # "modelId" instead, per its Converse API shape) without needing a
+        # per-provider special case here.
+        self.note_model(params.get("model") or params.get("modelId"))
         return call_id
+
+    def note_model(self, model: str | None) -> None:
+        """Append `model` to the run's `models` list the first time it's seen,
+        preserving first-seen order and deduping repeats; ignores None/empty
+        so a call with no model param never pollutes the list with a blank
+        entry. Cheap: the common case (a model already known) costs only an
+        in-memory set lookup — the `models` JSON is re-serialized and the run
+        row UPDATEd only on an actual new model, not on every call."""
+        if not model or model in self._models_seen:
+            return
+        self._models_seen.add(model)
+        self._models.append(model)
+        with self._conn:  # single-statement transaction
+            self._conn.execute(
+                "UPDATE run SET models = ? WHERE id = ?",
+                (json.dumps(self._models), self._run_id),
+            )
 
     # --- reading -----------------------------------------------------------
 

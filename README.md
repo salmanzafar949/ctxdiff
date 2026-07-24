@@ -1,8 +1,8 @@
 # ctxdiff
 
+[![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg)](https://pypi.org/project/ctxdiff/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Status: v1 · capture → diff → tokens → cache → viewer](https://img.shields.io/badge/status-v1%20%C2%B7%20capture%20%E2%86%92%20diff%20%E2%86%92%20tokens%20%E2%86%92%20cache%20%E2%86%92%20viewer-brightgreen.svg)](#features)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
@@ -30,6 +30,13 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 
 ![ctxdiff dashboard — a multi-agent run: agent chips and filtering, git-style turn diffs, token allocation, cache-break attribution, light and dark themes](assets/ctxdiff-dashboard-agents.gif)
 
+> **See it in 30 seconds — no API key, no setup:**
+> ```bash
+> pip install ctxdiff
+> ctxdiff demo          # builds a sample multi-agent trace and opens this dashboard
+> ```
+> A realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
+
 ---
 
 ## Features
@@ -51,7 +58,6 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 **What it doesn't do (yet):**
 
 - ⏳ **Streaming usage** — streamed calls are captured, but token `usage` isn't (the response is a stream object at record time).
-- ⏳ **Async clients** — `AsyncOpenAI` / `AsyncAnthropic` aren't intercepted yet.
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
 - ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
@@ -225,7 +231,7 @@ Block text is written into the page as a JSON island and rendered with `textCont
 
 | Provider | Client | Notes |
 |----------|--------|-------|
-| **OpenAI** | `openai.OpenAI(...)` | Chat Completions |
+| **OpenAI** | `openai.OpenAI(...)` | Chat Completions **and Responses API** |
 | **Azure OpenAI** | `openai.AzureOpenAI(...)` | Same adapter, zero config |
 | **Anthropic / Claude** | `anthropic.Anthropic(...)` | Messages API |
 | **Google Gemini** | `google.genai.Client(...)` | Generate Content API (`models.generate_content`) |
@@ -289,6 +295,17 @@ tracer.close()
 ```
 
 `tracer.path` tells you where the trace was written. Call `tracer.close()` when the run is done to close the store cleanly.
+
+### Async clients
+
+`wrap()` transparently intercepts async clients too — `AsyncOpenAI`, `AsyncAnthropic`, and `genai.Client(...).aio` — via call-time awaitable detection, so `await`ed calls are captured exactly like sync ones, no extra config needed:
+
+```python
+client = tracer.wrap(AsyncOpenAI())
+resp = await client.chat.completions.create(model="gpt-4o", messages=[...])
+```
+
+(Bedrock stays sync-only — boto3 has no first-party async client.)
 
 ### Semantic tagging
 
@@ -422,6 +439,26 @@ client = tracer.wrap(OpenAI())
 client.chat.completions.create(model="gpt-4o", messages=[...])
 ```
 
+### OpenAI Responses API
+
+The same `wrap()` also captures `client.responses.create(...)` — the Responses API the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) builds on — off the *same* wrapped client, no separate call. `instructions` is captured as the leading system block, flat `tools` schemas next, then `input` (string or a list of message/tool items); usage is read from `input_tokens`/`output_tokens` instead of `prompt_tokens`/`completion_tokens`, and `previous_response_id` is kept in params since it's chain linkage, not content.
+
+```python
+from openai import OpenAI
+client = tracer.wrap(OpenAI())
+client.responses.create(
+    model="gpt-4o",
+    instructions="You are a support agent.",
+    input="What's your refund window?",
+)
+```
+
+Works async too, exactly like the chat path:
+
+```python
+resp = await tracer.wrap(AsyncOpenAI()).responses.create(model="gpt-4o", input="hi")
+```
+
 ### Azure OpenAI
 
 No special configuration — Azure clients live in the `openai` package, so the OpenAI adapter applies automatically.
@@ -545,7 +582,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, async clients, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
 
 ---
 
