@@ -1,0 +1,101 @@
+# CI + PyPI auto-publish for ctxdiff.
+#
+# What runs when:
+#   - pull_request → tests only (the merge gate).
+#   - push to main → tests → build → publish to PyPI, but ONLY when the
+#     version in pyproject.toml is not already on PyPI (the version guard) —
+#     so doc-only merges don't fail trying to republish an existing version.
+#     Releasing = bump `version` in pyproject.toml and merge to main.
+#   - workflow_dispatch → manual re-run of the same pipeline.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC): no API token or secret is
+# stored in the repo. PyPI must be told to trust this workflow once — see the
+# "pypi" environment + the repo's README/PR notes for the one-time setup.
+
+name: CI & Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (dev + eval extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,eval]"
+      - name: Run the full suite (unit + real-SDK eval, HTTP stubbed)
+        run: pytest -q
+
+  build:
+    name: build distribution
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      # The version parsed from pyproject.toml, consumed by the version guard.
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+      - name: Read package version
+        id: meta
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: publish to PyPI (if version is new)
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Trusted Publishing: PyPI is configured (one-time, on pypi.org) to trust
+    # this exact repo + workflow + environment. No token/secret anywhere.
+    environment: pypi
+    permissions:
+      id-token: write   # required for PyPI OIDC token exchange
+    steps:
+      - name: Version guard — skip if this version is already on PyPI
+        id: guard
+        run: |
+          v="${{ needs.build.outputs.version }}"
+          status=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/ctxdiff/$v/json")
+          if [ "$status" = "200" ]; then
+            echo "ctxdiff $v already on PyPI — skipping publish (bump the version to release)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ctxdiff $v not on PyPI — publishing."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.guard.outputs.publish == 'true'
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        if: steps.guard.outputs.publish == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
