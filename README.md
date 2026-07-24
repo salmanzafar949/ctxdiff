@@ -76,7 +76,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 
 **What it doesn't do (yet):**
 
-- ⏳ **Streaming usage** — streamed calls are captured, but token `usage` isn't (the response is a stream object at record time).
+- ⏳ **Gemini/Bedrock streaming usage** — `generate_content_stream`/`converse_stream` calls are separate, not-yet-wrapped methods; use the non-streaming `generate_content`/`converse` if you need usage from these two providers today. (OpenAI chat+Responses and Anthropic streaming usage ARE captured — see [Streaming usage](#streaming-usage) below.)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
 - ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
@@ -333,6 +333,27 @@ resp = await client.chat.completions.create(model="gpt-4o", messages=[...])
 
 (Bedrock stays sync-only — boto3 has no first-party async client.)
 
+### Streaming usage
+
+`stream=True` calls (sync or async) are captured too, including token `usage` — the interceptor wraps the returned stream so every chunk still reaches your code unchanged and immediately, and records the call once the stream completes (exhausted, closed, or its `with`/`async with` block exited):
+
+```python
+stream = client.chat.completions.create(
+    model="gpt-4o", messages=[...],
+    stream=True, stream_options={"include_usage": True},  # OpenAI chat: opt in for usage
+)
+for chunk in stream:
+    ...  # your code sees every chunk, unmodified
+```
+
+Whether usage is actually captured depends on what the provider puts on the wire:
+
+- **Anthropic** and **OpenAI Responses** streams report usage unconditionally — no caller action needed.
+- **OpenAI Chat Completions** streams only report usage on a final chunk when the *caller* passes `stream_options={"include_usage": True}`. ctxdiff never injects this for you (it would alter your own request) — without it, the call is still captured but `usage` is honestly `None`.
+- **Gemini** (`generate_content_stream`) and **Bedrock** (`converse_stream`) are separate, not-yet-wrapped methods — use the non-streaming call if you need usage from these two today.
+
+A stream you never fully consume, close, or use as a context manager still gets recorded, best-effort, on garbage collection — with whatever usage was accumulated before you moved on (possibly none).
+
 ### Semantic tagging
 
 Blocks are auto-labeled by a cheap heuristic (`system`, `user`, `history`, `tool_schema`, `tool_output`). For **exact** provenance — especially distinguishing retrieved RAG chunks from ordinary user text — tag the content *before* the call it belongs to:
@@ -573,7 +594,7 @@ llm.invoke("What's your refund window?")   # captured, with usage
 ```
 
 > Wrapping the `ChatOpenAI` object directly raises (it isn't an SDK client) — inject as above.
-> **Streaming caveat:** with `streaming=True`, the call is captured but token `usage` is not (the interceptor sees the stream before it's consumed). Streaming usage capture is tracked for a later milestone.
+> **Streaming caveat:** with `streaming=True`, the call is captured and the stream proxy records once it completes — but LangChain's default `ChatOpenAI` doesn't pass `stream_options={"include_usage": True}` itself, so `usage` still comes back `None` unless you configure LangChain to send it (see [Streaming usage](#streaming-usage) above).
 
 ---
 
