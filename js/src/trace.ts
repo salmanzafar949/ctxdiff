@@ -39,7 +39,9 @@ import { CTrace } from "./store/ctrace.js";
  * needs `accumulateStreamUsage` per-chunk, before any record happens). */
 interface WrapContext {
   tracer: Tracer;
-  recorder: Recorder;
+  // null when store setup failed and capture degraded fail-open: the proxy still
+  // forwards every host call, `onCreate` just short-circuits and records nothing.
+  recorder: Recorder | null;
   agent: string | null;
   provider: string;
   adapter: Adapter;
@@ -125,7 +127,14 @@ const REGISTRY: ProviderEntry[] = [
 export interface InitOptions {
   /** Per-block scrubber applied before storage. */
   redact?: RedactHook;
-  /** Where the `.ctrace` is written (defaults to ./<project>-<8hex>.ctrace). */
+  /**
+   * Where the project `.ctrace` is written. Defaults to a STABLE
+   * `./<project>.ctrace` in the cwd (NOT a per-run unique name): the first
+   * `wrap()` opens that file if it exists and APPENDS a new session, or creates
+   * it if absent, so every `init(project)` accumulates one more session in the
+   * same project db. An explicit `path` works the same way — it appends when the
+   * file already exists.
+   */
   path?: string;
 }
 
@@ -134,11 +143,6 @@ export interface WrapOptions {
   /** Names the agent this client belongs to; stamped onto every recorded call
    * so one run can attribute calls across several agents. */
   agent?: string;
-}
-
-/** Short random hex, used only for the default `.ctrace` filename. */
-function shortId(): string {
-  return Math.random().toString(16).slice(2, 10).padEnd(8, "0");
 }
 
 /** Best-effort exception type name, mirroring Python's `type(exc).__name__`. */
@@ -173,12 +177,16 @@ function isPrefixOfAny(path: string[], createPaths: string[][]): boolean {
 }
 
 /**
- * Create a Tracer for one run. `project` names the run; `opts.redact` is an
- * optional per-block scrubber applied before storage; `opts.path` is where the
- * `.ctrace` is written (defaults to ./<project>-<8hex>.ctrace in the cwd).
+ * Create a Tracer that opens the project's `.ctrace` and starts a NEW SESSION in
+ * it. `project` names the project; `opts.redact` is an optional per-block
+ * scrubber applied before storage; `opts.path` is where the project `.ctrace` is
+ * written (defaults to a STABLE ./<project>.ctrace in the cwd — see InitOptions).
+ * The first `wrap()` APPENDS a session to that file if it already exists, or
+ * creates it if absent, so every `init(project)` accumulates one more session in
+ * the same project db. Mirrors Python `trace.init`.
  */
 export function init(project: string, opts: InitOptions = {}): Tracer {
-  const path = opts.path ?? `${project}-${shortId()}.ctrace`;
+  const path = opts.path ?? `${project}.ctrace`;
   return new Tracer(project, opts.redact ?? null, path);
 }
 
@@ -189,6 +197,18 @@ export class Tracer {
   private ct: CTrace | null = null;
   private firstRecorder: Recorder | null = null;
   private seq = 0; // monotonically increasing turn index across ALL agents
+  // One-time guard for the store-setup fail-open path in wrap(): if the project
+  // store can't be created/opened (e.g. a persistent lock under heavy concurrent
+  // session creation, or an unopenable path) we degrade fail-open and warn at
+  // most once for the run rather than raising into the host.
+  private setupWarned = false;
+  // The matching one-way latch for the RETRY, not just the warning. `ct === null`
+  // alone can't distinguish "not opened yet" from "tried and failed", so every
+  // later wrap() re-entered `openOrCreateSession` and paid its full retry budget
+  // again — and that budget blocks Node's single event loop synchronously (see
+  // store/ctrace.ts). One failure is enough: capture is degraded for the run, so
+  // the second wrap() must cost nothing.
+  private setupFailed = false;
 
   /**
    * Per-async-context capture state — the core of the concurrency model.
@@ -242,15 +262,44 @@ export class Tracer {
         return client;
       }
       const adapter = entry.make();
-      if (this.ct === null) {
-        // model is per-call, not known yet: pass "" so CTrace.create leaves
+      if (this.ct === null && !this.setupFailed) {
+        // model is per-call, not known yet: pass "" so the store leaves
         // run.models == [] rather than seeding a bogus [""]; recordCall/
-        // noteModel backfill the real model(s) as calls arrive.
+        // noteModel backfill the real model(s) as calls arrive. Canonical UTC
+        // (`...Z` via toISOString) so downstream local-time rendering is
+        // unambiguous — see store.parseStartedAt.
         const started = new Date().toISOString();
-        this.ct = CTrace.create(this.path, this.project, entry.provider, "", started);
+        // openOrCreateSession APPENDS a new session (run row) to an existing
+        // project db, or creates the file — the project-scoped write path. Its
+        // connection carries WAL + busy_timeout + bounded retry for safe
+        // concurrent multi-writer access.
+        //
+        // Fail-open guard (the CRITICAL parity item): the store already sets
+        // busy_timeout first and retries on a transient lock, but if it STILL
+        // throws (a genuinely stuck lock under extreme concurrent creation, or an
+        // unopenable path), that must NEVER escape into the host and lose the
+        // whole session hard. We degrade fail-open: leave `ct` null, LATCH the
+        // failure (so no later wrap() re-runs the blocking retry loop), warn
+        // once, and fall through to return a proxy whose calls run normally but
+        // record nothing (recorder stays null → `onCreate` short-circuits).
+        try {
+          this.ct = CTrace.openOrCreateSession(
+            this.path,
+            this.project,
+            entry.provider,
+            "",
+            started,
+          );
+        } catch (err) {
+          this.ct = null;
+          this.setupFailed = true;
+          this.warnSetupDegraded(err);
+        }
       }
-      const recorder = new Recorder(this.ct, adapter, this.redact);
-      if (this.firstRecorder === null) this.firstRecorder = recorder;
+      const recorder = this.ct ? new Recorder(this.ct, adapter, this.redact) : null;
+      if (recorder !== null && this.firstRecorder === null) {
+        this.firstRecorder = recorder;
+      }
       const ctx: WrapContext = {
         tracer: this,
         recorder,
@@ -264,6 +313,22 @@ export class Tracer {
       console.warn("ctxdiff: wrap failed; returning unwrapped client", err);
       return client;
     }
+  }
+
+  /**
+   * Emit the capture-degradation warning AT MOST ONCE for the run when store
+   * setup in `wrap()` fails and capture falls back to fail-open (record nothing).
+   * A one-time flag stops repeated wraps on a broken store from spamming the
+   * host's logs; the underlying setup error is included for diagnosis without
+   * ever re-raising. Mirrors Python `_warn_setup_degraded`.
+   */
+  private warnSetupDegraded(err: unknown): void {
+    if (this.setupWarned) return;
+    this.setupWarned = true;
+    console.warn(
+      "ctxdiff: capture degraded (store setup failed); this run will not be recorded",
+      err,
+    );
   }
 
   /**

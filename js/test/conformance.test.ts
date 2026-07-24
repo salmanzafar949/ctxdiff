@@ -171,6 +171,126 @@ for cb in ct.get_call_blocks(ct.get_calls()[0].id):
   }
 
   it.skipIf(!hasVenv)(
+    "a JS-written MULTI-SESSION project .ctrace lists identical sessions/calls in the Python reader",
+    async () => {
+      const path = join(tmpdir(), `ctxdiff-conf-multi-${randomUUID()}.ctrace`);
+      try {
+        // Two separate init()s APPEND two sessions to ONE project file — the
+        // project-scoped model. Session A: one call under agent "planner";
+        // session B: two calls under agent "worker".
+        const mkStub = () =>
+          stubClient({
+            id: "cmpl",
+            object: "chat.completion",
+            model: "gpt-4o",
+            choices: [
+              { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+            ],
+            usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+          });
+
+        const tA = init("proj", { path });
+        const wA = tA.wrap(mkStub(), { agent: "planner" }) as OpenAI;
+        await wA.chat.completions.create({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "session A q1" }],
+        });
+        tA.close();
+
+        const tB = init("proj", { path });
+        const wB = tB.wrap(mkStub(), { agent: "worker" }) as OpenAI;
+        for (const q of ["session B q1", "session B q2"]) {
+          await wB.chat.completions.create({
+            model: "gpt-4o",
+            messages: [{ role: "user", content: q }],
+          });
+        }
+        tB.close();
+
+        // What the JS reader sees: two sessions, oldest-first, with turn counts
+        // and agents. Emit a stable, comparable projection.
+        const rjs = CTrace.open(path);
+        const jsSessions = rjs
+          .listSessions()
+          .map((s) => `${s.turnCount} ${s.provider} ${s.agents.join(",")}`);
+        rjs.close();
+        expect(jsSessions).toEqual(["1 openai planner", "2 openai worker"]);
+
+        // The Python reader must list the SAME sessions (oldest-first) with the
+        // same per-session call counts and agent sets — cross-language proof the
+        // multi-session project file is byte-compatible.
+        const pyScript = `
+from ctxdiff.store.ctrace import CTrace
+ct = CTrace.open(${JSON.stringify(path)})
+for s in ct.list_sessions():
+    print(s.turn_count, s.provider, ",".join(s.agents))
+`;
+        const proc = spawnSync(venvPython, ["-c", pyScript], {
+          encoding: "utf8",
+          env: { ...process.env, PYTHONPATH: pySrc },
+        });
+        expect(
+          proc.status,
+          `python reader failed (status ${proc.status}):\n${proc.stderr}`,
+        ).toBe(0);
+        const lines = proc.stdout.trim().split("\n");
+        expect(lines).toEqual(jsSessions);
+      } finally {
+        for (const suffix of ["", "-wal", "-shm"]) {
+          rmSync(path + suffix, { force: true });
+        }
+      }
+    },
+  );
+
+  it.skipIf(!hasVenv)(
+    "a Python-written MULTI-SESSION project .ctrace lists identical sessions in the JS reader (vice-versa)",
+    () => {
+      const path = join(tmpdir(), `ctxdiff-conf-pymulti-${randomUUID()}.ctrace`);
+      try {
+        // Python appends two sessions to one project file via its own project-
+        // scoped write path (open_or_create_session), mirroring the JS direction.
+        const pyScript = `
+import datetime
+from ctxdiff.store.ctrace import CTrace
+def sess(agent, n):
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ct = CTrace.open_or_create_session(${JSON.stringify(path)}, project="proj", provider="openai", model="", started_at=now)
+    for s in range(1, n + 1):
+        ct.record_call(seq=s, params={"model": "gpt-4o"}, usage=None, latency_ms=1, error=None, call_blocks=[], agent=agent)
+    ct.close()
+sess("planner", 1)
+sess("worker", 2)
+`;
+        const proc = spawnSync(venvPython, ["-c", pyScript], {
+          encoding: "utf8",
+          env: { ...process.env, PYTHONPATH: pySrc },
+        });
+        expect(
+          proc.status,
+          `python writer failed (status ${proc.status}):\n${proc.stderr}`,
+        ).toBe(0);
+
+        // The JS reader lists the same two sessions, oldest-first, with matching
+        // per-session turn counts and agents.
+        const ct = CTrace.open(path);
+        const sessions = ct.listSessions();
+        expect(
+          sessions.map((s) => `${s.turnCount} ${s.provider} ${s.agents.join(",")}`),
+        ).toEqual(["1 openai planner", "2 openai worker"]);
+        // Session-less JS read defaults to the newest (Python's second session).
+        expect(ct.getCalls()).toHaveLength(2);
+        for (const c of ct.getCalls()) expect(c.agent).toBe("worker");
+        ct.close();
+      } finally {
+        for (const suffix of ["", "-wal", "-shm"]) {
+          rmSync(path + suffix, { force: true });
+        }
+      }
+    },
+  );
+
+  it.skipIf(!hasVenv)(
     "an Anthropic .ctrace written by JS opens in the Python reader with identical hashes",
     () => {
       assertProviderConformance(

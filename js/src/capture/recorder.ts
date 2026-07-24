@@ -16,6 +16,11 @@ export class Recorder {
   private ct: CTrace;
   private adapter: Adapter;
   private redact: RedactHook | null;
+  // One-time latch for the record-failure warning. A store that fails one write
+  // usually fails every write (a full disk, a revoked file handle, a stuck
+  // lock), and this path runs once per LLM call — unlatched it floods the host's
+  // logs with an identical stack per turn. Mirrors Python's `_persist_warned`.
+  private recordWarned = false;
 
   constructor(ct: CTrace, adapter: Adapter, redact: RedactHook | null) {
     this.ct = ct;
@@ -83,11 +88,15 @@ export class Recorder {
         provider,
       });
     } catch (err) {
-      // fail-open is the whole point
-      if (!quiet) {
+      // fail-open is the whole point. Warn AT MOST ONCE for the run: the first
+      // failure carries the diagnosis (message + stack), and every subsequent
+      // one is dropped silently rather than repeating the same stack per turn.
+      if (!quiet && !this.recordWarned) {
+        this.recordWarned = true;
         // eslint-disable-next-line no-console
         console.warn(
-          `ctxdiff: failed to record call seq=${seq} (tracing skipped)`,
+          `ctxdiff: failed to record call seq=${seq} (tracing skipped); ` +
+            "further record failures in this run will be silent",
           err,
         );
       }

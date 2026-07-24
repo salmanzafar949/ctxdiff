@@ -15,7 +15,7 @@ import { init, Tracer } from "./trace.js";
 
 export { init, Tracer } from "./trace.js";
 export type { InitOptions, WrapOptions } from "./trace.js";
-export { CTrace } from "./store/ctrace.js";
+export { CTrace, parseStartedAt } from "./store/ctrace.js";
 export { SCHEMA_VERSION, DDL } from "./store/schema.js";
 export { VERSION } from "./version.js";
 export {
@@ -24,7 +24,7 @@ export {
   contentHash,
   basicLabel,
 } from "./models.js";
-export type { Block, RawBlock, CallBlock, Run, Call } from "./models.js";
+export type { Block, RawBlock, CallBlock, Run, Call, Session } from "./models.js";
 export { countTokens } from "./tokenize.js";
 export type { Adapter } from "./capture/base.js";
 export { OpenAIAdapter } from "./capture/openai.js";

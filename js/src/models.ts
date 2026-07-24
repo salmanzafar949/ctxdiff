@@ -57,6 +57,24 @@ export interface Run {
   ctxdiffVersion: string;
 }
 
+/**
+ * A one-line summary of one session (one `run` row) in a project `.ctrace`, as
+ * returned by `CTrace.listSessions()` — the shape a session picker lists from.
+ * `agents` is the set of distinct agent labels seen on this session's calls, in
+ * first-appearance order (`[]` for a single-agent/pre-v2 session); `turnCount`
+ * is how many calls it holds. `startedAt` is the raw stored string — use
+ * `parseStartedAt()` for a tz-aware Date. Mirrors Python's `Session`.
+ */
+export interface Session {
+  id: string;
+  project: string;
+  startedAt: string;
+  provider: string;
+  models: string[];
+  agents: string[];
+  turnCount: number;
+}
+
 /** One LLM request/response ('turn'), as stored in the `call` table. */
 export interface Call {
   id: string;
