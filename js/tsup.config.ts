@@ -16,5 +16,5 @@ export default defineConfig({
   sourcemap: true,
   target: "node22",
   platform: "node",
-  external: ["openai"],
+  external: ["openai", "@anthropic-ai/sdk", "@google/genai"],
 });

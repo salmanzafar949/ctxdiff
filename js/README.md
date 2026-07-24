@@ -72,11 +72,21 @@ const tracer = trace.init("my-project", {
 The block is hashed and token-counted **before** redaction, so identity/dedup
 stays stable; only the stored text changes.
 
-## Scope
+## Providers
 
-This release captures **OpenAI** (chat completions + responses, sync/async,
-streaming, and `.stream()`). Anthropic and Gemini adapters slot into the same
-layer next.
+`tracer.wrap(client)` auto-detects the provider from the client you pass:
+
+| Provider  | Client                          | Methods captured                                                              |
+| --------- | ------------------------------- | ----------------------------------------------------------------------------- |
+| OpenAI    | `openai`                        | `chat.completions.create` / `.stream()`, `responses.create` / `.stream()`, `stream:true` |
+| Anthropic | `@anthropic-ai/sdk`             | `messages.create` (+ `stream:true`), `messages.stream()`                       |
+| Gemini    | `@google/genai`                 | `models.generateContent`, `models.generateContentStream`                       |
+
+All are peer dependencies — you bring your own client(s). Streaming usage is
+folded from the provider's own events (OpenAI final-chunk `usage`; Anthropic
+`message_start` + `message_delta`; Gemini cumulative `usageMetadata`) and
+recorded once the stream completes. Traces from any provider open in the same
+Python `ctxdiff view`. (AWS Bedrock is not yet in the JS SDK.)
 
 ## Format
 

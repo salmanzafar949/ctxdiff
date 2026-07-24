@@ -28,6 +28,8 @@
  */
 import type { Adapter } from "./capture/base.js";
 import { OpenAIAdapter } from "./capture/openai.js";
+import { AnthropicAdapter } from "./capture/anthropic.js";
+import { GeminiAdapter } from "./capture/gemini.js";
 import { Recorder, type RedactHook } from "./capture/recorder.js";
 import { CTrace } from "./store/ctrace.js";
 
@@ -51,13 +53,18 @@ interface ProviderEntry {
   make(): Adapter;
 }
 
+function ctorName(client: unknown): string | undefined {
+  if (client == null || typeof client !== "object") return undefined;
+  return (client as { constructor?: { name?: string } }).constructor?.name;
+}
+
 /** Recognize an OpenAI client (sync or async): by class name, or by duck-typing
  * the two completion resources. Azure's client subclasses OpenAI, so its name
  * check is covered too. Kept liberal so a lightly-wrapped or re-exported client
  * still resolves; anything else falls through to unrecognized (pass-through). */
 function detectOpenAI(client: unknown): boolean {
   if (client == null || typeof client !== "object") return false;
-  const name = (client as { constructor?: { name?: string } }).constructor?.name;
+  const name = ctorName(client);
   if (name === "OpenAI" || name === "AzureOpenAI") return true;
   const c = client as {
     chat?: { completions?: { create?: unknown } };
@@ -66,8 +73,39 @@ function detectOpenAI(client: unknown): boolean {
   return typeof c.chat?.completions?.create === "function" && c.responses != null;
 }
 
+/** Recognize an Anthropic client: by class name, or by duck-typing
+ * `messages.create` while ensuring it is NOT an OpenAI client (which has no
+ * top-level `messages` resource but does have `chat`/`responses`). */
+function detectAnthropic(client: unknown): boolean {
+  if (client == null || typeof client !== "object") return false;
+  if (ctorName(client) === "Anthropic") return true;
+  const c = client as {
+    messages?: { create?: unknown };
+    chat?: unknown;
+    responses?: unknown;
+  };
+  return (
+    typeof c.messages?.create === "function" &&
+    c.chat == null &&
+    c.responses == null
+  );
+}
+
+/** Recognize a @google/genai client (`GoogleGenAI`): by class name, or by
+ * duck-typing `models.generateContent`. */
+function detectGemini(client: unknown): boolean {
+  if (client == null || typeof client !== "object") return false;
+  if (ctorName(client) === "GoogleGenAI") return true;
+  const c = client as { models?: { generateContent?: unknown } };
+  return typeof c.models?.generateContent === "function";
+}
+
+// The single extension point. Order matters only to disambiguate overlapping
+// duck-types; these three are mutually exclusive (distinct resource shapes).
 const REGISTRY: ProviderEntry[] = [
   { provider: "openai", detect: detectOpenAI, make: () => new OpenAIAdapter() },
+  { provider: "anthropic", detect: detectAnthropic, make: () => new AnthropicAdapter() },
+  { provider: "gemini", detect: detectGemini, make: () => new GeminiAdapter() },
 ];
 
 /** Options for `init`. */
@@ -316,7 +354,20 @@ function makeInterceptor(
   path: string[],
   ctx: WrapContext,
 ): (...a: unknown[]) => unknown {
-  const isStreamHelper = path[path.length - 1] === "stream";
+  const last = path[path.length - 1];
+  // Two "this method always streams" shapes, distinguished by the last path
+  // segment (a STRUCTURAL signal read at proxy-resolution time, never
+  // duck-typed off the return value):
+  //   - EXACTLY "stream" → a `.stream()` convenience helper (OpenAI's
+  //     chat.completions/responses, Anthropic's messages) that returns the
+  //     stream object synchronously (no `stream:true` kwarg, no Promise).
+  //   - ends WITH "stream" but isn't exactly "stream" → a distinctly-named
+  //     streaming method (Gemini's `generateContentStream`) that returns a
+  //     Promise resolving to a direct async-iterable; there is no `stream`
+  //     kwarg to read, so the method name is the only signal.
+  const isStreamHelper = last === "stream";
+  const isNamedStreamMethod =
+    last !== "stream" && last.toLowerCase().endsWith("stream");
 
   return function interceptor(...args: unknown[]): unknown {
     const kwargs =
@@ -342,9 +393,10 @@ function makeInterceptor(
       throw exc;
     }
 
-    // `.stream()` helper is the signal `isStreamHelper`; `create({stream:true})`
-    // is signalled by the kwarg. Either routes to the stream proxy.
-    const streaming = isStreamHelper || !!kwargs["stream"];
+    // Streaming if: a `.stream()` helper, a named streaming method (Gemini), or
+    // the caller's own `stream:true` kwarg. Any of these routes to the stream
+    // proxy instead of recording immediately.
+    const streaming = isStreamHelper || isNamedStreamMethod || !!kwargs["stream"];
 
     if (isThenable(result)) {
       // create()/create({stream:true}) — returns a Promise. Record after await.
@@ -447,8 +499,20 @@ function wrapStream(
     if (finalized) return;
     finalized = true;
     try {
+      // Route accumulated usage through the SAME `extractUsage` path a
+      // non-streaming call uses, by presenting `state` as a synthetic response.
+      // The state is exposed under BOTH `usage` (OpenAI/Anthropic's
+      // `extractUsage` reads `response.usage`) AND `usageMetadata` (Gemini's
+      // reads `response.usageMetadata`) — both names point at the SAME object,
+      // so whichever attribute a given adapter duck-types off of, it finds the
+      // right data. This mirrors the Python `_SyntheticStreamResponse` fix:
+      // without the `usageMetadata` alias a Gemini stream's usage would vanish
+      // at record time even though accumulation worked.
       const hasUsage = Object.keys(state).length > 0;
-      const response = hasUsage ? { usage: { ...state } } : null;
+      const usageNs = { ...state };
+      const response = hasUsage
+        ? { usage: usageNs, usageMetadata: usageNs }
+        : null;
       const latencyMs = Math.round(performance.now() - start);
       ctx.tracer.onCreate({
         kwargs,

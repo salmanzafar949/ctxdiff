@@ -15,6 +15,10 @@ import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { init } from "../src/trace.js";
 import { CTrace } from "../src/store/ctrace.js";
+import { Recorder } from "../src/capture/recorder.js";
+import { AnthropicAdapter } from "../src/capture/anthropic.js";
+import { GeminiAdapter } from "../src/capture/gemini.js";
+import type { Adapter } from "../src/capture/base.js";
 
 // vitest runs with cwd = the js/ package dir; the repo root is one level up.
 const repoRoot = resolve(process.cwd(), "..");
@@ -108,8 +112,103 @@ for cb in ct.get_call_blocks(ct.get_calls()[0].id):
     },
   );
 
+  /**
+   * Record one call for `adapter` through the real Recorder (tokens → hash →
+   * label → store) into a fresh `.ctrace`, then open it in the Python venv and
+   * assert Python reports the same provider and the SAME block hashes/labels the
+   * JS reader produced. Proves an Anthropic/Gemini trace written by JS opens
+   * byte-compatibly in the Python SDK — the whole point of the parity work.
+   */
+  function assertProviderConformance(
+    provider: string,
+    adapter: Adapter,
+    kwargs: Record<string, unknown>,
+    response: unknown,
+  ): void {
+    const path = join(tmpdir(), `ctxdiff-conf-${provider}-${randomUUID()}.ctrace`);
+    try {
+      const ct = CTrace.create(path, `conf-${provider}`, provider, "", new Date().toISOString());
+      const rec = new Recorder(ct, adapter, null);
+      rec.record({
+        seq: 1,
+        kwargs,
+        response,
+        latencyMs: 3,
+        error: null,
+        tagged: [],
+        agent: "a1",
+      });
+      ct.close();
+
+      const rjs = CTrace.open(path);
+      const jsCalls = rjs.getCalls();
+      const jsBlocks = rjs
+        .getCallBlocks(jsCalls[0].id)
+        .map((cb) => `${cb.block.contentHash} ${cb.label}`);
+      rjs.close();
+
+      const pyScript = `
+from ctxdiff.store.ctrace import CTrace
+ct = CTrace.open(${JSON.stringify(path)})
+print(len(ct.get_calls()), ct.get_run().provider)
+for cb in ct.get_call_blocks(ct.get_calls()[0].id):
+    print(cb.block.content_hash, cb.label)
+`;
+      const proc = spawnSync(venvPython, ["-c", pyScript], {
+        encoding: "utf8",
+        env: { ...process.env, PYTHONPATH: pySrc },
+      });
+      expect(
+        proc.status,
+        `python reader failed (status ${proc.status}):\n${proc.stderr}`,
+      ).toBe(0);
+      const lines = proc.stdout.trim().split("\n");
+      expect(lines[0]).toBe(`1 ${provider}`);
+      expect(lines.slice(1)).toEqual(jsBlocks);
+    } finally {
+      rmSync(path, { force: true });
+    }
+  }
+
+  it.skipIf(!hasVenv)(
+    "an Anthropic .ctrace written by JS opens in the Python reader with identical hashes",
+    () => {
+      assertProviderConformance(
+        "anthropic",
+        new AnthropicAdapter(),
+        {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 100,
+          system: "be terse",
+          tools: [{ name: "get_weather", input_schema: { type: "object" } }],
+          messages: [{ role: "user", content: "hi" }],
+        },
+        { usage: { input_tokens: 10, output_tokens: 5 } },
+      );
+    },
+  );
+
+  it.skipIf(!hasVenv)(
+    "a Gemini .ctrace written by JS opens in the Python reader with identical hashes",
+    () => {
+      assertProviderConformance(
+        "gemini",
+        new GeminiAdapter(),
+        {
+          model: "gemini-2.0-flash",
+          contents: [
+            { role: "user", parts: [{ text: "what is 2+2" }] },
+            { role: "model", parts: [{ text: "4" }] },
+          ],
+          config: { systemInstruction: "be terse", temperature: 0.5 },
+        },
+        { usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 } },
+      );
+    },
+  );
+
   // No separate "venv unavailable" case: when the venv is absent the real
-  // conformance `it` above is reported by vitest as an explicit SKIP (via
+  // conformance `it`s above are reported by vitest as explicit SKIPs (via
   // `it.skipIf`), which already surfaces the state honestly — a vacuous passing
   // assertion here would only disguise a skipped cross-language run as green.
 });

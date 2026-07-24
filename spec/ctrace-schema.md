@@ -106,6 +106,16 @@ on the label, because the same text can be labeled differently per call.
   > affect JS→Python reads (readers store and return hashes verbatim, never
   > re-hash), and within a single language dedup is fully consistent.
 
+  > **Degenerate `text: null` edge:** a content part with an explicit null text
+  > value (e.g. `{"type": "text", "text": null}`) — which no real provider SDK
+  > emits — is handled differently by the two SDKs. Python keeps the value as
+  > `None`, which normalizes to `"null"` but then fails the `block.text NOT NULL`
+  > insert, so the whole call is dropped fail-open (nothing recorded). JS coerces
+  > the null to `""` at extraction, so the call IS recorded with an empty-text
+  > block. The JS choice is deliberate: `block.text` is typed `string`, and
+  > silently losing a call to a degenerate input is worse than an empty block.
+  > Only reachable via hand-built malformed payloads.
+
 ### `contentHash(role, kind, text)`
 
 ```

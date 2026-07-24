@@ -6,7 +6,15 @@
   "license": "Apache-2.0",
   "author": "Salman Zafar",
   "homepage": "https://github.com/salmanzafar/ctxdiff",
-  "keywords": ["llm", "openai", "context", "debugger", "observability", "tracing", "agents"],
+  "keywords": [
+    "llm",
+    "openai",
+    "context",
+    "debugger",
+    "observability",
+    "tracing",
+    "agents"
+  ],
   "engines": {
     "node": ">=22"
   },
@@ -20,7 +28,10 @@
       "require": "./dist/index.cjs"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsup && node scripts/fix-node-sqlite.mjs && tsc --emitDeclarationOnly --outDir dist",
     "test": "vitest run",
@@ -30,14 +41,24 @@
     "gpt-tokenizer": "^3.4.0"
   },
   "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.30",
+    "@google/genai": ">=0.3",
     "openai": ">=4"
   },
   "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "@google/genai": {
+      "optional": true
+    },
     "openai": {
       "optional": true
     }
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.114.0",
+    "@google/genai": "^2.13.0",
     "@types/node": "^26.1.1",
     "openai": "^6.49.0",
     "tsup": "^8.5.1",

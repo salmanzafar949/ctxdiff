@@ -28,6 +28,8 @@ export type { Block, RawBlock, CallBlock, Run, Call } from "./models.js";
 export { countTokens } from "./tokenize.js";
 export type { Adapter } from "./capture/base.js";
 export { OpenAIAdapter } from "./capture/openai.js";
+export { AnthropicAdapter } from "./capture/anthropic.js";
+export { GeminiAdapter } from "./capture/gemini.js";
 export { Recorder, type RedactHook } from "./capture/recorder.js";
 
 /** Namespace mirroring the Python `from ctxdiff import trace` entry point, so
