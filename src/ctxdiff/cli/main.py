@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import os
 import sys
+import tempfile
+import webbrowser
 
 from ctxdiff.analyze.cache import analyze_cache
 from ctxdiff.analyze.differ import diff_turns
@@ -20,6 +23,9 @@ from ctxdiff.cli.render import (
     render_turn_diff,
 )
 from ctxdiff.store.ctrace import CTrace
+from ctxdiff.viewer import export_html
+
+_log = logging.getLogger("ctxdiff")
 
 
 def _find_default_run(cwd: str) -> str | None:
@@ -92,9 +98,37 @@ def _add_runs_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_runs)
 
 
+def _add_export_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff export [--run PATH] [--out FILE.html]`: emit a
+    self-contained HTML dashboard. `--out` overrides the destination; by
+    default the file is written as `<trace-stem>.html` beside the trace."""
+    p = subparsers.add_parser(
+        "export", help="write a self-contained HTML dashboard for a run")
+    p.add_argument("--run", default=None, help="path to a .ctrace file "
+                    "(default: most recently modified *.ctrace in cwd)")
+    p.add_argument("--out", default=None,
+                    help="output .html path (default: <trace-stem>.html next to the trace)")
+    p.set_defaults(func=_cmd_export)
+
+
+def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff view [--run PATH] [--no-open]`: export the dashboard
+    to a temp file and open it in the default browser. `--no-open` skips the
+    browser launch (used by tests and headless/CI environments) but still
+    writes and prints the file path."""
+    p = subparsers.add_parser(
+        "view", help="open a self-contained HTML dashboard in your browser")
+    p.add_argument("--run", default=None, help="path to a .ctrace file "
+                    "(default: most recently modified *.ctrace in cwd)")
+    p.add_argument("--no-open", action="store_true", dest="no_open",
+                    help="write and print the HTML path but do not open a browser")
+    p.set_defaults(func=_cmd_view)
+
+
 # Every registered subcommand's add_parser function, in help-listing order.
 # Appending here is the ONLY change later milestones need to add a subcommand.
-_SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_cache_parser, _add_runs_parser]
+_SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_cache_parser,
+                _add_runs_parser, _add_export_parser, _add_view_parser]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -232,6 +266,55 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             ct.close()
         rows.append((os.path.basename(path), run.project, run.provider, n_calls))
     print(render_runs_list(rows))
+    return 0
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff export`. How: resolves the `.ctrace` (missing ->
+    exit 1, same convention as the other subcommands), exports it to HTML
+    (any open/build/write failure -> exit 1 with a message), and prints the
+    written path on success."""
+    path = _resolve_run_path(args.run)
+    if path is None:
+        print("no .ctrace here — did the run capture?", file=sys.stderr)
+        return 1
+    try:
+        out = export_html(path, args.out)
+    except Exception as exc:  # noqa: BLE001 — any export failure is reported, not crashed
+        print(f"ctxdiff: {exc}", file=sys.stderr)
+        return 1
+    print(out)
+    return 0
+
+
+def _cmd_view(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff view`. How: resolves the `.ctrace` (missing ->
+    exit 1), exports the dashboard to a temp `.html` file, prints its path,
+    and opens it in the default browser via a `file://` URL unless
+    `--no-open` is set. The browser launch is wrapped so a failing/absent
+    browser NEVER crashes the command — the path is already printed, so the
+    user can always open the file themselves."""
+    path = _resolve_run_path(args.run)
+    if path is None:
+        print("no .ctrace here — did the run capture?", file=sys.stderr)
+        return 1
+
+    # mkstemp creates and opens the file; we only need its path, so close the
+    # descriptor immediately and let export_html rewrite the file by path.
+    fd, tmp = tempfile.mkstemp(suffix=".html")
+    os.close(fd)
+    try:
+        out = export_html(path, tmp)
+    except Exception as exc:  # noqa: BLE001 — any export failure is reported, not crashed
+        print(f"ctxdiff: {exc}", file=sys.stderr)
+        return 1
+
+    print(out)
+    if not args.no_open:
+        try:
+            webbrowser.open("file://" + os.path.abspath(out))
+        except Exception:  # noqa: BLE001 — never let a browser failure crash view
+            _log.warning("ctxdiff: could not open a browser; open %s manually", out)
     return 0
 
 

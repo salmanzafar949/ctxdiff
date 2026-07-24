@@ -1,4 +1,5 @@
 import json
+import os
 import re
 
 from ctxdiff.cli import main
@@ -367,3 +368,62 @@ def test_cache_stable_trace_shows_green_line_and_exits_zero(tmp_path, capsys):
     assert "✓" in out
     assert "prefix stable across all 1 turn pairs" in out
     assert "⚠" not in out
+
+
+# --- `ctxdiff export` / `ctxdiff view` ----------------------------------------
+
+
+def test_export_writes_file_and_prints_path(tmp_path, capsys):
+    """`ctxdiff export --out FILE` writes the HTML file and prints its path,
+    exit 0."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_trace(path)
+    out_file = str(tmp_path / "dash.html")
+
+    exit_code = main(["export", "--run", path, "--out", out_file])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert os.path.exists(out_file)
+    assert out_file in captured.out
+    # sanity: it really is the self-contained dashboard for this run
+    assert "demo" in open(out_file, encoding="utf-8").read()
+
+
+def test_export_default_path_next_to_trace(tmp_path, capsys):
+    """With no --out, export writes <stem>.html beside the trace and prints it."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_trace(path)
+
+    exit_code = main(["export", "--run", path])
+
+    out = capsys.readouterr().out.strip()
+    assert exit_code == 0
+    assert out == str(tmp_path / "demo.html")
+    assert os.path.exists(out)
+
+
+def test_view_no_open_writes_temp_html_and_exits_zero(tmp_path, capsys):
+    """`ctxdiff view --no-open` exports to a temp .html, prints its path, and
+    exits 0 without launching a browser."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_trace(path)
+
+    exit_code = main(["view", "--run", path, "--no-open"])
+
+    printed = capsys.readouterr().out.strip()
+    assert exit_code == 0
+    assert printed.endswith(".html")
+    assert os.path.exists(printed)
+    os.remove(printed)  # clean up the tempfile this test created
+
+
+def test_export_no_run_found_exits_1(tmp_path, monkeypatch, capsys):
+    """No .ctrace findable -> the friendly message and exit 1, same as diff."""
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["export"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "did the run capture" in captured.err
