@@ -1,0 +1,32 @@
+name: js
+
+# Build + test the JavaScript/TypeScript SDK. Path-filtered to js/** so it only
+# runs when the JS package changes. TEST ONLY — npm publishing is wired
+# separately once npm auth is configured; this workflow never publishes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "js/**"
+      - ".github/workflows/js.yml"
+  pull_request:
+    paths:
+      - "js/**"
+      - ".github/workflows/js.yml"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
