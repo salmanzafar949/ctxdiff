@@ -85,9 +85,21 @@ class CTrace:
         per-CALL fact (`wrap()` doesn't know it yet at run-creation time — see
         trace.py), so seeding a placeholder here would just store a bogus
         blank string forever if no call ever arrives. `note_model()` is what
-        actually populates `models` from real call params as they come in."""
-        conn = sqlite3.connect(path)
+        actually populates `models` from real call params as they come in.
+
+        `check_same_thread=False` + WAL: a live capture run drives all its
+        writes through ONE dedicated writer thread (see `trace.py`'s `_Writer`),
+        NOT the thread that opened the connection here. sqlite3 otherwise
+        forbids using a connection from a thread other than its creator, so the
+        check is disabled — safe because ctxdiff still serializes every write
+        onto that single writer thread (never concurrent access), it just isn't
+        the creating thread. WAL (write-ahead logging) lets those writes commit
+        without blocking readers and is enabled once at creation (it's a
+        persistent property of the file). Both are set BEFORE the DDL so the
+        whole run is created under them."""
+        conn = sqlite3.connect(path, check_same_thread=False)
         try:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA foreign_keys = ON")
             conn.executescript(DDL)
             run_id = uuid.uuid4().hex
@@ -264,5 +276,16 @@ class CTrace:
         return result
 
     def close(self) -> None:
-        """Close the underlying SQLite connection."""
+        """Checkpoint the WAL back into the main database file, then close the
+        connection. The explicit `wal_checkpoint(TRUNCATE)` guarantees a fresh
+        reader that opens the file on ANOTHER connection right after close sees
+        every committed write immediately (and shrinks the -wal sidecar),
+        rather than relying on SQLite's automatic on-close checkpoint. The
+        checkpoint is best-effort — a failure here (e.g. WAL not in use for a
+        v1 file opened read-only) must never stop the connection from closing,
+        so it is swallowed."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:  # noqa: BLE001 — checkpoint is best-effort; always close
+            pass
         self._conn.close()

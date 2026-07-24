@@ -1468,11 +1468,17 @@ def test_stream_manager_nothing_recorded_before_with_block_entered(tmp_path):
 
     manager = wrapped.chat.completions.stream(
         model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
-    assert t._seq == 0  # nothing recorded yet
+    # Nothing recorded yet: `.stream()` fires no request (the real manager's
+    # __enter__ hasn't run) so no call has been enqueued.
+    assert not client.chat.completions.next_manager.entered
     with manager as s:
         list(s)
-    assert t._seq == 1  # exactly one call recorded once the block ran
     t.close()
+    # Exactly one call recorded once the block ran (the flush on close()
+    # guarantees the writer has persisted it before we read).
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert len(ct.get_calls()) == 1
+    ct.close()
 
 
 def test_stream_manager_sync_with_block_records_once_with_usage(tmp_path):

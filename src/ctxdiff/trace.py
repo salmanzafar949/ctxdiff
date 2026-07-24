@@ -32,8 +32,13 @@ wrapped in the SAME `_StreamProxy`/`_AsyncStreamProxy` used for
 machinery is shared, not duplicated."""
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import inspect
+import itertools
 import logging
+import queue
+import threading
 import time
 import types
 import uuid
@@ -134,6 +139,182 @@ def _detect_provider(client: object) -> str:
         f"supported providers: {sorted(_ADAPTERS)}")
 
 
+class _Writer:
+    """The run's single dedicated writer thread, sitting behind a bounded queue.
+
+    Why it exists: SQLite connections are thread-affine and disk writes should
+    not sit on the host's call path. So every persist for a run is funnelled
+    onto ONE thread that owns the connection: `submit()` (called from any host
+    thread/asyncio task) enqueues a zero-arg job and returns immediately; the
+    thread drains the queue FIFO and runs each job. Because exactly one thread
+    ever writes, there is never concurrent connection access even though the
+    connection was opened on the thread that created the CTrace.
+
+    Ordering: `seq` is assigned by the caller BEFORE `submit()` (see
+    `Tracer._on_create`), so it reflects call-COMPLETION order; the queue is
+    FIFO and the store reads back `ORDER BY seq`, so the persisted timeline is
+    stable regardless of how writer scheduling interleaves.
+
+    Fail-open (the whole point): `submit()` never blocks the host meaningfully
+    and never raises. On a full queue (backpressure) or a writer that is no
+    longer alive, the record is DROPPED and a ONE-TIME degradation warning is
+    emitted — capture degrades silently rather than ever slowing or breaking
+    the host. Each job runs inside its own guard on the writer thread, so a
+    single bad job can never kill the loop; the loop only ends on the close
+    sentinel.
+
+    Shutdown: `close()` enqueues a sentinel AFTER every already-queued job;
+    FIFO ordering means the writer persists them all before it sees the
+    sentinel, giving a true flush with no lost writes. It then closes the
+    connection (on its own thread, honouring affinity) and exits, and `close()`
+    joins it."""
+
+    _SENTINEL = object()
+
+    def __init__(self, ctrace: CTrace, maxsize: int = 10000):
+        """Start the writer thread that will own `ctrace`'s connection. How:
+        creates the bounded FIFO queue (maxsize caps memory / defines the
+        backpressure point), a lock guarding the one-time-warning + closed
+        flags, and a daemon thread running `_run` (daemon so a host that exits
+        without calling `tracer.close()` is never blocked by it). `maxsize`
+        (default 10k) is generous enough that a healthy writer never hits it;
+        reaching it means the writer is falling behind, which is exactly the
+        degradation the drop-and-warn path is for."""
+        self._ct = ctrace
+        self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._lock = threading.Lock()
+        self._closed = False
+        self._warned = False
+        self._persist_warned = False   # one-time flag for writer-side job failures
+        self._thread = threading.Thread(
+            target=self._run, name="ctxdiff-writer", daemon=True)
+        self._thread.start()
+
+    def submit(self, job: Callable[[], None], quiet: bool = False) -> None:
+        """Enqueue one persist job from a host thread/task and return at once.
+        What: hands `job` (a zero-arg callable that persists one call) to the
+        writer thread. How: a non-blocking `put_nowait` so the host is never
+        stalled; if the writer is already stopped or dead, or the queue is full
+        (backpressure), the job is dropped and `_degrade` fires the one-time
+        warning. The whole body is wrapped so nothing — not even an unexpected
+        error building the enqueue — can ever propagate into the host call.
+        `quiet` suppresses the degradation warning for GC/shutdown-time callers
+        (a stream `__del__` finalize), where warning is noise at best."""
+        try:
+            if self._closed or not self._thread.is_alive():
+                self._degrade("writer thread not running", quiet)
+                return
+            self._queue.put_nowait(job)
+        except queue.Full:
+            self._degrade("write queue overflow", quiet)
+        except Exception:  # noqa: BLE001 — enqueue must never break the host
+            self._degrade("enqueue failed", quiet)
+
+    def _degrade(self, reason: str, quiet: bool) -> None:
+        """Emit the capture-degradation warning AT MOST ONCE for the run, then
+        stay silent. What: signals genuine capture loss (writer dead / queue
+        overflow) — deliberately NOT fired for normal concurrency, which just
+        enqueues successfully. How: a lock-guarded `_warned` flag makes the
+        first genuine degradation log and every subsequent one a no-op, so a
+        storm of dropped calls can't spam the host's logs. `quiet` callers
+        (GC/shutdown) skip logging entirely."""
+        if quiet:
+            return
+        with self._lock:
+            if self._warned:
+                return
+            self._warned = True
+        _log.warning("ctxdiff: capture degraded (%s); some calls in this run "
+                     "will not be recorded", reason)
+
+    def _run(self) -> None:
+        """The writer thread's loop: drain the queue FIFO, persisting each job,
+        until the close sentinel. How: blocks on `queue.get()`, and for a real
+        job runs it inside `_run_job` (a guarded runner) so a single failing
+        persist is warned-once and skipped rather than killing the loop (which
+        would silently end all further capture). On the sentinel it first
+        DRAINS any jobs still queued BEHIND it (a `submit()` that passed the
+        `_closed` check before `close()` set it can land its `put_nowait` after
+        the sentinel — see `_drain_stragglers`), then closes the connection
+        HERE, on the owning thread, honouring SQLite thread-affinity; that close
+        is guarded so a failure still lets the thread exit cleanly."""
+        while True:
+            job = self._queue.get()
+            if job is self._SENTINEL:
+                self._drain_stragglers()
+                break
+            self._run_job(job)
+        try:
+            self._ct.close()
+        except Exception:  # noqa: BLE001 — close is best-effort on the way out
+            pass
+
+    def _run_job(self, job: Callable[[], None]) -> None:
+        """Run one persist job inside a guard so a single failure can never kill
+        the writer loop. A failure is warned AT MOST ONCE for the run (mirrors
+        `_degrade`) via `_persist_warned`: a store failing every write would
+        otherwise log one line per job. Never host-facing — writer-only."""
+        try:
+            job()
+        except Exception:  # noqa: BLE001 — one bad job must not kill the writer
+            with self._lock:
+                if self._persist_warned:
+                    return
+                self._persist_warned = True
+            _log.warning("ctxdiff: writer failed to persist a call; further "
+                         "writer failures in this run will be silent (skipped)",
+                         exc_info=True)
+
+    def _drain_stragglers(self) -> None:
+        """After the sentinel is seen, process any jobs still sitting in the
+        queue BEHIND it before the thread exits. Why: `submit()` reads
+        `_closed==False`, then `close()` sets `_closed` and enqueues the
+        sentinel, then that racing `submit()` finally `put_nowait`s its job —
+        which now sits AFTER the sentinel. Without this drain that straggler
+        would be silently abandoned (a lost write, no warning). How: non-blocking
+        `get_nowait` until the queue is empty, running each real job through the
+        same guarded `_run_job`; extra sentinels (from an idempotent double
+        close) are skipped. Warns once if any straggler was found so the rare
+        close-race is observable rather than silent."""
+        stragglers = 0
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if job is self._SENTINEL:
+                continue
+            stragglers += 1
+            self._run_job(job)
+        if stragglers:
+            _log.warning("ctxdiff: drained %d write(s) enqueued during close "
+                         "(recorded, not lost)", stragglers)
+
+    def close(self, timeout: float = 30.0) -> None:
+        """Flush every enqueued write, stop the thread, and close the store —
+        blocking until done, with no lost writes. How: sets `_closed` (so any
+        racing `submit()` now drops instead of enqueuing past the sentinel),
+        then enqueues the sentinel with a BLOCKING put (close may block; the
+        host call path may not) so it lands AFTER all already-queued jobs —
+        FIFO then guarantees the writer persists them all before exiting.
+        Joins the thread (which closes the connection as its last act). The
+        join timeout is a safety valve against a hypothetically wedged writer:
+        exceeding it warns rather than hanging the caller forever. Idempotent —
+        a second close is a no-op."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._queue.put(self._SENTINEL)  # blocking: ensure the flush is enqueued
+        except Exception:  # noqa: BLE001 — never raise out of close
+            pass
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            _log.warning("ctxdiff: writer did not drain within %ss on close; "
+                         "some writes may be lost", timeout)
+
+
 def init(project: str, redact: Callable[[Block], Block] | None = None,
          path: str | None = None) -> "Tracer":
     """Create a Tracer for one run. `project` names the run; `redact` is an
@@ -151,19 +332,44 @@ class Tracer:
     def __init__(self, project: str, redact: Callable[[Block], Block] | None,
                  path: str):
         """Store the run's static config and initialize empty-run state. How:
-        the store/recorder are NOT created here — they need the provider,
-        which is only known once `wrap()` is called — so `_ct`/`_recorder`
-        start as None and `_seq`/`_pending_tags` start at their zero values."""
+        the store/recorder/writer are NOT created here — they need the provider,
+        which is only known once `wrap()` is called — so `_ct`/`_recorder`/
+        `_writer` start as None.
+
+        Concurrency state (the core of the v0.5 model):
+        - `_seq` is an `itertools.count`, not a plain int: `next(self._seq)` is
+          atomic under CPython's GIL, so many threads/tasks completing calls in
+          parallel each get a UNIQUE, monotonic turn index without a lock on the
+          hot path.
+        - pending tags and the sticky step live in `contextvars.ContextVar`s,
+          NOT instance attributes. This is what makes attribution correct under
+          concurrency: asyncio copies the context per Task (so `tag()`/`mark()`
+          inside one gathered coroutine never leak into a sibling), and each OS
+          thread has its own context (so a `ThreadPoolExecutor` fan-out is
+          isolated too). The vars are per-Tracer instances (a Tracer is a
+          once-per-run object, not created in a hot loop, so this is safe and
+          gives clean per-run isolation) and are reset on the CONSTRUCTING
+          context here so a fresh run never inherits a leftover step/tag from a
+          previous Tracer on this same thread."""
         self.path = path
         self._project = project
         self._redact = redact
         self._ct: CTrace | None = None
         self._recorder: Recorder | None = None  # the FIRST wrap's recorder (kept
-        # for backward compat: tests monkeypatch t._recorder.record to prove the
-        # interceptor wiring is fail-open even when record() is broken)
-        self._seq = 0                      # monotonically increasing turn index
-        self._step: str | None = None      # sticky step label (see mark())
-        self._pending_tags: list[tuple[str, str]] = []  # (label, needle) for next call
+        # for backward compat: tests monkeypatch t._recorder.build to prove the
+        # interceptor wiring is fail-open even when recording is broken)
+        self._writer: _Writer | None = None     # single writer thread (lazy, per wrap)
+        self._seq = itertools.count(1)          # thread-safe monotonic turn index
+        # Per-execution-context capture state (see docstring). Defaults: no
+        # pending tags (empty tuple) and no sticky step (None).
+        self._pending_tags: contextvars.ContextVar[tuple[tuple[str, str], ...]] = \
+            contextvars.ContextVar("ctxdiff_pending_tags", default=())
+        self._step: contextvars.ContextVar[str | None] = \
+            contextvars.ContextVar("ctxdiff_step", default=None)
+        # Clear any value lingering on THIS context from a prior Tracer so runs
+        # don't bleed into each other on a reused (e.g. main) thread.
+        self._pending_tags.set(())
+        self._step.set(None)
 
     def wrap(self, client: object, agent: str | None = None) -> object:
         """Return a transparent proxy over `client` that records every call to
@@ -191,6 +397,10 @@ class Tracer:
             self._ct = CTrace.create(self.path, project=self._project,
                                      provider=provider, model=model,
                                      started_at=started)
+            # Start the single writer thread that will own this connection and
+            # perform every persist for the run — created exactly once, with
+            # the store, on the first wrap (see `_Writer`).
+            self._writer = _Writer(self._ct)
         recorder = Recorder(self._ct, adapter, self._redact)
         if self._recorder is None:
             # Keep the first recorder reachable as t._recorder (see __init__).
@@ -206,11 +416,20 @@ class Tracer:
                             recorder, agent, provider, adapter)
 
     def tag(self, label: str, items: list) -> None:
-        """Buffer semantic tags for the NEXT recorded call only. Each item is
-        reduced to its text (str as-is, else a 'text'/'content' field) and
-        paired with `label`; the recorder marks any block containing that text
-        as `label`. Contrast mark(): tag() is next-call-only (consumed and
-        cleared after one call), whereas mark() is sticky across many calls."""
+        """Buffer semantic tags for the NEXT recorded call only, in the CURRENT
+        execution context. Each item is reduced to its text (str as-is, else a
+        'text'/'content' field) and paired with `label`; the recorder marks any
+        block containing that text as `label`. Contrast mark(): tag() is
+        next-call-only (consumed and cleared after one call), whereas mark() is
+        sticky across many calls.
+
+        How (concurrency): the pending tags live in a ContextVar, so a `tag()`
+        call inside one asyncio Task or one thread is visible ONLY to that
+        task/thread's next recorded call — never a sibling's. Because a
+        ContextVar's default is shared, this copies-on-write: it reads the
+        current tuple, appends to a fresh copy, and `set()`s that back, so no
+        mutation ever escapes into another context."""
+        pending = list(self._pending_tags.get())
         for item in items:
             if isinstance(item, str):
                 text = item
@@ -219,52 +438,126 @@ class Tracer:
             else:
                 text = str(item)
             if text:
-                self._pending_tags.append((label, text))
+                pending.append((label, text))
+        self._pending_tags.set(tuple(pending))
 
     def mark(self, step: str | None) -> None:
-        """Set the CURRENT step label stamped onto every subsequent recorded
-        call — across ALL agents — until changed; `mark(None)` clears it. This
-        is STICKY (persists until the next mark()), unlike tag(), which applies
-        to the next call only and is then cleared. Use it to label phases of a
-        run (e.g. 'plan', 'retrieve', 'answer') so per-step views can slice the
-        timeline."""
-        self._step = step
+        """Set the sticky step label stamped onto every subsequent recorded call
+        IN THE CURRENT EXECUTION CONTEXT until changed; `mark(None)` clears it.
+        Sticky (persists until the next mark()), unlike tag() which is
+        next-call-only. Use it to label phases of a run (e.g. 'plan', 'retrieve',
+        'answer') so per-step views can slice the timeline.
+
+        SEMANTICS (v0.5): the step is stored in a ContextVar rather than global
+        tracer state, so "sticky" means sticky WITHIN THE CURRENT EXECUTION
+        CONTEXT, not across ALL agents globally. In sequential code this is
+        IDENTICAL to the old behavior. Under `asyncio.gather` or
+        `asyncio.to_thread` it is also correct: each COPIES the context per task,
+        so one task's mark() never relabels a sibling's calls.
+
+        CAVEAT — raw thread pools. A ContextVar aliases the OS thread, and a raw
+        `ThreadPoolExecutor` REUSES its worker threads WITHOUT resetting their
+        context between tasks. So a step you mark() lingers on that worker: a
+        LATER logical task that runs on the same worker and does NOT call mark()
+        inherits the previous task's step. mark() is therefore only self-correct
+        for a task that sets it every time. Under a raw pool, either call mark()
+        at the start of EVERY task, or — better — use the scoped `step()` context
+        manager below, which resets on exit and so cannot leak across tasks even
+        on a reused worker (and remains correct under asyncio)."""
+        self._step.set(step)
+
+    @contextlib.contextmanager
+    def step(self, label: str | None):
+        """Scoped, concurrency-safe phase label — the RECOMMENDED way to label
+        phases under concurrency. Use as `with tracer.step("retrieve"): ...`;
+        every call recorded inside the block carries `step=label`, and on exit
+        the previous step is restored.
+
+        Why prefer this over `mark()`: it `set()`s the step ContextVar on enter,
+        saving the returned token, and `reset()`s via that token on exit — so the
+        label is cleared BEFORE the worker thread can be handed the next task.
+        That makes it leak-proof even under a raw `ThreadPoolExecutor` that
+        reuses workers (unlike sticky `mark()`, whose value lingers on the
+        worker — see mark()'s CAVEAT), while remaining correct under asyncio
+        (each task has its own context, so the set/reset is task-local). A task
+        that does NOT open a `step()` block therefore records `step=None`, never
+        a sibling task's leftover label. Fully reentrant: nested `step()` blocks
+        restore the exact enclosing label, since each holds its own token."""
+        token = self._step.set(label)
+        try:
+            yield
+        finally:
+            # Reset to the value the ContextVar held before this block, clearing
+            # the label off this context (and, crucially, off a pooled worker)
+            # before it can be reused by another logical task.
+            self._step.reset(token)
 
     def _on_create(self, kwargs: dict, response: object | None,
                    latency_ms: int | None, error: str | None,
                    recorder: Recorder | None, agent: str | None,
                    provider: str | None, quiet: bool = False) -> None:
-        """Interceptor callback: advance the turn counter, hand everything to
-        the wrapping proxy's own recorder (with the proxy's agent/provider and
-        the tracer's current sticky step), then clear pending tags. `seq` stays
-        a single monotonic counter across ALL agents — the global timeline is
-        the source of truth and per-agent views filter it. Never raises:
-        `Recorder.record` is internally fail-open, but this call is *also*
-        wrapped so the wiring itself stays fail-open even if `record` is
-        broken/replaced entirely (e.g. monkeypatched) and its own internal
-        guard is bypassed. `quiet` (default False; propagated straight into
-        `recorder.record`, see its docstring) ALSO suppresses this method's
-        OWN `exc_info=True` warning log below — a stream proxy's best-effort
-        `__del__` finalize (trace.py) is the only caller that ever sets it,
-        so every other call site's logging behavior is unchanged."""
-        self._seq += 1
-        tags = self._pending_tags
-        self._pending_tags = []
-        step = self._step
-        if recorder is not None:
-            try:
-                recorder.record(seq=self._seq, kwargs=kwargs, response=response,
-                                latency_ms=latency_ms, error=error, tagged=tags,
-                                agent=agent, step=step, provider=provider, quiet=quiet)
-            except Exception:  # noqa: BLE001 — fail-open guards the wiring, not just record()
-                if not quiet:
-                    _log.warning("ctxdiff: recorder.record raised; tracing skipped for seq=%s",
-                                 self._seq, exc_info=True)
+        """Interceptor callback, run on the HOST's thread/task at call
+        completion. What: assigns this call's seq, reads THIS context's pending
+        tags + sticky step, SNAPSHOTS the call into a persist job via the
+        recorder's `build()` (on this thread, so the host's kwargs are captured
+        before it can mutate them), then hands the job to the writer thread and
+        returns immediately — the actual disk write happens off the call path.
+
+        How the concurrency guarantees hold here:
+        - `seq = next(self._seq)`: unique + monotonic across all threads/tasks,
+          assigned in the calling context at enqueue time so ordering reflects
+          call-completion order (the writer persists FIFO; reads are ORDER BY
+          seq). `seq` stays a single counter across ALL agents — one global
+          timeline, filtered per-agent by views.
+        - tags/step come from the ContextVar (this task's/thread's own), and the
+          tags are reset to empty IN THIS CONTEXT so they apply to exactly one
+          call — with zero effect on any sibling context.
+
+        Fail-open: never raises. `build()` and the writer's `submit()` are each
+        internally guarded, and the whole body is ALSO wrapped so even an
+        unexpected error (e.g. a monkeypatched `build` that throws) degrades
+        capture silently instead of touching the host's own result/exception.
+        `quiet` (set only by a stream proxy's best-effort `__del__` finalize)
+        suppresses this method's own warning and is propagated into build/submit
+        for the same GC/shutdown-time reasons described there."""
+        seq = next(self._seq)
+        try:
+            # Read + reset THIS context's tags (one-call-only); read its step.
+            tags = self._pending_tags.get()
+            if tags:
+                self._pending_tags.set(())
+            step = self._step.get()
+            if recorder is None or self._writer is None:
+                return
+            job = recorder.build(seq=seq, kwargs=kwargs, response=response,
+                                 latency_ms=latency_ms, error=error,
+                                 tagged=list(tags), agent=agent, step=step,
+                                 provider=provider, quiet=quiet)
+            if job is None:
+                return
+            # Bind THIS call's recorder + job into the writer-thread thunk, so
+            # multi-provider runs persist through the correct adapter's recorder.
+            self._writer.submit(lambda: recorder.persist(job, quiet=quiet), quiet=quiet)
+        except Exception:  # noqa: BLE001 — fail-open guards the wiring, not just build()
+            if not quiet:
+                _log.warning("ctxdiff: failed to enqueue call seq=%s (tracing skipped)",
+                             seq, exc_info=True)
 
     def close(self) -> None:
-        """Close the underlying store, if one was opened."""
-        if self._ct is not None:
+        """Flush and shut the run down cleanly. What: blocks until the writer
+        thread has persisted every enqueued call, then stops it and closes the
+        connection — no lost writes. How: delegates the flush/stop/close to the
+        writer (which owns the connection and closes it on its own thread,
+        honouring SQLite affinity); if no wrap ever happened there is no writer
+        or store to close. Idempotent: clears `_writer`/`_ct` so a second call
+        is a no-op."""
+        if self._writer is not None:
+            self._writer.close()   # flush queue, stop thread, close the connection
+            self._writer = None
+            self._ct = None
+        elif self._ct is not None:
             self._ct.close()
+            self._ct = None
 
 
 class _ClientProxy:
