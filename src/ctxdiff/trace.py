@@ -152,7 +152,11 @@ class Tracer:
         provider = _detect_provider(client)
         adapter = _ADAPTERS[provider]()
         if self._ct is None:
-            model = ""  # model is per-call; the run stores the first seen later
+            # model is per-call, not known yet at run-creation time: pass ""
+            # so CTrace.create() leaves run.models == [] rather than seeding
+            # a bogus [""] — CTrace.record_call()/note_model() backfill the
+            # real model(s) as calls come in (see store/ctrace.py).
+            model = ""
             started = datetime.now(timezone.utc).isoformat()
             self._ct = CTrace.create(self.path, project=self._project,
                                      provider=provider, model=model,

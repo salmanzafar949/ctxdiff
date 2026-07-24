@@ -31,6 +31,19 @@ def test_builder_writes_a_readable_multi_call_multi_agent_trace(tmp_path):
     assert agents == {"researcher", "writer"}
 
 
+def test_builder_populates_run_models(tmp_path):
+    """The demo's flagship header regression: run.models rolls up both real
+    models the two agents actually called with — not `['']` — since every
+    call in the builder goes through the real trace.wrap()/record_call()
+    path (see build_demo_trace)."""
+    ct = _open(str(tmp_path / "demo.ctrace"))
+    models = ct.get_run().models
+    ct.close()
+
+    assert models  # non-empty: the bug this fix closes
+    assert set(models) == {"gpt-4o", "claude-3-5-sonnet-20241022"}
+
+
 def test_builder_includes_a_rag_tagged_block(tmp_path):
     """At least one call carries a block labeled 'rag' with a tagged source
     (not a role-based heuristic guess)."""

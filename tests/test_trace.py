@@ -59,6 +59,21 @@ def test_wrap_detects_provider_from_client(tmp_path):
     ct.close(); t.close()
 
 
+def test_wrap_backfills_run_models_from_the_call(tmp_path):
+    """End-to-end regression for the `run.models == ['']` bug: wrap() no
+    longer seeds a bogus blank model at run-creation time, and a single real
+    call's `model` kwarg rolls up onto run.models — not `['']`."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    wrapped = t.wrap(_FakeOpenAI())
+    wrapped.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_run().models == ["gpt-4o"]
+    ct.close()
+
+
 def test_tag_overrides_label_on_next_call(tmp_path):
     """tag() buffers a (label, text); the next recorded call labels any block
     containing that text with the tagged label and source 'tagged'."""
@@ -342,6 +357,9 @@ def test_multi_provider_wraps_record_through_own_adapter(tmp_path):
     ct = CTrace.open(str(tmp_path / "r.ctrace"))
     by_provider = {c.provider: c for c in ct.get_calls()}
     assert set(by_provider) == {"openai", "anthropic"}
+    # Both providers' models roll up onto the single run, in call order —
+    # the multi-agent/multi-provider case for the run.models backfill.
+    assert ct.get_run().models == ["gpt-4o", "claude-sonnet-4-5"]
 
     # OpenAI call: openai usage shape, its user block present.
     oa_call = by_provider["openai"]

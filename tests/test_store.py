@@ -13,12 +13,56 @@ def _call_block(text, position, label="user", source="heuristic"):
 
 
 def test_create_writes_run_row(tmp_path):
-    """create() persists a run row readable via get_run()."""
+    """create() persists a run row readable via get_run(). Passing a real
+    model id at create time still seeds `models` with it directly (no call
+    needed to populate it in this case)."""
     path = str(tmp_path / "r.ctrace")
     ct = CTrace.create(path, project="agent", provider="openai", model="gpt-4o")
     run = ct.get_run()
     assert run.project == "agent" and run.provider == "openai"
     assert run.models == ["gpt-4o"]
+    ct.close()
+
+
+def test_create_with_empty_model_starts_with_no_models(tmp_path):
+    """create() with an empty/unknown model (the tracer's wrap()-time case —
+    the model is only known once a call comes in) leaves `models` as an empty
+    list, NOT `['']` — the bug this fix closes. An empty string and no model
+    at all behave identically."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="")
+    assert ct.get_run().models == []
+    ct.close()
+
+
+def test_note_model_dedups_preserves_order_and_ignores_empty(tmp_path):
+    """note_model() appends new models in first-seen order, ignores a repeat
+    of a model already recorded, and ignores None/"" so a call with no model
+    param never pollutes the list with a blank entry."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="")
+    ct.note_model("gpt-4o")
+    ct.note_model("gpt-4o")       # repeat: ignored
+    ct.note_model(None)           # ignored
+    ct.note_model("")             # ignored
+    ct.note_model("claude-sonnet-4-5")
+    assert ct.get_run().models == ["gpt-4o", "claude-sonnet-4-5"]
+    ct.close()
+
+
+def test_record_call_rolls_up_distinct_models_from_params(tmp_path):
+    """record_call() backfills run.models from each call's own params["model"]
+    — two calls on different models roll up onto the run in call order, and a
+    call whose model repeats an already-seen one doesn't duplicate it."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="")
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None,
+                   latency_ms=1, error=None, call_blocks=[])
+    ct.record_call(seq=2, params={"model": "gpt-4o"}, usage=None,
+                   latency_ms=1, error=None, call_blocks=[])
+    ct.record_call(seq=3, params={"model": "claude-sonnet-4-5"}, usage=None,
+                   latency_ms=1, error=None, call_blocks=[])
+    assert ct.get_run().models == ["gpt-4o", "claude-sonnet-4-5"]
     ct.close()
 
 

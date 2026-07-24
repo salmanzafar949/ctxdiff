@@ -222,6 +222,25 @@ def test_script_breakout_impossible(tmp_path):
     assert payload["calls"][0]["blocks"][0]["text"] == evil
 
 
+def test_export_omits_model_fallback_when_models_empty(tmp_path):
+    """The header must not render a dangling ' \\u00b7 ? \\u00b7 ' placeholder for
+    the model segment when run.models is empty (a run whose call(s) never
+    reported a model param). The old `(r.models || []).join(", ") || "?"`
+    fallback — which rendered a literal "?" in that case — must be gone from
+    the header-building JS embedded in the exported page; the payload's
+    run.models stays an accurate empty list either way."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="empty-model-run", provider="openai", model="")
+    ct.record_call(seq=1, params={}, usage=None, latency_ms=1, error=None,
+                   call_blocks=[_cb("hi", 0)])
+    ct.close()
+    text = open(export_html(path), encoding="utf-8").read()
+    raw = _DATA_RE.search(text).group(1)
+    payload = json.loads(raw)
+    assert payload["run"]["models"] == []
+    assert '(r.models || []).join(", ") || "?"' not in text
+
+
 def test_html_injection_stays_inside_json_island(tmp_path):
     """Raw HTML in block text appears in the embedded JSON but NEVER as live
     markup outside the script tag — the page renders block text via textContent
