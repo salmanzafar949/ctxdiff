@@ -1,12 +1,16 @@
 # ctxdiff
 
 [![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg?logo=pypi&logoColor=white)](https://pypi.org/project/ctxdiff/)
+[![npm](https://img.shields.io/npm/v/ctxdiff.svg?logo=npm&logoColor=white)](https://www.npmjs.com/package/ctxdiff)
 [![CI](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml/badge.svg)](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Node 22+](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg?logo=node.js&logoColor=white)](https://nodejs.org)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/CONTRIBUTING.md)
 
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
+
+**Pick your language:** [🐍 Python](#install) · [🟨 JavaScript / TypeScript](js/README.md) — same `.ctrace` format, same CLI, cross-compatible.
 
 `ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI, Anthropic, Gemini, or Bedrock client in one line, run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
 
@@ -33,7 +37,7 @@ tracer.close()                          # writes ./customer-support-agent-<id>.c
 ```
 </details>
 
-<details>
+<details open>
 <summary>🟨 <b>JavaScript / TypeScript</b></summary>
 
 ```ts
@@ -671,6 +675,13 @@ from openai import OpenAI
 client = tracer.wrap(OpenAI(base_url="http://localhost:11434/v1", api_key="ollama"))
 client.chat.completions.create(model="llama3", messages=[...])
 ```
+
+The same holds for **aggregators and proxies that speak the OpenAI API** — no extra code:
+
+- **[OpenRouter](https://openrouter.ai)** — one endpoint in front of hundreds of models: `OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)`, then `wrap()` it. Every model you route through it is captured.
+- **[LiteLLM proxy](https://docs.litellm.ai/docs/simple_proxy)** — a self-hosted OpenAI-compatible gateway over 100+ providers: point `OpenAI(base_url="http://localhost:4000")` at it and `wrap()`. Captures whatever the proxy fronts.
+
+Because detection keys off the `openai` client module, both are captured by the OpenAI adapter with zero ctxdiff-specific configuration.
 
 ### LangChain
 
