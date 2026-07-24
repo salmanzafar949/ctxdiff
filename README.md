@@ -1,8 +1,8 @@
 # ctxdiff
 
+[![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg)](https://pypi.org/project/ctxdiff/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Status: v1 · capture → diff → tokens → cache → viewer](https://img.shields.io/badge/status-v1%20%C2%B7%20capture%20%E2%86%92%20diff%20%E2%86%92%20tokens%20%E2%86%92%20cache%20%E2%86%92%20viewer-brightgreen.svg)](#features)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
@@ -29,6 +29,13 @@ tracer.close()                          # writes ./customer-support-agent-<id>.c
 Then `ctxdiff view` opens the self-contained dashboard — here debugging a **multi-agent** run (researcher + writer), with agent filtering, turn-by-turn diffs, an agent handoff, and light/dark themes:
 
 ![ctxdiff dashboard — a multi-agent run: agent chips and filtering, git-style turn diffs, token allocation, cache-break attribution, light and dark themes](assets/ctxdiff-dashboard-agents.gif)
+
+> **See it in 30 seconds — no API key, no setup:**
+> ```bash
+> pip install ctxdiff
+> ctxdiff demo          # builds a sample multi-agent trace and opens this dashboard
+> ```
+> A realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
 
 ---
 
@@ -78,13 +85,6 @@ To run the real-SDK evaluation suite, install the optional extra:
 ```bash
 pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
 ```
-
-> **Try it in 30 seconds — no API key needed:**
-> ```bash
-> pip install ctxdiff
-> ctxdiff demo          # builds a sample multi-agent trace and opens the dashboard
-> ```
-> It's a realistic research-pipeline run (two agents, real SDK shapes, zero network calls) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
 
 ---
 
