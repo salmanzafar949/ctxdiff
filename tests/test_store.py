@@ -196,3 +196,92 @@ def test_open_v1_file_surfaces_none_and_does_not_mutate(tmp_path):
 
     after = open(path, "rb").read()
     assert before == after  # opening a v1 file left its bytes untouched
+
+
+# --- hardening: parity fixes mirrored from the JS SDK -----------------------
+
+
+def test_note_model_retries_after_a_failed_write(tmp_path, monkeypatch):
+    """A model roll-up whose UPDATE FAILED must be retried by the next call that
+    sees the same model. The old ordering marked the model seen BEFORE the write,
+    so one exhausted retry budget left it permanently "already known" and
+    `run.models` stayed [] for the life of the run — permanent, silent model
+    loss. Here the first write is forced to fail; the second sighting must still
+    persist it."""
+    import sqlite3
+    path = str(tmp_path / "m.ctrace")
+    ct = CTrace.create(path, project="p", provider="openai", model="")
+
+    seen = {"n": 0}
+    real = CTrace._with_write_retry
+
+    def flaky(fn):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            # Stands in for "the bounded retry budget was exhausted".
+            raise sqlite3.OperationalError("database is locked")
+        return real(fn)
+
+    monkeypatch.setattr(CTrace, "_with_write_retry", staticmethod(flaky))
+    with pytest.raises(sqlite3.OperationalError):
+        ct.note_model("gpt-4o")
+    monkeypatch.undo()
+
+    ct.note_model("gpt-4o")  # second chance — must NOT be skipped as "seen"
+    assert ct.get_run().models == ["gpt-4o"]
+    ct.close()
+
+
+def test_record_call_does_not_raise_when_model_rollup_fails(tmp_path, monkeypatch):
+    """The model roll-up runs AFTER the call transaction has committed, so its
+    failure must not escape `record_call` — otherwise the caller logs "failed to
+    record call" for a call that WAS persisted."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="p", provider="openai", model="")
+
+    def boom(self, model):
+        raise RuntimeError("roll-up boom")
+
+    monkeypatch.setattr(CTrace, "note_model", boom)
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None, latency_ms=1,
+                   error=None, call_blocks=[], agent="a")
+    monkeypatch.undo()
+
+    calls = ct.get_calls()
+    assert len(calls) == 1 and calls[0].agent == "a"
+    ct.close()
+
+
+def test_append_into_v1_file_upgrades_and_preserves_attribution(tmp_path):
+    """Appending a v2 session into a PHYSICALLY-v1 file must upgrade the `call`
+    table in place. `CREATE TABLE IF NOT EXISTS` no-ops against the existing v1
+    table, so without an explicit ALTER the new session was written in the
+    7-column v1 shape — dropping agent/step/provider — while its run row was
+    still stamped schema_version=2. Silent data loss, newly reachable now that
+    the default path is a STABLE ./<project>.ctrace that can land on a
+    pre-existing file."""
+    path = str(tmp_path / "v1.ctrace")
+    _build_v1_file(path)
+
+    ct = CTrace.open_or_create_session(
+        path, project="proj", provider="openai", model="",
+        started_at="2026-07-25T00:00:00+00:00")
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None, latency_ms=5,
+                   error=None, call_blocks=[], agent="planner", step="retrieve",
+                   provider="openai")
+    ct.close()
+
+    r = CTrace.open(path)
+    sessions = r.list_sessions()
+    assert len(sessions) == 2  # the pre-existing v1 run plus the appended one
+    appended = sessions[-1]
+    calls = r.get_calls(appended.id)
+    assert len(calls) == 1
+    assert calls[0].agent == "planner"
+    assert calls[0].step == "retrieve"
+    assert calls[0].provider == "openai"
+    assert appended.agents == ["planner"]
+    # The pre-existing v1 call is untouched and still readable (NULL v2 fields).
+    legacy = r.get_calls("run1")
+    assert len(legacy) == 1 and legacy[0].agent is None
+    r.close()

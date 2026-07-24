@@ -251,6 +251,11 @@ class CTrace:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.executescript(DDL)  # IF NOT EXISTS — no-op on an existing DB
+                # ...and because it IS a no-op, an existing PHYSICALLY-v1 `call`
+                # table survives the DDL unchanged. Widen it before writing, or
+                # this session's agent/step/provider would be silently dropped
+                # under a run row stamped schema_version=2.
+                cls._upgrade_call_table(conn)
                 # Refuse to append into a file written by a newer ctxdiff.
                 row = conn.execute(
                     "SELECT MAX(schema_version) FROM run").fetchone()
@@ -270,6 +275,33 @@ class CTrace:
             conn.close()
             raise
         return cls(conn, run_id)
+
+    @staticmethod
+    def _upgrade_call_table(conn: sqlite3.Connection) -> None:
+        """Bring an existing `call` table up to the v2 layout by ADDing whichever
+        of `agent`/`step`/`provider` are missing — on the WRITE path only.
+
+        Why it's needed: `CREATE TABLE IF NOT EXISTS` no-ops against a table that
+        already exists, so appending a session into a file some older ctxdiff
+        wrote physically as v1 left `_has_v2_cols` False — every new call went in
+        with the 7-column v1 shape and lost its attribution, even though the new
+        run row was stamped `schema_version = 2`. Silent data loss, and newly
+        reachable now that the default path is a STABLE `./<project>.ctrace` that
+        can land on a pre-existing user file.
+
+        Upgrading in place beats downgrading the version stamp because the
+        columns are nullable: pre-existing v1 calls simply read back None,
+        nothing is rewritten or reinterpreted, and the file stays readable by
+        both SDKs. `ADD COLUMN` of a nullable TEXT is an O(1) header-only change
+        in SQLite — existing rows are not rewritten.
+
+        Read-only `open()` deliberately does NOT call this: a debugger must not
+        rewrite the evidence it inspects, so only a writer about to append its
+        own v2 rows upgrades the layout."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(call)")}
+        for col in ("agent", "step", "provider"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE call ADD COLUMN {col} TEXT")
 
     @staticmethod
     def _with_write_retry(fn):
@@ -398,7 +430,17 @@ class CTrace:
         # (which all name the param "model") and bedrock (which names it
         # "modelId" instead, per its Converse API shape) without needing a
         # per-provider special case here.
-        self.note_model(params.get("model") or params.get("modelId"))
+        #
+        # Guarded: the call above is ALREADY COMMITTED, so a failure of this
+        # best-effort roll-up must not propagate out of record_call — that would
+        # make the caller log "failed to record call" for a call that WAS
+        # persisted. It is self-healing anyway: note_model only marks a model
+        # seen once its UPDATE commits, so the next call carrying the same model
+        # retries it.
+        try:
+            self.note_model(params.get("model") or params.get("modelId"))
+        except Exception:  # noqa: BLE001 — roll-up is best-effort; call is saved
+            pass
         return call_id
 
     def note_model(self, model: str | None) -> None:
@@ -407,18 +449,30 @@ class CTrace:
         so a call with no model param never pollutes the list with a blank
         entry. Cheap: the common case (a model already known) costs only an
         in-memory set lookup — the `models` JSON is re-serialized and the run
-        row UPDATEd only on an actual new model, not on every call."""
+        row UPDATEd only on an actual new model, not on every call.
+
+        COMMIT-THEN-MARK ordering matters: the in-memory `_models_seen`/`_models`
+        mirror is updated INSIDE the retried transaction, only AFTER the UPDATE
+        succeeds. Marking the model seen up front (the obvious ordering) meant a
+        write that failed its retry budget left the model permanently "already
+        known", so no later call ever retried it and `run.models` stayed [] for
+        the life of the run. Deferring the mutation makes the roll-up
+        self-healing: a failed attempt changes nothing, and the next call
+        carrying that model tries again."""
         if not model or model in self._models_seen:
             return
-        self._models_seen.add(model)
-        self._models.append(model)
+        # Candidate list built without touching the mirror, so a failed (or
+        # retried) attempt can never leave a half-applied state behind.
+        nxt = [*self._models, model]
 
         def _txn():
             with self._conn:  # single-statement transaction
                 self._conn.execute(
                     "UPDATE run SET models = ? WHERE id = ?",
-                    (json.dumps(self._models), self._run_id),
+                    (json.dumps(nxt), self._run_id),
                 )
+            self._models = nxt
+            self._models_seen.add(model)
         self._with_write_retry(_txn)  # retry on transient lock (multi-writer)
 
     # --- reading -----------------------------------------------------------
