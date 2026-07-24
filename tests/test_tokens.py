@@ -280,6 +280,31 @@ def test_bloat_malformed_schema_json_no_crash_sentinel_excluded():
     assert report.unused_tools == ["delete_account"]
 
 
+def test_bloat_recognizes_openai_tool_call_content_part_as_used():
+    """End-to-end-ish: build blocks the way the FIXED OpenAI adapter now
+    produces them for an assistant message with tool_calls — a 'content_part'
+    block (role=assistant) whose text is the tool_call dict's JSON, which
+    contains the function name nested under "function". A second, genuinely
+    unreferenced tool's schema must still be reported as unused. This is the
+    regression test for the capture bug: before the fix, tool_calls were
+    dropped entirely and every OpenAI tool call would read as 'unused'."""
+    used_schema = _schema_cb(0, "get_weather", token_count=40, shape="function")
+    never_used_schema = _schema_cb(1, "never_used", token_count=60, shape="function")
+    tool_call_text = json.dumps({
+        "id": "c1", "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city":"Dubai"}'},
+    }, sort_keys=True, ensure_ascii=False)
+    tool_call_block = _cb(tool_call_text, 2, role="assistant", kind="content_part",
+                           label="history", token_count=15)
+    call_blocks = [used_schema, never_used_schema, tool_call_block]
+
+    report = detect_bloat([call_blocks])
+
+    assert report is not None
+    assert report.unused_tools == ["never_used"]
+    assert report.unused_tokens_per_call == 60
+
+
 # --- analyze_run: end-to-end over a real CTrace --------------------------------
 
 
