@@ -1,3 +1,4 @@
+import json
 import re
 
 from ctxdiff.cli import main
@@ -168,3 +169,113 @@ def test_no_run_found_exits_1_with_friendly_message(tmp_path, monkeypatch, capsy
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "did the run capture" in captured.err
+
+
+# --- `ctxdiff tokens` ---------------------------------------------------------
+
+USED_SCHEMA = json.dumps({"type": "function", "function": {"name": "get_weather"}})
+UNUSED_SCHEMA = json.dumps({"type": "function", "function": {"name": "delete_account"}})
+
+
+def _tok_cb(text, position, role="user", kind="message", label="user",
+            token_count=None, token_method="tiktoken"):
+    """Build a CallBlock whose hash is derived from (role, kind, text,
+    token_method) — the extra token_method component lets the same visible
+    text be stored once as exact and once as an estimate without colliding."""
+    if token_count is None:
+        token_count = len(text)
+    block = Block(content_hash=f"h:{role}:{kind}:{text}:{token_method}", role=role,
+                  kind=kind, text=text, token_count=token_count, token_method=token_method)
+    return CallBlock(block=block, position=position, label=label, label_source="heuristic")
+
+
+def _make_tokens_trace(path):
+    """Build a 2-turn .ctrace exercising every `ctxdiff tokens` code path:
+    a used tool schema (referenced by name in an assistant block), an unused
+    one (never referenced -> bloat), and one estimate-method block per turn
+    (-> the ~approx marker). Each turn carries a turn-specific user block so
+    `--turn` filtering is independently verifiable."""
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    for seq in (1, 2):
+        blocks = [
+            _tok_cb("system prompt", 0, role="system", label="system", token_count=50),
+            _tok_cb(USED_SCHEMA, 1, role="system", kind="tool_schema",
+                    label="tool_schema", token_count=30),
+            _tok_cb(UNUSED_SCHEMA, 2, role="system", kind="tool_schema",
+                    label="tool_schema", token_count=40),
+            _tok_cb("calling get_weather now", 3, role="assistant",
+                    label="history", token_count=10),
+            _tok_cb(f"question at turn {seq}", 4, role="user", label="user",
+                    token_count=20, token_method="estimate"),
+        ]
+        ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=None, latency_ms=10,
+                       error=None, call_blocks=blocks)
+    ct.close()
+
+
+def test_tokens_shows_per_turn_totals_and_approx_marker(tmp_path, capsys):
+    """Every turn's header appears with its total tokens, and the ~approx
+    marker shows up since each turn has an estimate-method block."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_tokens_trace(path)
+
+    exit_code = main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "turn 1 ·" in out
+    assert "turn 2 ·" in out
+    assert "~approx" in out
+
+
+def test_tokens_bloat_warning_names_unused_tool_only(tmp_path, capsys):
+    """The bloat line names the unused tool (delete_account) and does not
+    name the used one (get_weather)."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_tokens_trace(path)
+
+    main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    bloat_line = next(line for line in out.splitlines() if "schema bloat" in line)
+    assert "delete_account" in bloat_line
+    assert "get_weather" not in bloat_line
+
+
+def test_tokens_turn_filter_limits_output(tmp_path, capsys):
+    """`--turn 2` shows only turn 2's block, not turn 1's."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_tokens_trace(path)
+
+    exit_code = main(["tokens", "--turn", "2", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "turn 2 ·" in out
+    assert "turn 1 ·" not in out
+
+
+def test_tokens_missing_turn_exits_1_with_stderr_message(tmp_path, capsys):
+    path = str(tmp_path / "demo.ctrace")
+    _make_tokens_trace(path)
+
+    exit_code = main(["tokens", "--turn", "99", "--run", path])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.strip() != ""
+    assert captured.out == ""
+
+
+def test_tokens_no_color_output_has_no_ansi_escapes(tmp_path, monkeypatch, capsys):
+    """NO_COLOR strips every ANSI escape, same convention as `ctxdiff diff`."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_tokens_trace(path)
+    monkeypatch.setenv("NO_COLOR", "1")
+    import sys
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert not _ANSI_RE.search(out)

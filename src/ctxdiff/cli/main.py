@@ -11,7 +11,8 @@ import os
 import sys
 
 from ctxdiff.analyze.differ import diff_turns
-from ctxdiff.cli.render import render_runs_list, render_turn_diff
+from ctxdiff.analyze.tokens import analyze_run, registered_tool_names
+from ctxdiff.cli.render import render_runs_list, render_run_tokens, render_turn_diff
 from ctxdiff.store.ctrace import CTrace
 
 
@@ -55,6 +56,19 @@ def _add_diff_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_diff)
 
 
+def _add_tokens_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff tokens [--turn N] [--run PATH]`. `--turn` is a
+    single optional int (unlike `diff`'s `--turn` twice) — omitted, every
+    turn in the run is shown; given, output is limited to that one turn."""
+    p = subparsers.add_parser(
+        "tokens", help="token heatmap + schema-bloat report")
+    p.add_argument("--turn", type=int, default=None,
+                    help="limit output to one turn (call seq) number")
+    p.add_argument("--run", default=None, help="path to a .ctrace file "
+                    "(default: most recently modified *.ctrace in cwd)")
+    p.set_defaults(func=_cmd_tokens)
+
+
 def _add_runs_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register `ctxdiff runs` (no arguments: it always lists the cwd)."""
     p = subparsers.add_parser(
@@ -64,7 +78,7 @@ def _add_runs_parser(subparsers: argparse._SubParsersAction) -> None:
 
 # Every registered subcommand's add_parser function, in help-listing order.
 # Appending here is the ONLY change later milestones need to add a subcommand.
-_SUBCOMMANDS = [_add_diff_parser, _add_runs_parser]
+_SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_runs_parser]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -110,6 +124,49 @@ def _cmd_diff(args: argparse.Namespace) -> int:
             print(f"ctxdiff: {exc}", file=sys.stderr)
             return 1
         print(render_turn_diff(diff))
+    finally:
+        ct.close()
+    return 0
+
+
+def _cmd_tokens(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff tokens`. How: resolves and opens the `.ctrace`
+    (missing/corrupt file -> exit 1, same as `diff`), runs the token
+    attributor over the whole run, then narrows to one turn when `--turn` is
+    given (missing turn -> exit 1 with a message, mirroring `diff`'s
+    behavior). When there IS unused-schema bloat to report, a second pass
+    over the run's blocks derives "M" (how many tools are registered in
+    total) for the "N of M" bloat message — cheap relative to the run size,
+    and only paid when there's something to report."""
+    path = _resolve_run_path(args.run)
+    if path is None:
+        print("no .ctrace here — did the run capture?", file=sys.stderr)
+        return 1
+    try:
+        ct = CTrace.open(path)
+    except Exception as exc:  # noqa: BLE001 — any open failure is reported, not crashed
+        print(f"ctxdiff: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        run_tokens = analyze_run(ct)
+        calls_by_seq = {c.seq: c for c in run_tokens.calls}
+
+        if args.turn is not None:
+            if args.turn not in calls_by_seq:
+                print(f"ctxdiff: turn {args.turn} not found in this run "
+                      f"(available turns: {sorted(calls_by_seq)})", file=sys.stderr)
+                return 1
+            selected = [calls_by_seq[args.turn]]
+        else:
+            selected = run_tokens.calls
+
+        total_tools = None
+        if run_tokens.bloat is not None and run_tokens.bloat.unused_tools:
+            all_blocks = [ct.get_call_blocks(c.id) for c in ct.get_calls()]
+            total_tools = len(registered_tool_names(all_blocks))
+
+        print(render_run_tokens(selected, run_tokens.bloat, total_tools))
     finally:
         ct.close()
     return 0
