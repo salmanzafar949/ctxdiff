@@ -79,6 +79,13 @@ To run the real-SDK evaluation suite, install the optional extra:
 pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
 ```
 
+> **Try it in 30 seconds — no API key needed:**
+> ```bash
+> pip install ctxdiff
+> ctxdiff demo          # builds a sample multi-agent trace and opens the dashboard
+> ```
+> It's a realistic research-pipeline run (two agents, real SDK shapes, zero network calls) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
+
 ---
 
 ## Quickstart

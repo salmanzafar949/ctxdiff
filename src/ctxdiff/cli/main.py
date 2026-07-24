@@ -24,6 +24,7 @@ from ctxdiff.cli.render import (
     render_turn_diff,
     render_usage_summary,
 )
+from ctxdiff.demo import build_demo_trace
 from ctxdiff.store.ctrace import CTrace
 from ctxdiff.viewer import export_html
 
@@ -120,6 +121,28 @@ def _add_export_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_export)
 
 
+def _add_demo_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff demo [--out FILE] [--no-open] [--keep]`: the
+    zero-friction first run — build a sample multi-agent `.ctrace` (no API
+    keys, no network, no agent to wire up) and open its dashboard. `--out`
+    picks a permanent `.ctrace` path (implying `--keep`'s no-tempfile
+    behavior); `--keep` alone writes to a fixed `./ctxdiff-demo.{ctrace,html}`
+    pair instead of a tempfile; `--no-open` skips the browser launch (CI/
+    headless/screenshotting) but still writes and prints both paths."""
+    p = subparsers.add_parser(
+        "demo", help="build a sample multi-agent trace and open its dashboard "
+                     "— no API keys, no setup")
+    p.add_argument("--out", default=None,
+                   help="write the demo trace to FILE.ctrace (and FILE.html "
+                        "beside it) instead of a tempfile; implies --keep")
+    p.add_argument("--no-open", action="store_true", dest="no_open",
+                   help="write and print both paths but do not open a browser")
+    p.add_argument("--keep", action="store_true",
+                   help="write to ./ctxdiff-demo.ctrace + .html in the "
+                        "current directory instead of a tempfile")
+    p.set_defaults(func=_cmd_demo)
+
+
 def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register `ctxdiff view [--run PATH] [--no-open]`: export the dashboard
     to a temp file and open it in the default browser. `--no-open` skips the
@@ -137,7 +160,8 @@ def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
 # Every registered subcommand's add_parser function, in help-listing order.
 # Appending here is the ONLY change later milestones need to add a subcommand.
 _SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_cache_parser,
-                _add_runs_parser, _add_export_parser, _add_view_parser]
+                _add_runs_parser, _add_export_parser, _add_view_parser,
+                _add_demo_parser]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -353,6 +377,60 @@ def _cmd_view(args: argparse.Namespace) -> int:
             webbrowser.open("file://" + os.path.abspath(out))
         except Exception:  # noqa: BLE001 — never let a browser failure crash view
             _log.warning("ctxdiff: could not open a browser; open %s manually", out)
+    return 0
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff demo`: the zero-friction first run. How: resolves
+    where the demo's two files go (see the three placement rules below),
+    builds the sample trace via `build_demo_trace` and exports its dashboard
+    (any build/write failure -> exit 1, same convention as `export`/`view`),
+    prints both paths plus a one-line explanation of what they're looking at,
+    opens the dashboard in a browser unless `--no-open`, and closes with a
+    nudge toward tracing a real agent. The browser launch is wrapped exactly
+    like `view`'s — a failing/absent browser never crashes the command, since
+    both paths are already printed.
+
+    Placement rules, in priority order: `--out FILE` writes the trace there
+    (and `FILE`'s `.html` sibling next to it) and is never cleaned up, since
+    the user named a permanent location; `--keep` (no `--out`) writes a fixed
+    `./ctxdiff-demo.ctrace` + `.html` pair in the cwd, so a re-run overwrites
+    the same two files the user can find again; the default uses a tempfile
+    pair, same as `view` — printed for one-off use, never auto-deleted (same
+    convention `view` already established)."""
+    if args.out:
+        ctrace_path = args.out
+        html_path = os.path.splitext(ctrace_path)[0] + ".html"
+    elif args.keep:
+        ctrace_path = os.path.join(os.getcwd(), "ctxdiff-demo.ctrace")
+        html_path = os.path.join(os.getcwd(), "ctxdiff-demo.html")
+    else:
+        fd, ctrace_path = tempfile.mkstemp(suffix=".ctrace")
+        os.close(fd)
+        fd, html_path = tempfile.mkstemp(suffix=".html")
+        os.close(fd)
+
+    try:
+        build_demo_trace(ctrace_path)
+        out = export_html(ctrace_path, html_path)
+    except Exception as exc:  # noqa: BLE001 — any build/export failure is reported, not crashed
+        print(f"ctxdiff: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"sample trace  -> {ctrace_path}")
+    print(f"dashboard     -> {out}")
+    print("This is a sample multi-agent research-pipeline run (no API keys, "
+          "no network) — it shows turn-by-turn diffs, token/schema-bloat "
+          "detection, a cache-prefix break, and two agents on one timeline.")
+
+    if not args.no_open:
+        try:
+            webbrowser.open("file://" + os.path.abspath(out))
+        except Exception:  # noqa: BLE001 — never let a browser failure crash demo
+            _log.warning("ctxdiff: could not open a browser; open %s manually", out)
+
+    print('Trace your own agent next: tracer = trace.init("my-agent"); '
+          "client = tracer.wrap(OpenAI())")
     return 0
 
 
