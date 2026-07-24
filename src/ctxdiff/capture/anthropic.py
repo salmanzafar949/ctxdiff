@@ -77,3 +77,33 @@ class AnthropicAdapter:
             "input_tokens": getattr(usage, "input_tokens", None),
             "output_tokens": getattr(usage, "output_tokens", None),
         }
+
+    def accumulate_stream_usage(self, chunk: object, state: dict) -> None:
+        """Fold usage from ONE streamed Anthropic event into `state`.
+        Confirmed empirically against real `anthropic` 0.118.0 SSE parsing
+        (Phase 12 Step 0): unlike OpenAI, Anthropic splits input and output
+        token counts across TWO different event types rather than reporting
+        both together on one final chunk — `message_start` carries the
+        (already-known) input token count at `chunk.message.usage.
+        input_tokens`, and `message_delta` (emitted once, near the end of
+        the stream, alongside the stop reason) carries the output token
+        count at `chunk.usage.output_tokens`. Both are written into `state`
+        under the SAME key names `extract_usage` uses for a non-streaming
+        response, so the eventual synthetic response reads back
+        identically. Duck-typed and defensive — see `OpenAIAdapter.
+        accumulate_stream_usage` for why this stays self-guarding rather
+        than relying solely on the caller's own try/except."""
+        try:
+            event_type = getattr(chunk, "type", None)
+            if event_type == "message_start":
+                usage = getattr(getattr(chunk, "message", None), "usage", None)
+                input_tokens = getattr(usage, "input_tokens", None)
+                if input_tokens is not None:
+                    state["input_tokens"] = input_tokens
+            elif event_type == "message_delta":
+                usage = getattr(chunk, "usage", None)
+                output_tokens = getattr(usage, "output_tokens", None)
+                if output_tokens is not None:
+                    state["output_tokens"] = output_tokens
+        except Exception:  # noqa: BLE001 — never break the caller's iteration
+            pass

@@ -1,15 +1,20 @@
 """Encodes TODAY'S ground truth for LangChain's `ChatOpenAI` as regression
-tests (spike §4). The default (non-streaming) `.invoke()` gap is now CLOSED:
+tests (spike §4). The default (non-streaming) `.invoke()` gap is CLOSED:
 `_ClientProxy` treats `with_raw_response`/`with_streaming_response` as
 transparent hops (see `trace._TRANSPARENT_HOPS`), so the call IS captured,
 WITH usage (via `extract_usage`'s `.parse()` fallback on the raw-response
-wrapper). The streaming-usage gap remains OPEN and is intentionally still
-asserted here as a DOCUMENTED LIMITATION (a v1 non-goal — the streaming path
-hands the interceptor a `Stream` iterator with no `.parse()`, so usage stays
-unrecoverable at call time). These tests exist to fail loudly if either
-behavior is ever silently changed, so a future contributor who touches
-`_ClientProxy`/the interceptor/`extract_usage` has to consciously update this
-file rather than accidentally gaining/losing capability unnoticed."""
+wrapper). The streaming path (Phase 12) is ALSO now captured — the
+interceptor wraps the returned stream in `_StreamProxy` and records once it
+completes, instead of at call-time — but `usage` still comes back `None` in
+`test_client_injection_streaming_invoke_is_captured` below, for a DIFFERENT,
+narrower reason than before: LangChain's `ChatOpenAI._stream()` doesn't pass
+`stream_options={"include_usage": True}` itself, and ctxdiff never injects
+that opt-in on the caller's behalf (see capture/openai.py), so no chunk in
+this SSE fixture ever carries usage to accumulate. These tests exist to fail
+loudly if either behavior is ever silently changed, so a future contributor
+who touches `_ClientProxy`/the interceptor/`extract_usage` has to consciously
+update this file rather than accidentally gaining/losing capability
+unnoticed."""
 from __future__ import annotations
 
 import httpx
@@ -99,17 +104,18 @@ def test_client_injection_streaming_invoke_is_captured(respx_mock, tmp_ctrace_pa
 
     This LangChain invocation path is captured (as is, now, the default
     non-streaming path — see `test_client_injection_default_invoke_is_
-    captured`), but with a caveat this test locks in as a SEPARATE, STILL
-    OPEN gap (a v1 non-goal, not addressed by the with_raw_response
-    transparent-hop fix): `real_create(...)` returns an
-    `openai.Stream[ChatCompletionChunk]` iterator (not a completed response,
-    and not a raw-response wrapper with a `.parse()`) at the moment the
-    interceptor's `tracer._on_create` runs, so `OpenAIAdapter.extract_usage`
-    finds neither a direct `.usage` nor a `.parse()` to fall back to —
-    `call.usage` is `None` even though the call itself succeeded and blocks
-    were recorded. A future fix for the streaming-usage gap (e.g. wrapping
-    the iterator to capture usage from its final chunk) should change this
-    test's `is None` assertion deliberately, not by accident.
+    captured`): `real_create(...)` returns an `openai.Stream[
+    ChatCompletionChunk]`, which the interceptor (Phase 12) wraps in
+    `_StreamProxy` and records once LangChain finishes consuming it inside
+    `.invoke()`. `call.usage` is STILL `None` here, but for a narrower
+    reason than before: LangChain's `ChatOpenAI._stream()` doesn't pass
+    `stream_options={"include_usage": True}`, and ctxdiff deliberately never
+    injects that on the caller's behalf (it would alter the caller's own
+    request — see capture/openai.py's `accumulate_stream_usage`), so this
+    fixture's SSE body — built without a final usage-bearing chunk — never
+    gives `_StreamProxy` anything to accumulate. If a future LangChain
+    version (or explicit config) starts sending that opt-in, this test's
+    `is None` assertion should change deliberately, not by accident.
 
     How the canned response is built: the openai SDK's streaming client
     parses a Server-Sent-Events body (`data: <json>\\n\\n` per chunk,

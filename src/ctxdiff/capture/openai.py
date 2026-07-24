@@ -244,3 +244,50 @@ class OpenAIAdapter:
             "completion_tokens": completion_tokens,
             "total_tokens": getattr(usage, "total_tokens", None),
         }
+
+    def accumulate_stream_usage(self, chunk: object, state: dict) -> None:
+        """Fold usage from ONE streamed chunk into `state`, covering both
+        shapes a stream can carry (confirmed empirically against real
+        `openai` 2.47.0 SSE parsing, Phase 12 Step 0):
+
+        - Chat Completions (`ChatCompletionChunk`): every chunk has a
+          `.usage` attribute, but it's `None` on all but the LAST chunk, and
+          ONLY when the caller opted in via
+          `stream_options={"include_usage": True}` — ctxdiff never injects
+          that itself (see trace.py module docstring), so without caller
+          opt-in no chunk ever carries usage and `state` stays empty. When
+          present, `chunk.usage` duck-types identically to a non-streaming
+          `ChatCompletion.usage` (prompt_tokens/completion_tokens/
+          total_tokens), so the SAME key names are written into `state` —
+          the eventual synthetic response `extract_usage` reads back off of
+          this state is indistinguishable from a real one.
+        - Responses (`ResponseStreamEvent`): the terminal `response.completed`
+          event carries the completed `Response` at `.response`, whose
+          `.usage` is the same `input_tokens`/`output_tokens`/`total_tokens`
+          shape as a non-streaming Responses call — no caller opt-in needed,
+          Responses streams emit usage unconditionally.
+
+        Duck-typed via `getattr(..., None)` throughout and wrapped in a
+        catch-all: a malformed/unexpected chunk must never interrupt the
+        caller's own iteration (trace.py's stream proxies also wrap this
+        call in their own try/except, but this method stays defensive on
+        its own rather than relying solely on that outer guard — same
+        convention as `extract_usage`'s `.parse()` fallback above)."""
+        try:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                prompt_tokens = getattr(usage, "prompt_tokens", None)
+                completion_tokens = getattr(usage, "completion_tokens", None)
+                if prompt_tokens is not None or completion_tokens is not None:
+                    state["prompt_tokens"] = prompt_tokens
+                    state["completion_tokens"] = completion_tokens
+                    state["total_tokens"] = getattr(usage, "total_tokens", None)
+                    return
+            if getattr(chunk, "type", None) == "response.completed":
+                resp_usage = getattr(getattr(chunk, "response", None), "usage", None)
+                if resp_usage is not None:
+                    state["input_tokens"] = getattr(resp_usage, "input_tokens", None)
+                    state["output_tokens"] = getattr(resp_usage, "output_tokens", None)
+                    state["total_tokens"] = getattr(resp_usage, "total_tokens", None)
+        except Exception:  # noqa: BLE001 — never break the caller's iteration
+            pass

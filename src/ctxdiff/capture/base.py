@@ -38,3 +38,22 @@ class Adapter(Protocol):
     def extract_usage(self, response: object) -> dict | None:
         """Return provider-reported token usage as a plain dict, or None."""
         ...
+
+    def accumulate_stream_usage(self, chunk: object, state: dict) -> None:
+        """OPTIONAL — fold any usage carried by one streamed chunk into
+        `state`, using this provider's own usage-dict key names (e.g.
+        prompt_tokens/completion_tokens for OpenAI chat, input_tokens/
+        output_tokens for OpenAI Responses and Anthropic) so `state` ends up
+        shaped exactly like what `extract_usage` would have returned from a
+        non-streaming response. Called once per chunk from inside the
+        caller's own iteration (see trace.py's `_StreamProxy`/
+        `_AsyncStreamProxy`), so it must be duck-typed and never raise.
+
+        This is genuinely optional: `Adapter` is a structural Protocol with
+        no runtime enforcement, and trace.py looks this method up with
+        `getattr(adapter, "accumulate_stream_usage", None)` before calling
+        it — an adapter that omits it (Gemini's `generate_content_stream`,
+        Bedrock's `converse_stream` — both separate methods, out of scope
+        for this pass) simply never accumulates stream usage; `state` stays
+        empty and the recorded call's usage is None, same as today."""
+        ...
