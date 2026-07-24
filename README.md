@@ -224,7 +224,7 @@ Block text is written into the page as a JSON island and rendered with `textCont
 
 | Provider | Client | Notes |
 |----------|--------|-------|
-| **OpenAI** | `openai.OpenAI(...)` | Chat Completions |
+| **OpenAI** | `openai.OpenAI(...)` | Chat Completions **and Responses API** |
 | **Azure OpenAI** | `openai.AzureOpenAI(...)` | Same adapter, zero config |
 | **Anthropic / Claude** | `anthropic.Anthropic(...)` | Messages API |
 | **Google Gemini** | `google.genai.Client(...)` | Generate Content API (`models.generate_content`) |
@@ -430,6 +430,26 @@ Estimates are always labeled as such — never presented as exact. If `tiktoken`
 from openai import OpenAI
 client = tracer.wrap(OpenAI())
 client.chat.completions.create(model="gpt-4o", messages=[...])
+```
+
+### OpenAI Responses API
+
+The same `wrap()` also captures `client.responses.create(...)` — the Responses API the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) builds on — off the *same* wrapped client, no separate call. `instructions` is captured as the leading system block, flat `tools` schemas next, then `input` (string or a list of message/tool items); usage is read from `input_tokens`/`output_tokens` instead of `prompt_tokens`/`completion_tokens`, and `previous_response_id` is kept in params since it's chain linkage, not content.
+
+```python
+from openai import OpenAI
+client = tracer.wrap(OpenAI())
+client.responses.create(
+    model="gpt-4o",
+    instructions="You are a support agent.",
+    input="What's your refund window?",
+)
+```
+
+Works async too, exactly like the chat path:
+
+```python
+resp = await tracer.wrap(AsyncOpenAI()).responses.create(model="gpt-4o", input="hi")
 ```
 
 ### Azure OpenAI
