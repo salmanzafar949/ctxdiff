@@ -180,6 +180,45 @@ def test_wrap_treats_with_raw_response_as_transparent_hop(tmp_path):
     assert wrapped.with_raw_response is client.with_raw_response
 
 
+class _FakeModels:
+    """Stand-in for client.models with a recording generate_content()."""
+    def __init__(self): self.calls = []
+    def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return _Resp()
+
+
+class _FakeGeminiClient:
+    """Duck-typed google-genai client: its class lives under
+    'google.genai.client', the same dotted-prefix path the real SDK uses, so
+    detection must match via `_DOTTED_PREFIXES` (root 'google' alone is too
+    broad to map to gemini)."""
+    __module__ = "google.genai.client"
+    def __init__(self): self.models = _FakeModels()
+
+
+def test_wrap_detects_gemini_via_dotted_prefix_and_records(tmp_path):
+    """A fake client whose module is 'google.genai.client' (root 'google', not
+    in _ADAPTERS directly) is detected as gemini via the dotted-prefix
+    fallback, and a call through `.models.generate_content(...)` is recorded
+    to the .ctrace exactly like the other providers."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeGeminiClient()
+    wrapped = t.wrap(client)
+    resp = wrapped.models.generate_content(model="gemini-2.0-flash", contents="hi")
+    assert isinstance(resp, _Resp)
+    assert len(client.models.calls) == 1
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_run().provider == "gemini"
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    blocks = ct.get_call_blocks(calls[0].id)
+    assert blocks[0].block.text == "hi"
+    ct.close()
+
+
 def test_wrap_is_fail_open_if_recording_breaks(tmp_path, monkeypatch):
     """If recording raises internally, the host call still returns normally."""
     t = trace.init("agent", path=str(tmp_path / "r.ctrace"))

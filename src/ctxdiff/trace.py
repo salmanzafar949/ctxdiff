@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from ctxdiff.capture.anthropic import AnthropicAdapter
+from ctxdiff.capture.gemini import GeminiAdapter
 from ctxdiff.capture.openai import OpenAIAdapter
 from ctxdiff.capture.recorder import Recorder
 from ctxdiff.models import Block
@@ -18,7 +19,16 @@ from ctxdiff.store.ctrace import CTrace
 _log = logging.getLogger("ctxdiff")
 
 # Provider detection maps a client's top-level module to an adapter factory.
-_ADAPTERS = {"openai": OpenAIAdapter, "anthropic": AnthropicAdapter}
+_ADAPTERS = {"openai": OpenAIAdapter, "anthropic": AnthropicAdapter, "gemini": GeminiAdapter}
+
+# Some SDKs don't own their top-level module root — `google-genai`'s client
+# lives under `google.genai...`, but the bare root `google` is shared with
+# unrelated packages (google.cloud, google.protobuf, ...) and must NOT map to
+# an adapter blindly. For those, detection falls back to matching a known
+# DOTTED prefix of the full module path instead of just its root, so only
+# `google.genai` (and its submodules) resolve to gemini while any other
+# `google.*` package still falls through to the "unrecognized" error.
+_DOTTED_PREFIXES = {"google.genai": "gemini"}
 
 # SDK response-wrapper hops that sit BETWEEN a resource and its `.create`
 # method without changing which HTTP call gets made — e.g. LangChain's
@@ -33,11 +43,20 @@ _TRANSPARENT_HOPS = ("with_raw_response", "with_streaming_response")
 def _detect_provider(client: object) -> str:
     """Infer the provider from the client's module path (e.g. an OpenAI client's
     class lives under the 'openai' package). Raises if unrecognized so wrap()
-    fails loudly at setup time — not silently at record time."""
+    fails loudly at setup time — not silently at record time.
+
+    Two-stage lookup: first the module's top-level root (works for openai/
+    anthropic, whose packages are dedicated to one provider). When that
+    misses, fall back to matching a dotted prefix from `_DOTTED_PREFIXES` —
+    needed for SDKs like google-genai whose module root ('google') is shared
+    across unrelated packages, so root-only matching would be too broad."""
     module = type(client).__module__ or ""
     root = module.split(".", 1)[0]
     if root in _ADAPTERS:
         return root
+    for prefix, provider in _DOTTED_PREFIXES.items():
+        if module == prefix or module.startswith(prefix + "."):
+            return provider
     raise ValueError(
         f"ctxdiff: unrecognized client module '{module}'; "
         f"supported providers: {sorted(_ADAPTERS)}")
