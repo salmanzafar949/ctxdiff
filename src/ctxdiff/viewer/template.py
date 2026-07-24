@@ -106,7 +106,13 @@ a{color:inherit}
 .noscript{margin:18px 22px; padding:14px 16px; border:1px solid var(--warn);
   border-radius:10px; color:var(--warn)}
 
-main{max-width:1100px; margin:0 auto; padding:22px; display:grid; gap:18px}
+/* minmax(0,1fr) is load-bearing: grid children default to min-width:auto, so a
+   panel holding a long unbreakable line (a single-line diff row) would refuse
+   to shrink, blow past max-width, and force the PAGE to scroll horizontally —
+   text-overflow ellipsis only engages once the track is genuinely constrained. */
+main{max-width:1100px; margin:0 auto; padding:22px; display:grid;
+  grid-template-columns:minmax(0,1fr); gap:18px}
+main > *{min-width:0}
 
 .panel{
   background:var(--panel); border:1px solid var(--hairline); border-radius:14px;
