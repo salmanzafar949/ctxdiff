@@ -1,6 +1,7 @@
 # ctxdiff
 
 [![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg)](https://pypi.org/project/ctxdiff/)
+[![CI](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml/badge.svg)](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
@@ -90,11 +91,18 @@ See [The CLI](#the-cli) below for every subcommand, with real sample output.
 `ctxdiff` targets **Python ≥ 3.10**.
 
 ```bash
-# from source (PyPI package coming soon)
+pip install ctxdiff
+```
+
+<details>
+<summary>…or install from source</summary>
+
+```bash
 git clone https://github.com/salmanzafar949/ctxdiff
 cd ctxdiff
 pip install -e .
 ```
+</details>
 
 The only runtime dependency is [`tiktoken`](https://github.com/openai/tiktoken) (for exact OpenAI token counts). The provider SDKs (`openai`, `anthropic`, …) are **not** dependencies — `ctxdiff` wraps whatever client you already use.
 
