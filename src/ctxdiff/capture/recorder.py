@@ -32,11 +32,16 @@ class Recorder:
 
     def record(self, seq: int, kwargs: dict, response: object | None,
                latency_ms: int | None, error: str | None,
-               tagged: list[tuple[str, str]]) -> None:
+               tagged: list[tuple[str, str]],
+               agent: str | None = None, step: str | None = None,
+               provider: str | None = None) -> None:
         """Build and store one call from its request kwargs and response. Every
         step runs inside a catch-all: any failure is logged once and swallowed,
         leaving the host application's own call path untouched (fail-open).
-        `tagged` is a list of (label, needle) pairs used to override labels."""
+        `tagged` is a list of (label, needle) pairs used to override labels.
+        `agent`/`step`/`provider` are the v2 attribution fields threaded through
+        to the store unchanged (they flow inside this guarded path so capturing
+        them can never break the host, per the fail-open contract)."""
         try:
             raw = self._adapter.extract_blocks(kwargs)
             params = self._adapter.extract_params(kwargs)
@@ -65,7 +70,8 @@ class Recorder:
 
             self._ct.record_call(seq=seq, params=params, usage=usage,
                                  latency_ms=latency_ms, error=error,
-                                 call_blocks=call_blocks)
+                                 call_blocks=call_blocks,
+                                 agent=agent, step=step, provider=provider)
         except Exception:  # noqa: BLE001 — fail-open is the whole point
             _log.warning("ctxdiff: failed to record call seq=%s (tracing skipped)",
                          seq, exc_info=True)

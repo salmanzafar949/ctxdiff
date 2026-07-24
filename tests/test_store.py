@@ -52,10 +52,103 @@ def test_block_dedup_across_calls(tmp_path):
 
 
 def test_open_rejects_wrong_schema_version(tmp_path):
-    """A file whose schema_version differs raises a clear error, not a crash."""
+    """A file whose schema_version is NEWER than supported raises a clear
+    error, not a crash."""
     path = str(tmp_path / "r.ctrace")
     ct = CTrace.create(path, project="agent", provider="openai", model="gpt-4o")
     ct._conn.execute("UPDATE run SET schema_version = 999")
     ct._conn.commit(); ct.close()
     with pytest.raises(ValueError, match="schema version"):
         CTrace.open(path)
+
+
+# --- v2 attribution: agent / step / provider ----------------------------------
+
+
+def test_v2_roundtrip_agent_step_provider(tmp_path):
+    """A v2 trace stores and reads back a call's agent/step/provider verbatim."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="gpt-4o")
+    ct.record_call(seq=1, params={"model": "m"}, usage=None, latency_ms=1,
+                   error=None, call_blocks=[_call_block("hi", 0)],
+                   agent="researcher", step="retrieve", provider="openai")
+    ct.close()
+
+    ct = CTrace.open(path)
+    call = ct.get_calls()[0]
+    assert call.agent == "researcher"
+    assert call.step == "retrieve"
+    assert call.provider == "openai"
+    ct.close()
+
+
+def test_v2_attribution_defaults_to_none(tmp_path):
+    """Recording a call without the v2 params leaves all three fields None."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="gpt-4o")
+    ct.record_call(seq=1, params={"model": "m"}, usage=None, latency_ms=1,
+                   error=None, call_blocks=[_call_block("hi", 0)])
+    ct.close()
+    ct = CTrace.open(path)
+    call = ct.get_calls()[0]
+    assert call.agent is None and call.step is None and call.provider is None
+    ct.close()
+
+
+# A verbatim copy of the v1 `call` DDL (no agent/step/provider columns), used to
+# forge a REAL v1 file in-test so the v1-compatibility path is exercised against
+# an actual on-disk v1 schema, not a mocked one.
+_V1_DDL = """
+CREATE TABLE run (
+  id TEXT PRIMARY KEY, project TEXT NOT NULL, started_at TEXT NOT NULL,
+  provider TEXT NOT NULL, models TEXT NOT NULL, ctxdiff_version TEXT NOT NULL,
+  schema_version INTEGER NOT NULL);
+CREATE TABLE call (
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
+  params TEXT NOT NULL, usage TEXT, latency_ms INTEGER, error TEXT,
+  UNIQUE(run_id, seq));
+CREATE TABLE block (
+  content_hash TEXT PRIMARY KEY, role TEXT NOT NULL, kind TEXT NOT NULL,
+  text TEXT NOT NULL, token_count INTEGER NOT NULL, token_method TEXT NOT NULL);
+CREATE TABLE call_block (
+  call_id TEXT NOT NULL, block_id TEXT NOT NULL, position INTEGER NOT NULL,
+  label TEXT NOT NULL, label_source TEXT NOT NULL, PRIMARY KEY (call_id, position));
+"""
+
+
+def _build_v1_file(path):
+    """Forge a real v1 .ctrace on disk: v1 DDL, schema_version=1, one run and
+    one call written with the 7-column v1 call shape."""
+    import sqlite3
+    conn = sqlite3.connect(path)
+    conn.executescript(_V1_DDL)
+    conn.execute("INSERT INTO run VALUES ('run1','proj','2026-01-01','openai',"
+                 "'[\"gpt-4o\"]','0.1.0',1)")
+    conn.execute("INSERT INTO call VALUES ('call1','run1',1,'{\"model\":\"m\"}',"
+                 "NULL,10,NULL)")
+    conn.execute("INSERT INTO block VALUES ('h1','user','message','hi',2,'tiktoken')")
+    conn.execute("INSERT INTO call_block VALUES ('call1','h1',0,'user','heuristic')")
+    conn.commit(); conn.close()
+
+
+def test_open_v1_file_surfaces_none_and_does_not_mutate(tmp_path):
+    """Opening a REAL v1 file must (1) succeed, (2) surface the v2 fields as
+    None, and (3) never rewrite the file — a debugger must not mutate the
+    evidence it inspects, so the on-disk bytes are identical after open+read."""
+    path = str(tmp_path / "v1.ctrace")
+    _build_v1_file(path)
+    before = open(path, "rb").read()
+
+    ct = CTrace.open(path)
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].seq == 1
+    assert calls[0].agent is None
+    assert calls[0].step is None
+    assert calls[0].provider is None
+    # blocks still read fine through the unchanged block/call_block tables
+    assert ct.get_call_blocks(calls[0].id)[0].block.text == "hi"
+    ct.close()
+
+    after = open(path, "rb").read()
+    assert before == after  # opening a v1 file left its bytes untouched

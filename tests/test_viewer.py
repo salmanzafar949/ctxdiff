@@ -236,3 +236,124 @@ def test_html_injection_stays_inside_json_island(tmp_path):
     raw = _DATA_RE.search(text).group(1)
     assert xss in raw                      # present inside the JSON island
     assert xss not in text.replace(raw, "")  # absent everywhere else
+
+
+# --- multi-agent payload ------------------------------------------------------
+
+
+def _make_multi_agent_trace(path):
+    """Two agents interleaved on the global timeline: researcher (turns 1,3)
+    and writer (turn 2). Turn 2->3 and 1->2 are cross-agent hand-offs."""
+    ct = CTrace.create(path, project="multi", provider="openai", model="gpt-4o")
+
+    def rec(seq, blocks, agent, step=None):
+        ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=None,
+                       latency_ms=10, error=None, call_blocks=blocks,
+                       agent=agent, step=step)
+    r1 = [_cb("sys R", 0, role="system", label="system", token_count=5),
+          _cb("r-q1", 1, token_count=3)]
+    w1 = [_cb("sys W", 0, role="system", label="system", token_count=5),
+          _cb("w-q1", 1, token_count=3)]
+    r2 = r1 + [_cb("r-ans", 2, role="assistant", label="history", token_count=4),
+               _cb("r-q2", 3, token_count=3)]
+    rec(1, r1, "researcher", "plan")
+    rec(2, w1, "writer")
+    rec(3, r2, "researcher", "answer")
+    ct.close()
+
+
+def test_payload_carries_agent_stats_and_fields(tmp_path):
+    """stats.agents lists each agent with call count and tokens; calls carry
+    agent/step passthrough."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+    ct = CTrace.open(path)
+    try:
+        payload = build_payload(ct)
+    finally:
+        ct.close()
+
+    agents = {a["name"]: a for a in payload["stats"]["agents"]}
+    assert agents["researcher"]["calls"] == 2
+    assert agents["writer"]["calls"] == 1
+    assert agents["researcher"]["tokens"] > 0
+    assert payload["calls"][0]["agent"] == "researcher"
+    assert payload["calls"][0]["step"] == "plan"
+    # per-agent block tokens live on stats.agents (the template's source); the
+    # payload carries no redundant tokens.by_agent field.
+    assert "by_agent" not in payload["tokens"]
+
+
+def test_payload_carries_usage_rollup(tmp_path):
+    """stats.usage carries the provider-usage rollup: summed input/output,
+    coverage [reported, total], and per-agent [in, out] on a multi-agent run.
+    The _make_trace fixture in test_viewer records input_tokens per call, so
+    the totals are non-zero and full-coverage."""
+    path = str(tmp_path / "r.ctrace")
+    payload = _payload_for(path)   # single-agent fixture, input_tokens=200 x3
+    usage = payload["stats"]["usage"]
+    assert usage["input"] == 600           # 200 * 3 calls
+    assert usage["coverage"] == [3, 3]     # every call reported usage
+    assert usage["by_agent"] is None       # single-agent run
+
+
+def test_payload_usage_by_agent_multi_agent(tmp_path):
+    """A multi-agent run with provider usage carries per-agent [in, out]."""
+    path = str(tmp_path / "multi.ctrace")
+    ct = CTrace.create(path, project="multi", provider="openai", model="gpt-4o")
+    ct.record_call(seq=1, params={"model": "m"},
+                   usage={"prompt_tokens": 100, "completion_tokens": 20},
+                   latency_ms=10, error=None, call_blocks=[_cb("a", 0)],
+                   agent="researcher")
+    ct.record_call(seq=2, params={"model": "m"},
+                   usage={"input_tokens": 40, "output_tokens": 6},
+                   latency_ms=10, error=None, call_blocks=[_cb("b", 0)],
+                   agent="writer")
+    ct.close()
+    ct = CTrace.open(path)
+    try:
+        payload = build_payload(ct)
+    finally:
+        ct.close()
+    assert payload["stats"]["usage"]["by_agent"] == {
+        "researcher": [100, 20], "writer": [40, 6]}
+
+
+def test_payload_marks_cross_agent_diffs(tmp_path):
+    """Each adjacent-pair diff carries cross_agent; a hand-off pair that has a
+    same-agent predecessor also carries a precomputed same_agent_diff."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+    ct = CTrace.open(path)
+    try:
+        payload = build_payload(ct)
+    finally:
+        ct.close()
+
+    diffs = payload["diffs"]  # index 0 = turns 1->2, index 1 = turns 2->3
+    assert diffs[0]["cross_agent"] is True   # researcher -> writer
+    assert diffs[1]["cross_agent"] is True   # writer -> researcher
+    # turn 3 (researcher) has an earlier researcher turn (1) to diff against
+    assert "same_agent_diff" in diffs[1]
+    assert diffs[1]["same_agent_diff"]["seq_old"] == 1
+    assert diffs[1]["same_agent_diff"]["seq_new"] == 3
+
+
+def test_hostile_agent_name_stays_inside_json_island(tmp_path):
+    """An agent name with hostile markup survives to the payload but appears
+    ONLY inside the JSON island — the page renders agent names via textContent,
+    so a hostile name can never become live markup in the document."""
+    path = str(tmp_path / "r.ctrace")
+    ct = CTrace.create(path, project="x", provider="openai", model="gpt-4o")
+    evil = "</script><img onerror=alert(1)>"
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None, latency_ms=1,
+                   error=None, call_blocks=[_cb("hi", 0)], agent=evil)
+    ct.record_call(seq=2, params={"model": "gpt-4o"}, usage=None, latency_ms=1,
+                   error=None, call_blocks=[_cb("bye", 0)], agent="other")
+    ct.close()
+    text = open(export_html(path), encoding="utf-8").read()
+    raw = _DATA_RE.search(text).group(1)
+    # The </script> is escaped as <\/script> inside the island; compare on the
+    # unescaped form the browser would parse back.
+    assert evil in raw.replace("<\\/", "</")
+    assert evil not in text.replace(raw, "")  # nowhere in the static document

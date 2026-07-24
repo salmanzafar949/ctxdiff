@@ -17,9 +17,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ctxdiff.analyze.differ import TurnDiff, diff_calls
+from ctxdiff.analyze.differ import (
+    TurnDiff,
+    diff_calls,
+    distinct_agents,
+    filter_calls,
+)
 from ctxdiff.models import CallBlock
-from ctxdiff.store.ctrace import CTrace
+from ctxdiff.store.ctrace import Call, CTrace
 
 # --- value types -------------------------------------------------------------
 
@@ -56,6 +61,9 @@ class PrefixBreak:
     culprit_label: str
     culprit_snippet: str
     detail: str
+    agent: str | None = None  # which agent's timeline this break sits in (None
+    # for an unlabeled/single-agent run); a break is only ever computed between
+    # two calls of the SAME agent, so this is unambiguous
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,15 @@ class CacheReport:
     rebilled_tokens_total: int
     estimated_waste_note: str
     fix_hint: str | None
+    agents_analyzed: int | None = None  # number of distinct agent groups the
+    # run was split into when analyzed unfiltered with >1 agent (so a
+    # cross-agent adjacent pair is never counted as a break); None when the run
+    # was analyzed as a single timeline (one agent, or an --agent filter)
+    pairs_by_agent: dict[str, int] | None = None  # per-agent analyzed-pair
+    # counts (keyed by agent label) when grouped, so a break attributed to an
+    # agent can be reported against THAT agent's own pair count as the
+    # denominator; None when the run was a single timeline. '(unlabeled)' keys
+    # the None-agent group.
 
 
 # --- snippet formatting -------------------------------------------------------
@@ -296,9 +313,18 @@ def _fix_hint(breaks: list[PrefixBreak], dynamic_flags: list[bool]) -> str | Non
 # --- core algorithm --------------------------------------------------------------
 
 
-def analyze_cache(ct: CTrace) -> CacheReport:
-    """Analyze every consecutive call pair in `ct` (in seq order) for
-    cache-prefix stability (spec §6.4). For each pair (call N-1, call N):
+def _analyze_group(
+    calls: list[Call],
+    blocks_by_call_id: dict[str, list[CallBlock]],
+    agent_label: str | None,
+) -> tuple[list[PrefixBreak], list[bool], list[int], int]:
+    """Walk one agent's calls (already in seq order) for prefix stability and
+    return (breaks, dynamic_flags, stable_tokens_per_pair, rebilled_total).
+    This is the per-pair core, factored out so both the single-timeline and the
+    per-agent-grouped paths share ONE positional walk. `agent_label` is stamped
+    onto every PrefixBreak this group produces.
+
+    For each consecutive pair (call N-1, call N):
 
     1. Walk both calls' block-hash lists position-by-position from index 0
        (NOT the differ's LCS alignment — cache stability is a strictly
@@ -307,33 +333,15 @@ def analyze_cache(ct: CTrace) -> CacheReport:
        differ, or at the end of the shorter list.
     2. If the walk reached the end of the shorter list, the shorter call's
        entire block list is an exact leading prefix of the longer one — pure
-       history growth (or pure trailing truncation), the cache-friendly
-       happy path. This is NOT a break: no PrefixBreak, no rebilled tokens.
-    3. Otherwise there's a genuine divergence at that index: the blocks
-       before it are the stable prefix (their tokens are never rebilled);
-       everything in the NEWER call from that index onward is rebilled (it
-       would have been served from cache had the prefix held). `diff_calls`
-       (already-tested alignment) is reused to explain *what* happened at
-       that exact position — a same-slot edit, an insertion, or an eviction.
-
-    `stable_prefix_tokens_min` is tracked across EVERY pair (breaking or
-    not) — the effective guaranteed-cacheable prefix is only as good as the
-    worst pair in the run. A run with fewer than 2 calls has nothing to
-    diff, so it returns an empty report with an explanatory note rather than
-    crashing on an empty pair list."""
-    calls = ct.get_calls()
-    if len(calls) < 2:
-        return CacheReport(
-            pairs_analyzed=0, breaks=[], stable_prefix_tokens_min=0,
-            rebilled_tokens_total=0,
-            estimated_waste_note="fewer than 2 calls in this run — nothing to analyze",
-            fix_hint=None,
-        )
-
-    blocks_by_call_id = {c.id: ct.get_call_blocks(c.id) for c in calls}
-
+       history growth (or pure trailing truncation), the cache-friendly happy
+       path. This is NOT a break: no PrefixBreak, no rebilled tokens.
+    3. Otherwise there's a genuine divergence at that index: the blocks before
+       it are the stable prefix (their tokens are never rebilled); everything
+       in the NEWER call from that index onward is rebilled. `diff_calls`
+       (already-tested alignment) is reused to explain *what* happened at that
+       exact position."""
     breaks: list[PrefixBreak] = []
-    dynamic_flags: list[bool] = []  # parallel to `breaks`
+    dynamic_flags: list[bool] = []
     stable_tokens_per_pair: list[int] = []
     rebilled_total = 0
 
@@ -352,9 +360,7 @@ def analyze_cache(ct: CTrace) -> CacheReport:
         stable_tokens_per_pair.append(stable_tokens)
 
         if i == shorter_len:
-            # The shorter call's blocks are an exact leading prefix of the
-            # longer call's — pure append growth (or pure trailing
-            # truncation). Cache-friendly happy path: not a break.
+            # Exact leading prefix — pure append growth / trailing truncation.
             continue
 
         rebilled = sum(cb.block.token_count for cb in new[i:])
@@ -371,15 +377,98 @@ def analyze_cache(ct: CTrace) -> CacheReport:
             divergent_position=i,
             culprit_kind=culprit_kind, culprit_label=culprit_label,
             culprit_snippet=culprit_snippet, detail=detail,
+            agent=agent_label,
         ))
         dynamic_flags.append(is_dynamic)
 
-    pairs_analyzed = len(calls) - 1
+    return breaks, dynamic_flags, stable_tokens_per_pair, rebilled_total
+
+
+def analyze_cache(ct: CTrace, agent: str | None = None) -> CacheReport:
+    """Analyze a run for cache-prefix stability (spec §6.4), agent-aware.
+
+    Grouping semantics (the correctness fix this feature exposes): cache
+    stability is only meaningful BETWEEN CALLS OF THE SAME AGENT — two agents
+    interleaved on the global timeline each carry their own prefix, and an
+    adjacent cross-agent pair sharing nothing is NOT a "break" (the pre-v2 code
+    would have flagged every hand-off as a cache miss).
+
+    - `agent` given: analyze only that agent's calls (consecutive within its
+      own filtered timeline).
+    - `agent` None with a SINGLE distinct agent (or an all-unlabeled run):
+      behaves exactly as before — one timeline, consecutive global pairs.
+    - `agent` None with MULTIPLE distinct agents: split the calls into
+      per-agent groups (each preserving seq order), analyze prefix stability
+      WITHIN each group, and merge; a cross-agent adjacent pair is never
+      considered. `pairs_analyzed` is the sum of per-group pair counts, and
+      `agents_analyzed` records how many groups were merged.
+
+    `stable_prefix_tokens_min` is the smallest stable-prefix token count across
+    EVERY analyzed pair — the effective guaranteed-cacheable prefix is only as
+    good as the worst pair. A run (or filtered agent) with fewer than 2
+    analyzable pairs returns an empty report with an explanatory note rather
+    than crashing on an empty pair list."""
+    calls = filter_calls(ct.get_calls(), agent)
+    blocks_by_call_id = {c.id: ct.get_call_blocks(c.id) for c in calls}
+
+    # Decide the grouping. Only an unfiltered run with >1 distinct agent is
+    # split; everything else is one timeline.
+    labels = distinct_agents(calls)
+    grouped = agent is None and len(labels) > 1
+    if grouped:
+        groups = [(lbl, [c for c in calls if c.agent == lbl]) for lbl in labels]
+        agents_analyzed: int | None = len(labels)
+    else:
+        # A single group: its label is the filtered agent (when given) or the
+        # sole label seen (None for an unlabeled single-agent run).
+        sole = agent if agent is not None else (labels[0] if labels else None)
+        groups = [(sole, calls)]
+        agents_analyzed = None
+
+    all_breaks: list[PrefixBreak] = []
+    all_dynamic: list[bool] = []
+    all_stable: list[int] = []
+    rebilled_total = 0
+    # per-agent pair counts (only meaningful when grouped) so a break can be
+    # reported against its OWN agent's denominator, not the run-wide total.
+    pairs_by_agent: dict[str, int] = {}
+    for label, group_calls in groups:
+        breaks, dyn, stable, rebilled = _analyze_group(
+            group_calls, blocks_by_call_id, label)
+        all_breaks.extend(breaks)
+        all_dynamic.extend(dyn)
+        all_stable.extend(stable)
+        rebilled_total += rebilled
+        if grouped:
+            key = label if label is not None else "(unlabeled)"
+            pairs_by_agent[key] = len(stable)
+
+    pairs_analyzed = len(all_stable)  # one stable-tokens entry per analyzed pair
+    if pairs_analyzed == 0:
+        return CacheReport(
+            pairs_analyzed=0, breaks=[], stable_prefix_tokens_min=0,
+            rebilled_tokens_total=0,
+            estimated_waste_note="fewer than 2 calls in this run — nothing to analyze",
+            fix_hint=None, agents_analyzed=agents_analyzed,
+            pairs_by_agent=pairs_by_agent or None,
+        )
+
+    # Compute the fix hint BEFORE reordering: _fix_hint reads all(dynamic_flags)
+    # (order-independent) and compares every break to breaks[0], so the flags
+    # need only stay a valid collection, not stay positionally paired.
+    fix_hint = _fix_hint(all_breaks, all_dynamic)
+
+    # Merge order: by the newer call's seq, so breaks read in timeline order
+    # even after per-agent grouping shuffled them.
+    all_breaks.sort(key=lambda b: b.seq)
+
     return CacheReport(
         pairs_analyzed=pairs_analyzed,
-        breaks=breaks,
-        stable_prefix_tokens_min=min(stable_tokens_per_pair) if stable_tokens_per_pair else 0,
+        breaks=all_breaks,
+        stable_prefix_tokens_min=min(all_stable) if all_stable else 0,
         rebilled_tokens_total=rebilled_total,
         estimated_waste_note=_waste_note(rebilled_total, pairs_analyzed),
-        fix_hint=_fix_hint(breaks, dynamic_flags),
+        fix_hint=fix_hint,
+        agents_analyzed=agents_analyzed,
+        pairs_by_agent=pairs_by_agent or None,
     )

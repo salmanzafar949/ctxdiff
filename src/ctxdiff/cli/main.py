@@ -17,10 +17,12 @@ from ctxdiff.analyze.cache import analyze_cache
 from ctxdiff.analyze.differ import diff_turns
 from ctxdiff.analyze.tokens import analyze_run, registered_tool_names
 from ctxdiff.cli.render import (
+    render_agent_summary,
     render_cache_report,
     render_runs_list,
     render_run_tokens,
     render_turn_diff,
+    render_usage_summary,
 )
 from ctxdiff.store.ctrace import CTrace
 from ctxdiff.viewer import export_html
@@ -63,6 +65,9 @@ def _add_diff_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--turn", action="append", type=int, dest="turns",
                    help="turn (call seq) number; pass exactly twice, e.g. "
                         "--turn 7 --turn 8")
+    p.add_argument("--agent", default=None,
+                   help="restrict to one agent: both --turn values must be "
+                        "calls of this agent (turns still use global seq numbers)")
     p.add_argument("--run", default=None, help="path to a .ctrace file "
                     "(default: most recently modified *.ctrace in cwd)")
     p.set_defaults(func=_cmd_diff)
@@ -76,6 +81,8 @@ def _add_tokens_parser(subparsers: argparse._SubParsersAction) -> None:
         "tokens", help="token heatmap + schema-bloat report")
     p.add_argument("--turn", type=int, default=None,
                     help="limit output to one turn (call seq) number")
+    p.add_argument("--agent", default=None,
+                    help="restrict token attribution to one agent's calls")
     p.add_argument("--run", default=None, help="path to a .ctrace file "
                     "(default: most recently modified *.ctrace in cwd)")
     p.set_defaults(func=_cmd_tokens)
@@ -86,6 +93,8 @@ def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
     profiler always analyzes the whole run's consecutive-call pairs."""
     p = subparsers.add_parser(
         "cache", help="prefix-stability report + wasted-spend estimate")
+    p.add_argument("--agent", default=None,
+                    help="restrict prefix analysis to one agent's calls")
     p.add_argument("--run", default=None, help="path to a .ctrace file "
                     "(default: most recently modified *.ctrace in cwd)")
     p.set_defaults(func=_cmd_cache)
@@ -168,6 +177,18 @@ def _cmd_diff(args: argparse.Namespace) -> int:
 
     try:
         turn_old, turn_new = turns
+        # --agent: validate BOTH turns belong to that agent before diffing.
+        # Turns stay global seq numbers (what every view shows); we only check
+        # ownership, then diff_turns resolves them against the whole run as
+        # usual (the two calls happen to be this agent's).
+        if args.agent is not None:
+            agent_seqs = [c.seq for c in ct.get_calls() if c.agent == args.agent]
+            bad = [t for t in (turn_old, turn_new) if t not in agent_seqs]
+            if bad:
+                print(f"ctxdiff: turn(s) {bad} are not calls of agent "
+                      f"'{args.agent}' (that agent's turns: {agent_seqs})",
+                      file=sys.stderr)
+                return 1
         try:
             diff = diff_turns(ct, turn_old, turn_new)
         except ValueError as exc:
@@ -199,12 +220,14 @@ def _cmd_tokens(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        run_tokens = analyze_run(ct)
+        run_tokens = analyze_run(ct, agent=args.agent)
         calls_by_seq = {c.seq: c for c in run_tokens.calls}
 
         if args.turn is not None:
             if args.turn not in calls_by_seq:
-                print(f"ctxdiff: turn {args.turn} not found in this run "
+                where = (f"agent '{args.agent}'" if args.agent is not None
+                         else "this run")
+                print(f"ctxdiff: turn {args.turn} not found in {where} "
                       f"(available turns: {sorted(calls_by_seq)})", file=sys.stderr)
                 return 1
             selected = [calls_by_seq[args.turn]]
@@ -216,7 +239,13 @@ def _cmd_tokens(args: argparse.Namespace) -> int:
             all_blocks = [ct.get_call_blocks(c.id) for c in ct.get_calls()]
             total_tools = len(registered_tool_names(all_blocks))
 
-        print(render_run_tokens(selected, run_tokens.bloat, total_tools))
+        # The provider-usage rollup prints first (always — it self-describes as
+        # "no provider usage reported" when nothing reported); the per-agent
+        # block-token summary is only non-None for an unfiltered multi-agent run.
+        usage_summary = render_usage_summary(run_tokens.usage, args.agent)
+        agent_summary = render_agent_summary(run_tokens)
+        print(render_run_tokens(selected, run_tokens.bloat, total_tools,
+                                agent_summary, usage_summary))
     finally:
         ct.close()
     return 0
@@ -240,7 +269,7 @@ def _cmd_cache(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        report = analyze_cache(ct)
+        report = analyze_cache(ct, agent=args.agent)
         print(render_cache_report(report))
     finally:
         ct.close()
@@ -253,7 +282,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
     schema version, not actually a ctrace) is skipped rather than aborting
     the whole listing — one bad file shouldn't hide every good one."""
     candidates = sorted(glob.glob(os.path.join(os.getcwd(), "*.ctrace")))
-    rows: list[tuple[str, str, str, int]] = []
+    rows: list[tuple[str, str, str, int, str]] = []
     for path in candidates:
         try:
             ct = CTrace.open(path)
@@ -261,10 +290,19 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             continue
         try:
             run = ct.get_run()
-            n_calls = len(ct.get_calls())
+            calls = ct.get_calls()
+            n_calls = len(calls)
+            # Distinct named agents, in first-appearance order; '-' when the
+            # run has none (a single-agent/pre-v2 run).
+            names: list[str] = []
+            for c in calls:
+                if c.agent and c.agent not in names:
+                    names.append(c.agent)
+            agents = ", ".join(names) if names else "-"
         finally:
             ct.close()
-        rows.append((os.path.basename(path), run.project, run.provider, n_calls))
+        rows.append((os.path.basename(path), run.project, run.provider,
+                     n_calls, agents))
     print(render_runs_list(rows))
     return 0
 

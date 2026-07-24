@@ -256,6 +256,40 @@ def test_tokens_turn_filter_limits_output(tmp_path, capsys):
     assert "turn 1 ·" not in out
 
 
+def test_tokens_prints_provider_usage_summary_with_coverage(tmp_path, capsys):
+    """`ctxdiff tokens` prints a run-level provider-usage rollup first, summing
+    input/output from the calls that reported usage and stating the coverage
+    fraction (here 1 of 2 calls carried usage)."""
+    path = str(tmp_path / "usage.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+    ct.record_call(seq=1, params={"model": "m"},
+                   usage={"prompt_tokens": 18400, "completion_tokens": 640},
+                   latency_ms=10, error=None,
+                   call_blocks=[_cb("system prompt", 0, "system", "system")])
+    ct.record_call(seq=2, params={"model": "m"}, usage=None, latency_ms=10,
+                   error=None, call_blocks=[_cb("hello", 0, "user", "user")])
+    ct.close()
+
+    exit_code = main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "run total · in 18,400 tok · out 640 tok" in out
+    assert "1/2 calls reported usage" in out
+
+
+def test_tokens_no_provider_usage_says_none_not_zeros(tmp_path, capsys):
+    """When no call reported usage, the summary says so rather than printing a
+    misleading in-0 / out-0 total."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_trace(path)   # this fixture records usage=None on every call
+
+    main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert "no provider usage reported" in out
+
+
 def test_tokens_missing_turn_exits_1_with_stderr_message(tmp_path, capsys):
     path = str(tmp_path / "demo.ctrace")
     _make_tokens_trace(path)
@@ -427,3 +461,189 @@ def test_export_no_run_found_exits_1(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "did the run capture" in captured.err
+
+
+# --- multi-agent CLI ----------------------------------------------------------
+
+
+def _agent_cb(text, position, role="user", label="user", token_count=None):
+    if token_count is None:
+        token_count = len(text)
+    block = Block(content_hash=f"h:{role}:{text}", role=role, kind="message",
+                  text=text, token_count=token_count, token_method="tiktoken")
+    return CallBlock(block=block, position=position, label=label, label_source="heuristic")
+
+
+def _make_multi_agent_trace(path):
+    """Two agents (researcher, writer) interleaved on the global timeline; each
+    only appends to its own history (both internally cache-stable)."""
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    def rec(seq, blocks, agent, step=None):
+        ct.record_call(seq=seq, params={"model": "gpt-4o"}, usage=None,
+                       latency_ms=10, error=None, call_blocks=blocks,
+                       agent=agent, step=step)
+    r1 = [_agent_cb("sys R", 0, "system", "system"), _agent_cb("r-q1", 1)]
+    w1 = [_agent_cb("sys W", 0, "system", "system"), _agent_cb("w-q1", 1)]
+    r2 = r1 + [_agent_cb("r-ans", 2, "assistant", "history"), _agent_cb("r-q2", 3)]
+    rec(1, r1, "researcher", "plan")
+    rec(2, w1, "writer")
+    rec(3, r2, "researcher", "answer")
+    ct.close()
+
+
+def test_runs_shows_distinct_agent_names(tmp_path, monkeypatch, capsys):
+    """`ctxdiff runs` lists each trace's distinct agent names."""
+    _make_multi_agent_trace(str(tmp_path / "multi.ctrace"))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["runs"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "agents=researcher, writer" in out
+
+
+def test_runs_shows_dash_for_no_agents(tmp_path, monkeypatch, capsys):
+    """A run with no named agents shows `agents=-`."""
+    _make_trace(str(tmp_path / "demo.ctrace"))
+    monkeypatch.chdir(tmp_path)
+
+    main(["runs"])
+
+    out = capsys.readouterr().out
+    assert "agents=-" in out
+
+
+def test_tokens_agent_filter_limits_and_shows_no_summary(tmp_path, capsys):
+    """`tokens --agent researcher` shows only that agent's turns (1 and 3, not
+    the writer's turn 2)."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+
+    exit_code = main(["tokens", "--agent", "researcher", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "turn 1 ·" in out
+    assert "turn 3 ·" in out
+    assert "turn 2 ·" not in out       # writer's turn is filtered out
+
+
+def test_tokens_unfiltered_prints_per_agent_summary(tmp_path, capsys):
+    """Unfiltered on a multi-agent run, a per-agent summary block appears, and
+    turn headers carry the [agent·step] marker."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+
+    main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert "agents:" in out
+    assert "researcher" in out and "writer" in out
+    assert "[researcher·plan]" in out   # turn header marker
+
+
+def test_cache_agent_grouping_note(tmp_path, capsys):
+    """Unfiltered cache on a multi-agent run notes the per-agent grouping and
+    (since both agents are internally stable) reports the prefix stable."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+
+    exit_code = main(["cache", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "within 2 agents" in out
+    assert "⚠" not in out               # no cross-agent hand-off is a break
+
+
+def _make_agent_usage_trace(path):
+    """Multi-agent trace carrying provider usage per call, so the usage rollup
+    has non-zero numbers to scope by agent."""
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    def rec(seq, agent, pt, ct_tok):
+        ct.record_call(seq=seq, params={"model": "m"},
+                       usage={"prompt_tokens": pt, "completion_tokens": ct_tok},
+                       latency_ms=10, error=None,
+                       call_blocks=[_agent_cb("q", 0)], agent=agent)
+    rec(1, "researcher", 100, 20)
+    rec(2, "writer", 40, 6)
+    rec(3, "researcher", 30, 4)
+    ct.close()
+
+
+def test_tokens_agent_filter_scopes_usage_label(tmp_path, capsys):
+    """Under `--agent researcher`, the usage rollup label reads
+    `researcher total ·` (agent-scoped), not `run total ·` — the numbers are
+    agent-filtered and the label must not claim run scope."""
+    path = str(tmp_path / "usage.ctrace")
+    _make_agent_usage_trace(path)
+
+    exit_code = main(["tokens", "--agent", "researcher", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "researcher total · in 130 tok · out 24 tok" in out
+    assert "run total ·" not in out
+
+
+def test_cache_break_uses_agents_own_pair_denominator(tmp_path, capsys):
+    """A researcher that breaks on both of its own pairs, alongside a stable
+    writer, reports `2/2 pairs` (its OWN denominator) — not `2/3` of the
+    run-wide pair count."""
+    path = str(tmp_path / "multi.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    def rec(seq, blocks, agent):
+        ct.record_call(seq=seq, params={"model": "m"}, usage=None, latency_ms=10,
+                       error=None, call_blocks=blocks, agent=agent)
+
+    def r(ts):
+        return [_agent_cb(f"sys R time {ts}", 0, "system", "system"),
+                _agent_cb("r-q", 1)]
+    w1 = [_agent_cb("sys W", 0, "system", "system"), _agent_cb("w-q1", 1)]
+    w2 = w1 + [_agent_cb("w-ans", 2, "assistant", "history"), _agent_cb("w-q2", 3)]
+    rec(1, r("10:00:00"), "researcher")
+    rec(2, w1, "writer")
+    rec(3, r("10:00:05"), "researcher")   # researcher break #1
+    rec(4, w2, "writer")                  # writer stable
+    rec(5, r("10:00:10"), "researcher")   # researcher break #2
+    ct.close()
+
+    exit_code = main(["cache", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "(2/2 pairs)" in out    # researcher's own denominator
+    assert "2/3" not in out        # NOT the run-wide pair count
+
+
+def test_diff_agent_validates_turn_ownership(tmp_path, capsys):
+    """`diff --agent researcher --turn 1 --turn 2` fails: turn 2 belongs to
+    the writer, not the researcher — exit 1 with that agent's own turns listed."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+
+    exit_code = main(["diff", "--turn", "1", "--turn", "2",
+                      "--agent", "researcher", "--run", path])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "researcher" in captured.err
+    assert captured.out == ""
+
+
+def test_diff_agent_accepts_owned_turns(tmp_path, capsys):
+    """`diff --agent researcher --turn 1 --turn 3` succeeds: both turns are the
+    researcher's own calls."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+
+    exit_code = main(["diff", "--turn", "1", "--turn", "3",
+                      "--agent", "researcher", "--run", path])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "turn 1 → turn 3" in out
