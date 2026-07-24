@@ -2,7 +2,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Status: v1 · capture → diff → tokens → cache → viewer](https://img.shields.io/badge/status-v1%20%C2%B7%20capture%20%E2%86%92%20diff%20%E2%86%92%20tokens%20%E2%86%92%20cache%20%E2%86%92%20viewer-brightgreen.svg)](#status)
+[![Status: v1 · capture → diff → tokens → cache → viewer](https://img.shields.io/badge/status-v1%20%C2%B7%20capture%20%E2%86%92%20diff%20%E2%86%92%20tokens%20%E2%86%92%20cache%20%E2%86%92%20viewer-brightgreen.svg)](#features)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 **git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
@@ -28,17 +28,29 @@ tracer.close()                          # writes ./customer-support-agent-<id>.c
 
 ---
 
-## Status
+## Features
 
-`ctxdiff` was built in milestones; **v1 is complete** — capture, the diff/tokens/cache analyzers, and the HTML viewer all ship today.
+**What ctxdiff does** *(each link jumps to the details)*:
 
-| Milestone | What it adds | State |
-|-----------|--------------|-------|
-| **M1 — Capture + Store** | One-line SDK wrapping, content-hashed `.ctrace` traces, fail-open capture, redaction, token counting | ✅ **available now** |
-| **M2 — CLI diff** | `ctxdiff diff --turn 7 --turn 8` — git-style added/evicted/modified context | ✅ **available now** |
-| **M3 — Token heatmap** | `ctxdiff tokens` — token allocation per turn, "schema bloat" detection | ✅ **available now** |
-| **M4 — Cache profiler** | `ctxdiff cache` — prompt-cache prefix-break detection + wasted-spend estimate | ✅ **available now** |
-| **M5 — Web viewer** | `ctxdiff view` / `ctxdiff export` — time-travel scrubber + self-contained HTML export | ✅ **available now** |
+- 🔌 **[One-line capture](#quickstart)** — `tracer.wrap(client)` records every LLM call's full context, verbatim, into a single-file SQLite `.ctrace`. [Fail-open by design](#fail-open-guarantee): a ctxdiff error can never break your app.
+- 🧬 **[Content-hashed block storage](#the-block-model)** — every message, content part, and tool schema is a deduplicated block; a stable system prompt across 40 turns is stored once.
+- 🌐 **[Seven provider surfaces](#supported-providers)** — OpenAI, Azure OpenAI, Anthropic, Google Gemini, AWS Bedrock (Converse), any OpenAI-compatible OSS endpoint (Ollama/vLLM/…), and LangChain via client injection.
+- 🟩🟥🟨 **[Git-style turn diffing](#ctxdiff-diff---turn-n---turn-m)** — `ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
+- 📊 **[Token attribution](#ctxdiff-tokens---turn-n)** — `ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
+- 💸 **[Prompt-cache profiling](#ctxdiff-cache)** — `ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
+- 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request dashboard with a turn scrubber, diff panel, token heatmap, cache findings, and block inspector — safe to attach to a bug ticket.
+- 🏷️ **[Semantic tagging](#semantic-tagging)** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
+- 🔒 **[Privacy first](#redaction)** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
+- ✅ **[Honest numbers](#token-counting)** — exact `tiktoken` counts for OpenAI; estimates are always *marked* as estimates, never passed off as precise.
+
+**What it doesn't do (yet):**
+
+- ⏳ **Streaming usage** — streamed calls are captured, but token `usage` isn't (the response is a stream object at record time).
+- ⏳ **Async clients** — `AsyncOpenAI` / `AsyncAnthropic` aren't intercepted yet.
+- ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
+- ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
+- ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
+- ⏳ **VS Code extension** — the dashboard will be embeddable in an editor panel.
 
 See [The CLI](#the-cli) below for every subcommand, with real sample output.
 
@@ -499,14 +511,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-v1 is complete: capture across OpenAI, Anthropic, Gemini, and Bedrock (plus Azure and OpenAI-compatible OSS endpoints via the OpenAI adapter), the diff/tokens/cache analyzers, and the CLI + HTML viewer all ship today. Next:
-
-- **VS Code extension** — embeds the same self-contained viewer used by `ctxdiff view`/`export`, inline in the editor.
-- **Live tail** — file-watch a `.ctrace` while the agent is still running, instead of post-run-only analysis.
-- **Background recording** — capture a long-lived process's runs without an explicit `tracer.close()` per session.
-- **Streaming usage capture** — today, a streamed completion (`streaming=True`) is captured but its token `usage` is not, since the interceptor sees the stream before it's consumed.
-- **A native LangChain callback integration** — replacing today's client-injection recipe with a first-class callback handler.
-- **Populating `run.models`** — currently left empty; models are tracked per-call in `params`, not yet rolled up onto the run.
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, async clients, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
 
 ---
 
