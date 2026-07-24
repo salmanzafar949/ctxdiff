@@ -39,6 +39,24 @@ Then `ctxdiff view` opens the self-contained dashboard — here debugging a **mu
 
 ---
 
+## How it's different
+
+`ctxdiff` isn't a tracing platform. Tools like LangSmith, Langfuse, and Phoenix show you a **list of calls** — a snapshot of each request, aggregated across your fleet, for monitoring cost and health over time. That's a different job.
+
+`ctxdiff` shows you the **diff between calls** — what got *added, evicted, or modified* in the context window, turn by turn, down to the character that broke your prompt-cache prefix. It's the debugger you reach for when one specific run went wrong at turn 8, not the dashboard you watch in production.
+
+|  | Observability platforms | ctxdiff |
+|---|---|---|
+| **Question** | Is my fleet healthy & cheap over time? | Why did *this* run break at turn 8? |
+| **Shows you** | A list of calls (snapshot) | The **diff** between calls (delta) |
+| **Scope** | Many runs, aggregated | One run, turn by turn |
+| **Runs** | Hosted service / self-hosted server | Local — one `pip install`, one file |
+| **Your data** | Sent to a platform | Never leaves your machine |
+
+It's built to sit **alongside** your observability stack, not replace it. Use them for "is production okay"; use `ctxdiff` for "what exactly did the model see, and what changed."
+
+---
+
 ## Features
 
 **What ctxdiff does** *(each link jumps to the details)*:
