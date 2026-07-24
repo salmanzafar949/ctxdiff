@@ -64,7 +64,9 @@
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.30",
     "@google/genai": ">=0.3",
-    "openai": ">=4"
+    "mysql2": ">=3",
+    "openai": ">=4",
+    "pg": ">=8"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
@@ -75,13 +77,22 @@
     },
     "openai": {
       "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.114.0",
     "@google/genai": "^2.13.0",
     "@types/node": "^26.1.1",
+    "@types/pg": "^8.20.0",
+    "mysql2": "^3.23.1",
     "openai": "^6.49.0",
+    "pg": "^8.22.0",
     "tsup": "^8.5.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

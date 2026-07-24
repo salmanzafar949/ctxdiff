@@ -9,7 +9,7 @@
  */
 import { diffCalls, distinctAgents, filterCalls, type TurnDiff, type InlineSegment } from "./diff.js";
 import type { Call, CallBlock } from "../models.js";
-import type { CTrace } from "../store/ctrace.js";
+import type { ReadableStore } from "../store/base.js";
 
 // --- value types -------------------------------------------------------------
 
@@ -288,7 +288,7 @@ function analyzeGroup(
  * smallest stable-prefix token count across every analyzed pair. Mirrors Python
  * `analyze_cache`.
  */
-export function analyzeCache(ct: CTrace, agent: string | null = null): CacheReport {
+export function analyzeCache(ct: ReadableStore, agent: string | null = null): CacheReport {
   const calls = filterCalls(ct.getCalls(), agent);
   const blocksByCallId = new Map<string, CallBlock[]>();
   for (const c of calls) blocksByCallId.set(c.id, ct.getCallBlocks(c.id));

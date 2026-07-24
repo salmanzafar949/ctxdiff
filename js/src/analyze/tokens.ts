@@ -10,7 +10,7 @@
 import { distinctAgents, filterCalls } from "./diff.js";
 import { pyRound1 } from "./pyround.js";
 import type { Call, CallBlock } from "../models.js";
-import type { CTrace } from "../store/ctrace.js";
+import type { ReadableStore } from "../store/base.js";
 
 // --- value types -------------------------------------------------------------
 
@@ -344,7 +344,7 @@ export function detectBloat(allCallsWithBlocks: CallBlock[][]): BloatReport | nu
  * tokens, run bloat detection once across the analyzed calls, and compute the
  * per-agent token breakdown. Mirrors Python `analyze_run`.
  */
-export function analyzeRun(ct: CTrace, agent: string | null = null): RunTokens {
+export function analyzeRun(ct: ReadableStore, agent: string | null = null): RunTokens {
   const calls = filterCalls(ct.getCalls(), agent);
   const allCallsWithBlocks = calls.map((c) => ct.getCallBlocks(c.id));
   const callTokens = calls.map((call, i) => analyzeCall(call, allCallsWithBlocks[i]));

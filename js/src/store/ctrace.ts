@@ -491,9 +491,13 @@ export class CTrace {
 
     // Roll this call's model up onto the run — `model` covers openai/anthropic/
     // gemini; `modelId` covers bedrock's Converse shape.
+    // `||`, not `??`: Python spells this `params.get("model") or
+    // params.get("modelId")`, so an EMPTY model falls through to the Bedrock
+    // spelling rather than being rolled up as a blank. (`noteModel` ignores
+    // falsy models either way, so no stored file changes.)
     const model =
-      (params["model"] as string | undefined) ??
-      (params["modelId"] as string | undefined) ??
+      (params["model"] as string | undefined) ||
+      (params["modelId"] as string | undefined) ||
       null;
     // Guarded: the call above is ALREADY COMMITTED, so a failure of the
     // best-effort roll-up must not propagate out of recordCall — that would make

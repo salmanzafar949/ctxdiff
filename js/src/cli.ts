@@ -10,17 +10,27 @@
  */
 import { parseArgs } from "node:util";
 import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { platform } from "node:process";
 import { CTrace } from "./store/ctrace.js";
+import {
+  EmptyStoreError,
+  isFileBackend,
+  type ReadableStore,
+  type Session,
+  type StoreBackend,
+} from "./store/base.js";
+import { resolve as resolveConfigured } from "./store/config.js";
+import { SQLiteStore } from "./store/sqlite.js";
+import { snapshotStore } from "./store/snapshot.js";
 import { diffTurns } from "./analyze/diff.js";
 import { analyzeRun, registeredToolNames } from "./analyze/tokens.js";
 import { analyzeCache } from "./analyze/cache.js";
 import { listRuns } from "./analyze/runs.js";
-import { exportHtml } from "./viewer/export.js";
+import { exportHtml, exportStore } from "./viewer/export.js";
 import { buildDemoTrace } from "./demo.js";
 import {
   renderTurnDiff,
@@ -48,12 +58,111 @@ function findDefaultRun(dir: string): string | null {
   );
 }
 
-/** Resolve the `.ctrace` path to open: explicit value if given (positional or
- * `--run`), else the most recently modified `*.ctrace` in the cwd. Mirrors
- * Python `_resolve_run_path`. */
-function resolveRunPath(explicit: string | undefined): string | null {
-  if (explicit) return explicit;
-  return findDefaultRun(process.cwd());
+/**
+ * A trace opened for READING, whichever backend it came from: a `CTrace` on a
+ * local file, or an in-memory snapshot of one session of a Postgres/MySQL store.
+ * Both are synchronous and both close the same way, so every command below reads
+ * one of these without knowing which it got.
+ *
+ * Deliberately just ONE session's worth of reading plus `close`. `ctxdiff runs`
+ * is the only command that wants a store's whole session list, and it takes its
+ * own path to it (`runsFromStore`) rather than snapshotting a run it does not
+ * need — see `store/snapshot.ts` for why that listing is not free.
+ */
+interface Reader extends ReadableStore {
+  close(): void;
+}
+
+/** No trace to read: no `--run`, no configured backend, and no `*.ctrace` in the
+ * working directory. Its own type so callers can print the friendly "did the run
+ * capture?" line for this case while still reporting a genuine open FAILURE
+ * (corrupt file, unreachable database) as an error. Mirrors Python
+ * `_NoTraceFound`. */
+class NoTraceFound extends Error {}
+
+/**
+ * Open the store the read commands should analyze, and report the default HTML
+ * output path that goes with it (null when there is no file to derive one from —
+ * a networked store).
+ *
+ * Resolution mirrors the write side's explicit-beats-ambient rule:
+ * 1. `--run PATH` (or the positional) — always that file. A path names a file,
+ *    so it wins even when a database is configured.
+ * 2. A configured NETWORKED backend (`configure()` / `CTXDIFF_STORE`) — read its
+ *    newest session, materialized into a snapshot so the synchronous analyzers
+ *    can consume it (see `store/snapshot.ts`). Detected by the ABSENCE of
+ *    `pathFor`, the same file-backend capability check `Tracer` uses, rather than
+ *    an instanceof chain against every backend class.
+ * 3. A configured SQLite backend pointing at a concrete file — that file, opened
+ *    THROUGH the backend so the read side goes via the same protocol the write
+ *    side does.
+ * 4. Nothing configured — the most recently modified `*.ctrace` in the cwd,
+ *    exactly as before.
+ *
+ * Throws `NoTraceFound` when nothing resolves, and lets a real open error
+ * (corrupt file, dead database, missing driver) propagate with its own message.
+ */
+async function openSource(
+  explicit: string | undefined,
+): Promise<{ reader: Reader; htmlDefault: string | null }> {
+  if (explicit) return { reader: CTrace.open(explicit), htmlDefault: defaultHtmlFor(explicit) };
+
+  const backend = resolveConfigured();
+  if (backend !== null && !isFileBackend(backend)) {
+    return { reader: await snapshotStore(await backend.openReader()), htmlDefault: null };
+  }
+  if (backend !== null) {
+    const configuredPath = (backend as SQLiteStore).path;
+    if (configuredPath && !isDirectory(configuredPath)) {
+      return {
+        reader: backend.openReader() as CTrace,
+        htmlDefault: defaultHtmlFor(configuredPath),
+      };
+    }
+  }
+
+  const path = findDefaultRun(process.cwd());
+  if (path === null) throw new NoTraceFound();
+  return { reader: CTrace.open(path), htmlDefault: defaultHtmlFor(path) };
+}
+
+/** Whether `path` is an existing directory — used to tell a configured
+ * `SQLiteStore` that names ONE file from one that names a directory of them. */
+function isDirectory(path: string): boolean {
+  const st = statSync(path, { throwIfNoEntry: false });
+  return st !== undefined && st.isDirectory();
+}
+
+/** The dashboard path `export`/`view` default to for a file-backed trace:
+ * `<trace-stem>.html` right beside the trace — unchanged from when the CLI
+ * passed the path straight to `exportHtml`. */
+function defaultHtmlFor(ctracePath: string): string {
+  const abs = resolve(ctracePath);
+  const stem = basename(abs).replace(/\.[^.]*$/, "");
+  return join(dirname(abs), `${stem}.html`);
+}
+
+/**
+ * Print the right message for a failed `openSource` and return the exit code, so
+ * all five read commands report identically: the friendly "did the run capture?"
+ * line when there was nothing to open, and `ctxdiff: <error>` for a genuine
+ * failure — both exit 1.
+ *
+ * The prefix is added only when the message does not ALREADY carry it: most
+ * errors ctxdiff raises itself are spelled `ctxdiff: ...` so they read correctly
+ * wherever they surface, and blindly prepending here produced "ctxdiff: ctxdiff:
+ * no sessions recorded", which reads like a bug in the tool.
+ */
+function reportOpenFailure(err: unknown): number {
+  if (err instanceof NoTraceFound) {
+    process.stderr.write("no .ctrace here — did the run capture?\n");
+    return 1;
+  }
+  const message = (err as Error).message ?? String(err);
+  process.stderr.write(
+    (message.startsWith("ctxdiff:") ? message : `ctxdiff: ${message}`) + "\n",
+  );
+  return 1;
 }
 
 interface ParsedArgs {
@@ -132,24 +241,8 @@ function parseCommon(rest: string[]): ParsedArgs {
   };
 }
 
-/** Open a `.ctrace`, printing the Python-style "no .ctrace here" / open-error
- * messages to stderr and returning null on failure. */
-function openOrReport(explicit: string | undefined): CTrace | null {
-  const path = resolveRunPath(explicit);
-  if (path === null) {
-    process.stderr.write("no .ctrace here — did the run capture?\n");
-    return null;
-  }
-  try {
-    return CTrace.open(path);
-  } catch (err) {
-    process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
-    return null;
-  }
-}
-
 /** `ctxdiff diff --turn N --turn M [--agent A] [--run PATH]`. */
-function cmdDiff(rest: string[]): number {
+async function cmdDiff(rest: string[]): Promise<number> {
   const args = parseCommon(rest);
   if (args.turns.length !== 2) {
     process.stderr.write(
@@ -158,8 +251,12 @@ function cmdDiff(rest: string[]): number {
     );
     return 2;
   }
-  const ct = openOrReport(args.run);
-  if (ct === null) return 1;
+  let ct: Reader;
+  try {
+    ({ reader: ct } = await openSource(args.run));
+  } catch (err) {
+    return reportOpenFailure(err);
+  }
   try {
     const [turnOld, turnNew] = args.turns;
     if (args.agent !== null) {
@@ -188,10 +285,14 @@ function cmdDiff(rest: string[]): number {
 }
 
 /** `ctxdiff tokens [--turn N] [--agent A] [--run PATH]`. */
-function cmdTokens(rest: string[]): number {
+async function cmdTokens(rest: string[]): Promise<number> {
   const args = parseCommon(rest);
-  const ct = openOrReport(args.run);
-  if (ct === null) return 1;
+  let ct: Reader;
+  try {
+    ({ reader: ct } = await openSource(args.run));
+  } catch (err) {
+    return reportOpenFailure(err);
+  }
   try {
     // tokens' --turn is single: last value wins (matching argparse without append).
     const turn = args.turns.length ? args.turns[args.turns.length - 1] : null;
@@ -232,10 +333,14 @@ function cmdTokens(rest: string[]): number {
 }
 
 /** `ctxdiff cache [--agent A] [--run PATH]`. */
-function cmdCache(rest: string[]): number {
+async function cmdCache(rest: string[]): Promise<number> {
   const args = parseCommon(rest);
-  const ct = openOrReport(args.run);
-  if (ct === null) return 1;
+  let ct: Reader;
+  try {
+    ({ reader: ct } = await openSource(args.run));
+  } catch (err) {
+    return reportOpenFailure(err);
+  }
   try {
     process.stdout.write(renderCacheReport(analyzeCache(ct, args.agent)) + "\n");
     return 0;
@@ -244,9 +349,71 @@ function cmdCache(rest: string[]): number {
   }
 }
 
-/** `ctxdiff runs`: list every `*.ctrace` in the cwd. No flags (matches Python). */
-function cmdRuns(): number {
+/**
+ * `ctxdiff runs`: list the sessions ctxdiff can see. No flags (matches Python).
+ *
+ * Where it looks mirrors `openSource` (and therefore every other read command):
+ * a configured NETWORKED backend, or a configured SQLite backend naming ONE
+ * concrete file, is listed session-by-session through the store protocol; with
+ * nothing configured it falls back to listing every `*.ctrace` in the cwd. Why
+ * that matters: with `CTXDIFF_STORE` set, a `runs` that globbed the working
+ * directory would answer "no .ctrace files" about a machine whose traces all
+ * live in Postgres.
+ */
+async function cmdRuns(): Promise<number> {
+  try {
+    const backend = resolveConfigured();
+    if (backend !== null) {
+      const configuredPath = isFileBackend(backend) ? (backend as SQLiteStore).path : null;
+      if (!isFileBackend(backend) || (configuredPath && !isDirectory(configuredPath))) {
+        return await runsFromStore(backend);
+      }
+    }
+  } catch (err) {
+    // A bad DSN or a dead database is reported, not crashed.
+    return reportOpenFailure(err);
+  }
   process.stdout.write(renderRunsList(listRuns(process.cwd())) + "\n");
+  return 0;
+}
+
+/**
+ * List `ctxdiff runs` out of a CONFIGURED store rather than the cwd: one row per
+ * SESSION (oldest first) keyed by a short session id instead of a filename,
+ * since a store holds many sessions and no filenames at all. Turn counts and
+ * agent lists come straight off the `Session` summary, so this is one query set
+ * rather than an open-per-file. An EMPTY store is not an error — it prints an
+ * empty listing and exits 0, exactly as an empty directory does.
+ */
+async function runsFromStore(backend: StoreBackend): Promise<number> {
+  const empty = "no sessions in the configured store";
+  let sessions: Session[];
+  try {
+    // Straight through the store protocol rather than via `openSource`: a
+    // listing needs the session SUMMARIES only, and snapshotting would drag the
+    // newest session's every call and block across the network to print one line
+    // per session.
+    const reader = await backend.openReader();
+    try {
+      sessions = await reader.listSessions();
+    } finally {
+      await reader.close();
+    }
+  } catch (err) {
+    if (err instanceof EmptyStoreError) {
+      process.stdout.write(renderRunsList([], empty) + "\n");
+      return 0;
+    }
+    throw err;
+  }
+  const rows = sessions.map((s) => ({
+    filename: s.id.slice(0, 12),
+    project: s.project,
+    provider: s.provider,
+    turns: s.turnCount,
+    agents: s.agents.length ? s.agents.join(", ") : "-",
+  }));
+  process.stdout.write(renderRunsList(rows, empty) + "\n");
   return 0;
 }
 
@@ -296,47 +463,60 @@ function parseViewerArgs(
 
 /** `ctxdiff export [--run PATH] [--out FILE.html]`: write a self-contained HTML
  * dashboard beside the trace (or to `--out`) and print the path. */
-function cmdExport(rest: string[]): number {
+async function cmdExport(rest: string[]): Promise<number> {
   const { values, positionals } = parseViewerArgs(rest, {
     run: { type: "string" },
     out: { type: "string" },
   });
   const explicit = (values.run as string | undefined) ?? (positionals[0] as string | undefined);
-  const path = resolveRunPath(explicit);
-  if (path === null) {
-    process.stderr.write("no .ctrace here — did the run capture?\n");
-    return 1;
-  }
   try {
-    const out = exportHtml(path, values.out as string | undefined);
+    const out = await writeDashboard(explicit, values.out as string | undefined);
     process.stdout.write(out + "\n");
     return 0;
   } catch (err) {
-    process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
-    return 1;
+    return reportOpenFailure(err);
+  }
+}
+
+/**
+ * Render a dashboard for whichever trace `openSource` resolves and return the
+ * path written. `out` wins; otherwise the trace's own `<stem>.html` is used, and
+ * a store with no file (Postgres/MySQL) says so rather than inventing a
+ * filename. Shared by `export` and `view` so both reach a database identically.
+ */
+async function writeDashboard(
+  explicit: string | undefined,
+  out: string | undefined,
+): Promise<string> {
+  const { reader, htmlDefault } = await openSource(explicit);
+  try {
+    const target = out ?? htmlDefault;
+    if (target === null) {
+      throw new Error(
+        "ctxdiff: the configured store has no file to name the dashboard after " +
+          "— pass --out FILE.html",
+      );
+    }
+    return exportStore(reader, target);
+  } finally {
+    reader.close();
   }
 }
 
 /** `ctxdiff view [--run PATH] [--no-open]`: export the dashboard to a temp file,
  * print its path, and open it in the browser unless `--no-open`. */
-function cmdView(rest: string[]): number {
+async function cmdView(rest: string[]): Promise<number> {
   const { values, positionals } = parseViewerArgs(rest, {
     run: { type: "string" },
     "no-open": { type: "boolean" },
   });
   const explicit = (values.run as string | undefined) ?? (positionals[0] as string | undefined);
-  const path = resolveRunPath(explicit);
-  if (path === null) {
-    process.stderr.write("no .ctrace here — did the run capture?\n");
-    return 1;
-  }
   const tmp = join(tmpdir(), `ctxdiff-${randomUUID()}.html`);
   let out: string;
   try {
-    out = exportHtml(path, tmp);
+    out = await writeDashboard(explicit, tmp);
   } catch (err) {
-    process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
-    return 1;
+    return reportOpenFailure(err);
   }
   process.stdout.write(out + "\n");
   if (!values["no-open"]) openInBrowser(out);
@@ -407,23 +587,23 @@ const USAGE =
 
 /** Dispatch on the first argument (the command); return an exit code. With no
  * command, print usage and return 2 (matching the Python CLI's convention). */
-export function main(argv: string[]): number {
+export async function main(argv: string[]): Promise<number> {
   const command = argv[0];
   const rest = argv.slice(1);
   try {
     switch (command) {
       case "diff":
-        return cmdDiff(rest);
+        return await cmdDiff(rest);
       case "tokens":
-        return cmdTokens(rest);
+        return await cmdTokens(rest);
       case "cache":
-        return cmdCache(rest);
+        return await cmdCache(rest);
       case "runs":
-        return cmdRuns();
+        return await cmdRuns();
       case "export":
-        return cmdExport(rest);
+        return await cmdExport(rest);
       case "view":
-        return cmdView(rest);
+        return await cmdView(rest);
       case "demo":
         return cmdDemo(rest);
       default:
@@ -449,5 +629,15 @@ if (
   process.argv[1] &&
   (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.cjs"))
 ) {
-  process.exit(main(process.argv.slice(2)));
+  // `main` is async now (a configured database is read over the network), so the
+  // exit is deferred to its resolution. The catch is the last fail-safe: an
+  // unexpected rejection prints one line and exits 2 rather than surfacing an
+  // unhandled-rejection stack trace to the user.
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (err: unknown) => {
+      process.stderr.write(`ctxdiff: error: ${(err as Error).message}\n`);
+      process.exit(2);
+    },
+  );
 }

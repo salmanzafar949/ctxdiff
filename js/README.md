@@ -38,7 +38,7 @@ Then `npx ctxdiff view` opens the self-contained dashboard — a turn scrubber, 
 > ```
 > A realistic research-pipeline run (two agents, real SDK shapes, zero network) already showing turn diffs, token/schema-bloat, a cache-prefix break, and an agent hand-off.
 
-**Jump to:** [How it's different](#how-its-different) · [Features](#features) · [Install](#install) · [Quickstart](#quickstart) · [The CLI](#the-cli) · [HTML dashboard](#html-dashboard) · [Providers](#providers) · [How it works](#how-it-works) · [Provider recipes](#provider-recipes) · [The `.ctrace` format](#the-ctrace-format) · [Design principles](#design-principles) · [Contributing](#contributing)
+**Jump to:** [How it's different](#how-its-different) · [Features](#features) · [Install](#install) · [Quickstart](#quickstart) · [The CLI](#the-cli) · [HTML dashboard](#html-dashboard) · [Storage backends](#storage-backends) · [Providers](#providers) · [How it works](#how-it-works) · [Provider recipes](#provider-recipes) · [The `.ctrace` format](#the-ctrace-format) · [Design principles](#design-principles) · [Contributing](#contributing)
 
 ---
 
@@ -73,6 +73,7 @@ It's built to sit **alongside** your observability stack, not replace it.
 - 🖥️ **Self-contained HTML dashboard** — `npx ctxdiff view` / `export`: a one-file, zero-external-request dashboard with a turn scrubber, diff panel, token heatmap, cache findings, and block inspector — safe to attach to a bug ticket.
 - 🏷️ **Semantic tagging** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
 - 🤝 **Multi-agent runs** — `tracer.wrap(client, { agent: "researcher" })` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters `diff`/`tokens`/`cache`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
+- 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `configure({ store: new PostgresStore({ dsn }) })` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, the drivers are optional peers, and a dead database degrades capture without ever touching your agent.
 - 🔒 **Privacy first** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **Honest numbers** — exact `o200k_base` token counts for OpenAI (matching Python's `tiktoken`); estimates are always *marked* as estimates.
 
@@ -81,7 +82,7 @@ It's built to sit **alongside** your observability stack, not replace it.
 - ⏳ **AWS Bedrock** — supported in the Python SDK, not yet ported to JS.
 - ⏳ **Abandoned streams** — a stream you obtain but *never iterate at all* isn't recorded. JS has no deterministic finalizer, and GC-timed `FinalizationRegistry` recording was deliberately avoided; streams that are consumed, broken out of early, errored, or exhausted all record. (In practice you always iterate a stream you asked for.)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent runs.
-- ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost).
+- ⏳ **Background recording (local file only)** — writing to the local `.ctrace` is synchronous on the call path (fast, but not zero-cost); a [database backend](#storage-backends) already writes off it, via a serial background writer.
 - ℹ️ **Cross-language diff edge** — an integer-valued float inside a JSON-Schema numeric keyword (e.g. `default: 3.0`) normalizes as `3` in JS vs `3.0` in Python, so the *same tool schema authored in both SDKs* would hash differently. This affects only a cross-language diff; JS→Python reads are unaffected (readers never re-hash) and single-language dedup is fully consistent. See [`spec/ctrace-schema.md`](../spec/ctrace-schema.md).
 
 ---
@@ -95,6 +96,13 @@ npm i ctxdiff
 ```
 
 The only runtime dependency is a pure-JS tokenizer (`gpt-tokenizer`) for exact OpenAI token counts. The provider SDKs (`openai`, `@anthropic-ai/sdk`, `@google/genai`) are **optional peer dependencies** — `ctxdiff` wraps whatever client you already use, and never imports them itself.
+
+Storage is a local `.ctrace` file by default, with nothing extra to install. To keep traces in a database you already run, add the matching driver — see [Storage backends](#storage-backends):
+
+```bash
+npm i pg        # PostgreSQL
+npm i mysql2    # MySQL / MariaDB
+```
 
 ---
 
@@ -139,7 +147,7 @@ ct.close();
 | `diff --turn N --turn M` | git-style block diff between two turns (char-level inline diffs) |
 | `tokens [--turn N]` | per-label token heatmap, provider reconciliation, schema-bloat report |
 | `cache` | prompt-cache prefix-break profiler + price-free wasted-spend estimate |
-| `runs` | list `.ctrace` files in the working directory |
+| `runs` | list `.ctrace` files in the working directory (or, with a [database configured](#storage-backends), that store's sessions) |
 | `view [--no-open]` | open a self-contained HTML dashboard in your browser |
 | `export [--out FILE.html]` | write a self-contained HTML dashboard for a run |
 | `demo [--out FILE] [--keep] [--no-open]` | build a sample multi-agent dashboard — no API keys, no setup |
@@ -153,6 +161,88 @@ Common options: `--agent A` scopes to one agent; `--run PATH` picks a trace (def
 `npx ctxdiff view` (or `export`) produces **one HTML file** with everything inline — no CDN, no fonts, no external request of any kind — so it's safe to attach to a bug ticket or open offline. All trace text is HTML-escaped and rendered via `textContent`, never `innerHTML`, so untrusted trace data can never execute. It renders byte-identically to the Python viewer.
 
 Panels: a turn scrubber, agent chips + filtering, the block diff for the selected turn, a token-allocation heatmap, cache-break findings, a full block inspector, and a context-growth chart — light and dark themes.
+
+---
+
+## Storage backends
+
+By default `ctxdiff` is **local-first and zero-config**: `trace.init("my-agent")` writes `./my-agent.ctrace`, a plain SQLite file you can open, query, email or attach to a ticket. Nothing to install, nothing to run, no server. That default never changes on its own — everything below is opt-in.
+
+When you'd rather keep traces in a database you already run (a shared team dashboard, an agent fleet across many containers, a place where `.ctrace` files can't live), point `ctxdiff` at it **once** and every later `trace.init()` follows:
+
+```ts
+import { configure, trace, PostgresStore } from "ctxdiff";
+
+configure({ store: new PostgresStore({ dsn: "postgresql://user:pw@db.internal/agents" }) });
+
+// ...from here on, unchanged:
+const tracer = trace.init("support-agent");
+const client = tracer.wrap(new OpenAI());
+```
+
+Or set an environment variable and change **no code at all**:
+
+```bash
+export CTXDIFF_STORE=postgresql://user:pw@db.internal/agents   # PostgreSQL
+export CTXDIFF_STORE=mysql://user:pw@db.internal/agents        # MySQL / MariaDB
+export CTXDIFF_STORE=sqlite:///var/lib/ctxdiff/agents.ctrace   # one SQLite file
+export CTXDIFF_STORE=~/traces                                  # a directory: ~/traces/<project>.ctrace
+```
+
+The value is a **location**, not a backend name: `CTXDIFF_STORE=postgres` is rejected with a message showing the URL form, rather than quietly creating a local SQLite file called `postgres`.
+
+### The three backends
+
+| Backend | Install | Configure with |
+|---|---|---|
+| **SQLite** (default) | — built in (`node:sqlite`) | nothing, or `new SQLiteStore({ path })` |
+| **PostgreSQL** | `npm i pg` | `new PostgresStore({ dsn: "postgresql://..." })` |
+| **MySQL / MariaDB** | `npm i mysql2` | `new MySQLStore({ dsn: "mysql://..." })` |
+
+The drivers ([`pg`](https://node-postgres.com/) and [`mysql2`](https://sidorares.github.io/node-mysql2/)) are **optional peer dependencies, imported lazily at connect time**. `ctxdiff`'s core still has exactly one runtime dependency (`gpt-tokenizer`), `import "ctxdiff"` never loads a database driver, and a store configured for a backend whose driver isn't installed tells you what to install instead of crashing.
+
+### Tables are created for you
+
+On first connect the adapter runs `CREATE TABLE IF NOT EXISTS` for its four tables — `ctxdiff_run`, `ctxdiff_call`, `ctxdiff_block`, `ctxdiff_call_block` — in whatever database the DSN points at. **There is no migration step.** The tables are prefixed because they live in a database you share with your own application, and connecting again is a harmless no-op.
+
+It's the same logical model as a `.ctrace` file, in every backend: sessions, calls, content-hashed blocks stored **once** and referenced by position, and call→block membership. Analyzers can't tell the difference — the same conformance suite runs against all three, against real PostgreSQL and MySQL servers as well as SQLite. The tables and columns match the **Python** SDK's exactly, so a database written by either SDK reads in the other.
+
+Same *semantics*, too, not just the same shape:
+
+- **Sessions are ordered by write order**, never by `startedAt`. Several containers writing into one database will disagree about the clock; ordering by an insert-order column (SQLite's `rowid`, `BIGSERIAL`, `AUTO_INCREMENT`) means "the newest session" is the one written last on every backend, and stays stable between reads.
+- **Keys compare byte-exactly.** MySQL's default collation is case-insensitive, which would make two content hashes differing only in case the same block; ctxdiff pins `ascii_bin` on its id/hash columns so content-addressed dedup means what it says.
+- **Free-text columns are unbounded** on every backend, so a 400-character provider error or tag label stores rather than rejecting the call.
+
+### Reading from a database
+
+The CLI and the dashboard read from the configured store too. With `CTXDIFF_STORE` set (or after `configure()`), the read commands analyze the **newest session** in the database rather than looking for a `.ctrace` in the working directory:
+
+```bash
+npx ctxdiff tokens                   # newest session in the configured store
+npx ctxdiff diff --turn 7 --turn 8
+npx ctxdiff runs                     # every session in the store, oldest first
+npx ctxdiff export --out run.html    # same self-contained dashboard
+```
+
+`--run PATH` always wins: a path names a file, so it reads that `.ctrace` even when a database is configured. The same rule applies on the write side — `trace.init(project, { path })` is always a local file. `export`/`view` need an explicit `--out` against a database, since there is no trace filename to derive one from.
+
+### A database is never allowed to break your agent
+
+The [fail-open guarantee](#fail-open-guarantee) covers a networked store completely, and matters more there than for a local file — Node runs your agent on ONE thread, so anything that waits is something your whole process waits for:
+
+- **No database I/O ever happens on your call path.** Not the writes, and not the connect either: `tracer.wrap()` builds a queue and returns, and the run's single writer opens the session in the background. A database that is slow, wedged or absent costs your agent nothing, and the event loop keeps turning throughout.
+- **Every wait is bounded.** Connects (5s) and statements (10s, both configurable) are bounded server-side *and* client-side, because a server-side `statement_timeout` can never fire when the packets carrying its verdict are the ones being dropped. TCP keepalives catch a peer that dies while the connection is idle, and `tracer.close()` is bounded by the store's own statement timeout — a wedged database can slow your shutdown, never prevent it.
+- **A dead database degrades capture, never the run.** If the store can't be reached or created, `ctxdiff` logs **one** warning, records nothing, and your calls run exactly as if `ctxdiff` weren't there. It never silently falls back to writing a local file you didn't ask for.
+- **A connection killed mid-run is reopened.** A pooler recycle, a failover or a database restart costs the write that was in flight, not the rest of the run.
+- **A typo'd DSN behaves the same way** — a misconfigured trace destination is a tracing problem, and tracing problems must not take down the program being traced.
+
+`await tracer.close()` is the flush point for a database-backed run: it drains the queue and closes the connection. (For the local `.ctrace` the write is synchronous, so `tracer.close()` behaves exactly as it always has.)
+
+If you *forget* `close()`, your program still **exits normally** — the tracing connection is detached from Node's event loop, so it can never hold a finished process open. The cost is the writes still queued at exit, which is the right trade: a debugging tool that stops your script from ending would be a much worse bug than a lost final turn.
+
+### Writing your own backend
+
+`Store` and `StoreBackend` (exported from `ctxdiff`) are small structural interfaces — seven methods and two, respectively. Anything satisfying them can be passed to `configure({ store })`; no base class, no registration. Every method may return a value *or* a promise, which is how one protocol serves both the synchronous `node:sqlite` store and the promise-based network ones.
 
 ---
 
@@ -251,7 +341,7 @@ The block is hashed and token-counted **before** redaction, so identity/dedup st
 
 ### Fail-open guarantee
 
-Wrapping is **absolute** fail-open: it never throws into your app, never breaks stream iteration, never drops/reorders/delays a chunk, and never alters your request. If tracing can't run, your app runs unchanged.
+Wrapping is **absolute** fail-open: it never throws into your app, never breaks stream iteration, never drops/reorders/delays a chunk, and never alters your request. If tracing can't run, your app runs unchanged. With a [database backend](#storage-backends) it goes further: no store I/O of any kind — not even the connect — sits on your call path, and every wait ctxdiff makes is bounded, so a wedged database cannot stall your event loop or hang your shutdown.
 
 ### Token counting
 

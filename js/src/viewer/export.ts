@@ -17,6 +17,7 @@
 import { writeFileSync } from "node:fs";
 import { basename, dirname, resolve, join } from "node:path";
 import { CTrace } from "../store/ctrace.js";
+import type { ReadableStore } from "../store/base.js";
 import type { Call, CallBlock } from "../models.js";
 import { diffTurns, distinctAgents, type DiffEntry, type TurnDiff } from "../analyze/diff.js";
 import { analyzeRun, type RunTokens } from "../analyze/tokens.js";
@@ -155,7 +156,7 @@ function serializeCache(cr: CacheReport): Record<string, unknown> {
  * pure analyzers (single source of truth) and serializes their results with the
  * SAME field order as the Python builder. Mirrors Python `build_payload`.
  */
-export function buildPayload(ct: CTrace): Record<string, unknown> {
+export function buildPayload(ct: ReadableStore): Record<string, unknown> {
   const run = ct.getRun();
   const calls = ct.getCalls();
   const blocksByCall = new Map<string, CallBlock[]>();
@@ -277,9 +278,6 @@ export function exportHtml(ctracePath: string, outPath?: string): string {
     ct.close();
   }
 
-  const project = (payload.run as { project: string }).project;
-  const document = renderPage(htmlEscape(`ctxdiff — ${project}`), embedJson(payload));
-
   let out = outPath;
   if (out === undefined) {
     const abs = resolve(ctracePath);
@@ -287,6 +285,30 @@ export function exportHtml(ctracePath: string, outPath?: string): string {
     out = join(dirname(abs), `${stem}.html`);
   }
 
-  writeFileSync(out, document, "utf-8");
+  writeFileSync(out, renderPayload(payload), "utf-8");
   return out;
+}
+
+/**
+ * Export an already-open READER — a `CTrace`, or an in-memory snapshot of a
+ * Postgres/MySQL session (see `store/snapshot.ts`) — to a self-contained HTML
+ * dashboard at `outPath`, returning the path written.
+ *
+ * The counterpart to `exportHtml` for stores that have no file: `--out` (or
+ * `view`'s temp file) is REQUIRED here precisely because there is no trace path
+ * to derive `<stem>.html` from. Everything downstream of `buildPayload` is
+ * shared, so a dashboard rendered from a database is byte-identical to one
+ * rendered from the equivalent `.ctrace`. Mirrors Python `export_store`.
+ */
+export function exportStore(reader: ReadableStore, outPath: string): string {
+  writeFileSync(outPath, renderPayload(buildPayload(reader)), "utf-8");
+  return outPath;
+}
+
+/** Render one payload into the full standalone document — the last step both
+ * export entry points share, kept in one place so a file-backed and a
+ * database-backed dashboard can never drift. */
+function renderPayload(payload: Record<string, unknown>): string {
+  const project = (payload.run as { project: string }).project;
+  return renderPage(htmlEscape(`ctxdiff — ${project}`), embedJson(payload));
 }

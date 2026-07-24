@@ -30,9 +30,13 @@ beforeAll(() => {
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 /** Run the JS CLI in-process, capturing everything it writes to stdout AND
- * stderr. `main` is synchronous (all analyzers are), so both buffers are
- * complete when it returns. */
-function runJs(argv: string[], cwd?: string): { code: number; out: string; err: string } {
+ * stderr. `main` is async — a configured database backend is read over the
+ * network — so it is awaited here; the analyzers themselves are still
+ * synchronous, so both buffers are complete when it resolves. */
+async function runJs(
+  argv: string[],
+  cwd?: string,
+): Promise<{ code: number; out: string; err: string }> {
   const outChunks: string[] = [];
   const errChunks: string[] = [];
   const origOut = process.stdout.write.bind(process.stdout);
@@ -45,7 +49,7 @@ function runJs(argv: string[], cwd?: string): { code: number; out: string; err: 
   if (cwd) process.chdir(cwd);
   let code: number;
   try {
-    code = main(argv);
+    code = await main(argv);
   } finally {
     process.stdout.write = origOut;
     process.stderr.write = origErr;
@@ -128,9 +132,9 @@ beforeAll(() => {
 });
 
 describe.skipIf(!hasVenv)("cross-language analyzer conformance (JS output === Python output)", () => {
-  it("diff / tokens / cache produce byte-identical output to the Python CLI", () => {
+  it("diff / tokens / cache produce byte-identical output to the Python CLI", async () => {
     for (const c of CASES) {
-      const js = runJs(c.argv);
+      const js = await runJs(c.argv);
       const py = runPy(c.argv);
       expect(py.code, `python failed for ${c.name}`).toBe(0);
       expect(js.code, `js failed for ${c.name}`).toBe(0);
@@ -138,16 +142,16 @@ describe.skipIf(!hasVenv)("cross-language analyzer conformance (JS output === Py
     }
   });
 
-  it("runs listing is byte-identical (same cwd)", () => {
-    const js = runJs(["runs"], dir);
+  it("runs listing is byte-identical (same cwd)", async () => {
+    const js = await runJs(["runs"], dir);
     const py = runPy(["runs"], dir);
     expect(py.code).toBe(0);
     expect(js.out).toBe(py.out);
   });
 
-  it("error paths: exit codes and error messages match the Python CLI", () => {
+  it("error paths: exit codes and error messages match the Python CLI", async () => {
     for (const c of ERROR_CASES) {
-      const js = runJs(c.argv);
+      const js = await runJs(c.argv);
       const py = runPy(c.argv);
       // Exit code must match Python exactly.
       expect(js.code, `exit code mismatch for ${c.name}`).toBe(py.code);

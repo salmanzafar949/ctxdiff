@@ -8,7 +8,7 @@
 import { SequenceMatcher } from "./sequence-matcher.js";
 import type { Block, CallBlock } from "../models.js";
 import type { Call } from "../models.js";
-import type { CTrace } from "../store/ctrace.js";
+import type { ReadableStore } from "../store/base.js";
 
 // --- agent-awareness helpers -------------------------------------------------
 
@@ -22,7 +22,7 @@ export function filterCalls(calls: Call[], agent: string | null): Call[] {
 
 /** Load every call from `ct` and filter to `agent` (null = whole run). Mirrors
  * Python `agent_calls`. */
-export function agentCalls(ct: CTrace, agent: string | null): Call[] {
+export function agentCalls(ct: ReadableStore, agent: string | null): Call[] {
   return filterCalls(ct.getCalls(), agent);
 }
 
@@ -312,7 +312,7 @@ export function diffCalls(
  * blocks, and delegate to `diffCalls`. Throws a clear Error if either turn has
  * no matching call. Mirrors Python `diff_turns`.
  */
-export function diffTurns(ct: CTrace, turnOld: number, turnNew: number): TurnDiff {
+export function diffTurns(ct: ReadableStore, turnOld: number, turnNew: number): TurnDiff {
   const calls = ct.getCalls();
   const bySeq = new Map<number, Call>(calls.map((c) => [c.seq, c]));
   const missing = [turnOld, turnNew].filter((s) => !bySeq.has(s));

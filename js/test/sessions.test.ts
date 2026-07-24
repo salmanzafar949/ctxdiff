@@ -196,12 +196,15 @@ describe("project-scoped store: UTC-canonical timestamps", () => {
 describe("project-scoped store: fail-open on setup failure", () => {
   it("a store-setup failure never breaks the host call (records nothing)", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // Point the store at a DIRECTORY path: `new DatabaseSync(dir)` cannot open it
-    // and throws, forcing the wrap()-time setup fail-open branch.
+    // Point the store at a file inside a directory that does NOT exist:
+    // `new DatabaseSync(path)` cannot create it and throws, forcing the
+    // wrap()-time setup fail-open branch. (An existing DIRECTORY is no longer a
+    // failure — `SQLiteStore` reads it as "a directory of .ctrace files" and
+    // resolves `<dir>/<project>.ctrace`, matching the Python backend.)
     const dir = mkdtempSync(join(tmpdir(), "ctxdiff-faildir-"));
     created.push(dir);
 
-    const tracer = init("failopen", { path: dir });
+    const tracer = init("failopen", { path: join(dir, "no-such-subdir", "x.ctrace") });
     const wrapped = tracer.wrap(stubClient(), { agent: "a" }) as OpenAI;
 
     // The host call still runs and returns its real response.

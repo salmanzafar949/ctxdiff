@@ -17,6 +17,30 @@ export { init, Tracer } from "./trace.js";
 export type { InitOptions, WrapOptions } from "./trace.js";
 export { CTrace, parseStartedAt } from "./store/ctrace.js";
 export { SCHEMA_VERSION, DDL } from "./store/schema.js";
+
+// --- pluggable storage (parity with Python's `ctxdiff.store`) ---------------
+// Local-first stays the default: with nothing configured, `trace.init(project)`
+// writes `./<project>.ctrace` exactly as before. `configure({ store })` — or
+// `CTXDIFF_STORE` with no code change at all — points every later `init()` at a
+// database you already run. The drivers (`pg`, `mysql2`) are optional peer
+// dependencies, imported only when a connection is actually opened.
+export { configure, configured, resolve as resolveStore, fromDsn, ENV_VAR } from "./store/config.js";
+export type { ConfigureOptions } from "./store/config.js";
+export { SQLiteStore } from "./store/sqlite.js";
+export { PostgresStore } from "./store/postgres.js";
+export type { PostgresStoreOptions } from "./store/postgres.js";
+export { MySQLStore } from "./store/mysql.js";
+export type { MySQLStoreOptions } from "./store/mysql.js";
+export { EmptyStoreError, isFileBackend } from "./store/base.js";
+export type {
+  Awaitable,
+  OpenSessionArgs,
+  ReadableStore,
+  RecordCallArgs,
+  Store,
+  StoreBackend,
+} from "./store/base.js";
+export { snapshotStore, StoreSnapshot, type SnapshotOptions } from "./store/snapshot.js";
 export { VERSION } from "./version.js";
 export {
   normalizeText,
@@ -72,7 +96,7 @@ export {
 } from "./render.js";
 
 // --- viewer + demo (parity with Python's `ctxdiff.viewer` / `ctxdiff.demo`) --
-export { buildPayload, exportHtml } from "./viewer/export.js";
+export { buildPayload, exportHtml, exportStore } from "./viewer/export.js";
 export { renderPage, PAGE } from "./viewer/template.js";
 export { buildDemoTrace } from "./demo.js";
 

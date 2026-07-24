@@ -365,8 +365,9 @@ export function renderCacheReport(report: CacheReport): string {
 /** Render `ctxdiff runs`' listing. Mirrors Python `render_runs_list`. */
 export function renderRunsList(
   rows: { filename: string; project: string; provider: string; turns: number; agents: string }[],
+  empty = "no .ctrace files in the current directory",
 ): string {
-  if (rows.length === 0) return "no .ctrace files in the current directory";
+  if (rows.length === 0) return empty;
   return rows
     .map(
       (r) =>

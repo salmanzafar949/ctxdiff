@@ -1,0 +1,151 @@
+/**
+ * Read a networked store ONCE, up front, into memory — the bridge between an
+ * async `Store` and the strictly synchronous analyzers.
+ *
+ * Why this exists: every analyzer (`analyze/diff.ts`, `analyze/tokens.ts`,
+ * `analyze/cache.ts`) and the dashboard builder (`viewer/export.ts`) is a pure
+ * synchronous function that walks a run call-by-call and block-by-block,
+ * re-reading the same call's blocks several times (a diff of adjacent turns
+ * reads each turn twice, the cache profiler reads every turn again). Making them
+ * async would ripple `await` through every caller and every test and buy nothing
+ * — the data is bounded and is fully known before analysis starts.
+ *
+ * So a networked read is done eagerly here, in a fixed number of round trips (one
+ * for the run, one for its calls, one per call for its blocks), and handed to the
+ * analyzers as an object satisfying the same synchronous `ReadableStore` surface
+ * `CTrace` implements. The analyzers cannot tell the difference — which is the
+ * point: `npx ctxdiff diff/tokens/cache/view/export` works against Postgres and
+ * MySQL with no analyzer aware that a database exists.
+ */
+import type { Call, CallBlock, ReadableStore, Run, Session, Store } from "./base.js";
+
+/**
+ * An in-memory, synchronous view of ONE session in a store: its run row, its
+ * calls in turn order, and each call's blocks in position order — and, only when
+ * it was asked for, the store's full session list.
+ *
+ * The session list is OPTIONAL because it is the one piece of a snapshot whose
+ * cost is set by the DATABASE rather than by the run being read (see
+ * `snapshotStore`), and no analyzer wants it.
+ *
+ * `close()` exists so callers can treat a snapshot exactly like a `CTrace` in a
+ * `finally` block; it is a no-op because the underlying connection is already
+ * closed by the time the snapshot is handed over (see `snapshotStore`).
+ */
+export class StoreSnapshot implements ReadableStore {
+  private readonly run: Run;
+  private readonly calls: Call[];
+  private readonly blocks: Map<string, CallBlock[]>;
+  /** null when this snapshot was taken WITHOUT the session list — distinct from
+   * an empty list, which means the store genuinely holds no sessions. */
+  private readonly sessions: Session[] | null;
+
+  constructor(
+    run: Run,
+    calls: Call[],
+    blocks: Map<string, CallBlock[]>,
+    sessions: Session[] | null = null,
+  ) {
+    this.run = run;
+    this.calls = calls;
+    this.blocks = blocks;
+    this.sessions = sessions;
+  }
+
+  /** The snapshotted session's run row. A `sessionId` naming a DIFFERENT session
+   * is rejected rather than silently answered with this one's data — a snapshot
+   * covers exactly the session it was taken of. */
+  getRun(sessionId?: string): Run {
+    if (sessionId !== undefined && sessionId !== this.run.id) {
+      throw new Error(`ctxdiff: session ${sessionId} is not in this snapshot`);
+    }
+    return this.run;
+  }
+
+  /** The snapshotted session's calls, in turn order. */
+  getCalls(sessionId?: string): Call[] {
+    if (sessionId !== undefined && sessionId !== this.run.id) {
+      throw new Error(`ctxdiff: session ${sessionId} is not in this snapshot`);
+    }
+    return this.calls;
+  }
+
+  /** One call's blocks, in position order; an unknown call id reads as empty,
+   * matching what a join would return. */
+  getCallBlocks(callId: string): CallBlock[] {
+    return this.blocks.get(callId) ?? [];
+  }
+
+  /** Every session in the store this snapshot came from, oldest first —
+   * available only when the snapshot was taken with `{ sessions: true }`.
+   * Asking without it is a caller bug, and says so: answering "no sessions" for
+   * a database full of them would be a far worse failure. */
+  listSessions(): Session[] {
+    if (this.sessions === null) {
+      throw new Error(
+        "ctxdiff: this snapshot was taken without the store's session list — " +
+          "take it with snapshotStore(store, { sessions: true }) if you need it",
+      );
+    }
+    return this.sessions;
+  }
+
+  /** Present for symmetry with `CTrace` so CLI code can `finally { r.close() }`
+   * regardless of where the trace came from. The connection is already gone. */
+  close(): void {
+    /* nothing to release: the snapshot owns no connection */
+  }
+}
+
+/** What `snapshotStore` may read BEYOND the session it was pointed at. */
+export interface SnapshotOptions {
+  /** Also materialize every session in the store (`ctxdiff runs`' listing).
+   * Off by default: it is the one read whose cost grows with the DATABASE
+   * rather than with the run — see `snapshotStore`. */
+  sessions?: boolean;
+}
+
+/**
+ * Materialize `store`'s bound session into a `StoreSnapshot` and CLOSE the
+ * store.
+ *
+ * Reads exactly the run it was pointed at, in a fixed number of round trips:
+ * one for the run row, one for its calls, one per call for its blocks. The
+ * store's SESSION LIST is deliberately not among them unless
+ * `{ sessions: true }` asks for it, because it is the one read whose cost is set
+ * by the database instead of by the run: `listSessions()` is a COUNT and a GROUP
+ * BY across every call row anyone has ever written to that database — the shared
+ * database these backends exist to serve. Taking it unconditionally meant
+ * `diff`, `tokens`, `cache` and `export`, every one of which analyzes a SINGLE
+ * run, each paid for the whole fleet's history — measured against a real
+ * PostgreSQL holding 2001 sessions / 200k calls, a 40-turn run snapshots in
+ * 11ms and the listing added 156ms on top, growing with the database forever.
+ * Only `ctxdiff runs` wants the listing, and it asks for it.
+ *
+ * Closing here rather than leaving it to the caller is deliberate: after this
+ * returns, nothing can possibly need the connection again (every byte the
+ * analyzers will read is already in memory), and holding a database connection
+ * open for the duration of an HTML export is exactly the kind of avoidable
+ * liability a debugging tool should not add to someone's production database.
+ * The close is best-effort — a snapshot that was read successfully is not lost
+ * because the goodbye packet failed.
+ */
+export async function snapshotStore(
+  store: Store,
+  opts: SnapshotOptions = {},
+): Promise<StoreSnapshot> {
+  try {
+    const run = await store.getRun();
+    const calls = await store.getCalls();
+    const blocks = new Map<string, CallBlock[]>();
+    for (const call of calls) blocks.set(call.id, await store.getCallBlocks(call.id));
+    const sessions = opts.sessions === true ? await store.listSessions() : null;
+    return new StoreSnapshot(run, calls, blocks, sessions);
+  } finally {
+    try {
+      await store.close();
+    } catch {
+      /* the data is already read; a failed goodbye must not lose it */
+    }
+  }
+}
