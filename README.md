@@ -78,7 +78,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 
 **What it doesn't do (yet):**
 
-- ⏳ **Bedrock streaming usage** — `converse_stream` is a separate, not-yet-wrapped method; use the non-streaming `converse` if you need usage from Bedrock today. (OpenAI chat+Responses, Anthropic, and now **Gemini** `generate_content_stream` streaming usage ARE captured, including the `.stream()` convenience-manager helpers — see [Streaming usage](#streaming-usage) below.)
+- ⏳ **Bedrock streaming usage** — Bedrock's `converse_stream` is a separate, not-yet-wrapped method; use the non-streaming `converse` if you need usage from Bedrock today. (This is the **only** streaming gap — OpenAI chat+Responses, Anthropic, and Gemini streaming usage are all captured, including the `.stream()` convenience-manager helpers; see [Streaming usage](#streaming-usage).)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
 - ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
@@ -262,7 +262,7 @@ Block text is written into the page as a JSON island and rendered with `textCont
 | **OpenAI** | `openai.OpenAI(...)` | Chat Completions **and Responses API** |
 | **Azure OpenAI** | `openai.AzureOpenAI(...)` | Same adapter, zero config |
 | **Anthropic / Claude** | `anthropic.Anthropic(...)` | Messages API |
-| **Google Gemini** | `google.genai.Client(...)` | Generate Content API (`models.generate_content`) |
+| **Google Gemini** | `google.genai.Client(...)` | Generate Content API — `models.generate_content` **and** `models.generate_content_stream` (streaming usage captured) |
 | **AWS Bedrock** | `boto3.client("bedrock-runtime")` | Converse API (`client.converse(...)`) |
 | **Open-source models** | `openai.OpenAI(base_url="http://localhost:11434/v1", ...)` | Any OpenAI-compatible endpoint — Ollama, vLLM, LM Studio, Together, Groq, … |
 | **LangChain** | `langchain_openai.ChatOpenAI(...)` | Via client injection — see [LangChain](#langchain) |
@@ -654,7 +654,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: streaming usage capture, live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: Bedrock streaming usage (`converse_stream`), live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
 
 ---
 

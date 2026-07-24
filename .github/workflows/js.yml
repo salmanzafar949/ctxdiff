@@ -1,8 +1,30 @@
-name: js
+# CI + npm auto-publish for the ctxdiff JS/TS SDK (the `js/` package).
+#
+# Path-filtered to js/** so it ONLY runs when the JS package changes — a
+# Python-only push never triggers this, and a JS-only push never triggers the
+# PyPI pipeline in publish.yml. That's the "JS → npm, Python → PyPI" split.
+#
+# What runs when:
+#   - pull_request (js/**)      → tests only (the merge gate).
+#   - push to main (js/**)      → tests → build → publish to npm, but ONLY when
+#                                 BOTH are true: (a) an NPM_TOKEN secret exists,
+#                                 and (b) the version in js/package.json is not
+#                                 already on npm (the version guard). Otherwise
+#                                 it skips publishing and stays green.
+#   - workflow_dispatch         → manual re-run of the same pipeline.
+#
+# One-time setup to turn publishing on (until then it safely no-ops):
+#   1. Claim/own `ctxdiff` on npm (the first successful run publishes it).
+#   2. Create an npm automation access token and add it as the repo secret
+#      NPM_TOKEN (Settings → Secrets and variables → Actions).
+#   Releasing = bump `version` in js/package.json and merge to main.
+#
+# Publishes with --provenance (supply-chain attestation via GitHub OIDC), so the
+# publish job needs `id-token: write`. Once the package exists on npm you can
+# optionally switch to npm Trusted Publishing (OIDC, tokenless) and drop NPM_TOKEN.
 
-# Build + test the JavaScript/TypeScript SDK. Path-filtered to js/** so it only
-# runs when the JS package changes. TEST ONLY — npm publishing is wired
-# separately once npm auth is configured; this workflow never publishes.
+name: JS CI & Publish
+
 on:
   push:
     branches: [main]
@@ -13,9 +35,11 @@ on:
     paths:
       - "js/**"
       - ".github/workflows/js.yml"
+  workflow_dispatch:
 
 jobs:
-  build-test:
+  test:
+    name: build + test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -30,3 +54,50 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  publish:
+    name: publish to npm (if configured and version is new)
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for npm --provenance attestation
+      contents: read
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - name: Guard — need an NPM_TOKEN and a version not yet on npm
+        id: guard
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          v=$(node -p "require('./package.json').version")
+          echo "package version: $v"
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "NPM_TOKEN secret not set — skipping publish (add it + own the name to enable)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          elif npm view "ctxdiff@$v" version >/dev/null 2>&1; then
+            echo "ctxdiff $v already on npm — skipping (bump version in js/package.json to release)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ctxdiff $v not on npm — publishing."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install + build
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          npm ci
+          npm run build
+      - name: Publish to npm (with provenance)
+        if: steps.guard.outputs.publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
