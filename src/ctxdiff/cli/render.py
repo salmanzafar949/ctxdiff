@@ -354,22 +354,51 @@ def render_cache_report(report: CacheReport) -> str:
     return "\n".join(lines)
 
 
-def render_runs_list(rows: list[tuple[str, str, str, int, str]],
-                     empty: str = "no .ctrace files in the current directory") -> str:
-    """Render `ctxdiff runs`' listing. Each row is
-    (label, project, provider, turn_count, agents) — the label being a filename
-    when listing a directory of traces and a short session id when listing a
-    configured database, which is why it is not named after either. Prints one
-    line per row, or `empty` when there is nothing to list; the caller supplies
-    that message because "no .ctrace files in the current directory" would be
-    the wrong answer for a user whose traces live in Postgres.
-    `agents` is a comma-joined list of the distinct agent names in the trace,
-    or '-' when the run has no named agents (a single-agent/pre-v2 run)."""
+def render_sessions_list(rows: list[tuple[str, str, str, str, int, str]],
+                         empty: str = "no .ctrace files in the current directory") -> str:
+    """Render `ctxdiff sessions`' listing (and its hidden `runs` alias). Each
+    row is (label, started_local, project, provider, turn_count, agents).
+
+    `label` is deliberately not named after any one thing it can be: a filename
+    when listing the `.ctrace` files in a directory, `<filename>#<short id>`
+    when one of those files holds several sessions, and a bare short session id
+    when listing a configured database (which has no filenames at all).
+
+    `started_local` arrives ALREADY formatted (see `select.format_local`) — this
+    module never touches a clock or a timezone, it only lays out columns.
+
+    Prints one line per row, or `empty` when there is nothing to list; the
+    caller supplies that message because "no .ctrace files in the current
+    directory" would be the wrong answer for a user whose traces live in
+    Postgres. `agents` is a comma-joined list of the distinct agent names, or
+    '-' when the session has no named agents (single-agent/pre-v2)."""
     if not rows:
         return empty
     lines = [
-        f"{label}  project={project}  provider={provider}  turns={n_calls}"
-        f"  agents={agents}"
-        for label, project, provider, n_calls, agents in rows
+        f"{label}  {started}  project={project}  provider={provider}"
+        f"  turns={n_calls}  agents={agents}"
+        for label, started, project, provider, n_calls, agents in rows
+    ]
+    return "\n".join(lines)
+
+
+def render_agents_list(rows: list[tuple[str, int, int, str]],
+                       empty: str = "no agents in this project") -> str:
+    """Render `ctxdiff agents`' listing: one line per agent with how many
+    SESSIONS it appears in, how many calls it made in total, and its token
+    spend — all aggregated across every session in the project, which is the
+    whole point of the command (an agent's cost is a property of the project,
+    not of whichever run you happened to open).
+
+    Each row is (name, n_sessions, n_calls, tokens) where `tokens` is already a
+    string: the caller formats it as a thousands-separated PROVIDER-REPORTED
+    total (input + output), or '-' when not one of that agent's calls carried
+    usage — the same "never fake precision" rule the token report follows,
+    since printing `tokens=0` for unreported usage would read as free."""
+    if not rows:
+        return empty
+    lines = [
+        f"{name}  sessions={n_sessions}  calls={n_calls}  tokens={tokens}"
+        for name, n_sessions, n_calls, tokens in rows
     ]
     return "\n".join(lines)

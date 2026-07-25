@@ -247,7 +247,31 @@ sqlite3 support-agent-*.ctrace "SELECT seq, usage FROM call ORDER BY seq;"
 
 > **🐍 Python:** `ctxdiff <command>` &nbsp;·&nbsp; **🟨 JavaScript:** `npx ctxdiff <command>` — same commands, same flags, **byte-identical output**. The examples below use the Python form; prefix with `npx` for the JS SDK. Either CLI reads any `.ctrace`, no matter which SDK wrote it.
 
-Every subcommand reads a `.ctrace`; `--run PATH` picks which one, and defaults to the most recently modified `*.ctrace` in the current directory when omitted — the common case (one run in the working dir) needs no flag at all. Color is automatic (git-style ANSI) and turns off whenever stdout isn't a real terminal, or when [`NO_COLOR`](https://no-color.org) is set — the output below has `NO_COLOR=1` so it pastes cleanly.
+> **What "byte-identical" covers:** every command's **output** — stdout, the operational errors on stderr, the selector errors (`no session …`, `no agent …`, the ambiguity listings) and the **exit code** — for the same trace and the same `TZ`. It does **not** cover argparse's help/usage chrome: `--help` text and the `usage: …` block Python prints above a bad-flag message have no JS equivalent, so those errors match on exit code 2 and on the `error: …` line's substance rather than byte for byte. The JS CLI also accepts a leading positional `.ctrace` path as an alias for `--project`, which the Python CLI does not — an addition, never a difference in what either prints.
+
+Every subcommand reads one **session** out of one **project**. Four selectors say which, and every analysis command takes the same four:
+
+| Selector | Means | Default |
+| --- | --- | --- |
+| `--project PATH\|DSN` | which project DB — a `.ctrace` path or a [database DSN](#storage-backends) | the configured store, else the most recently modified `*.ctrace` in the cwd |
+| `--session ID` | which session in it (an id, or any unambiguous prefix of one) | the only session — **required when the project holds several** |
+| `--agent NAME` | scope the analysis to one agent | all agents |
+| `--turn N` | a specific turn (call seq) | every turn |
+
+`--run` is still accepted everywhere as an alias for `--project`, so existing scripts keep working.
+
+**Ambiguity is never guessed at.** One session in the project and you need no flag; several, and the command stops with a usage error (exit 2) that *lists the sessions* so you can pick one — quietly analyzing "the newest" would give you a confidently wrong answer about a run you weren't asking about. The same rule applies to `--agent`: a name that matches nobody is a bad flag, not an empty report.
+
+```
+$ ctxdiff tokens
+ctxdiff: this project holds 2 sessions — pass --session to pick one:
+  4f3a2b1c9d8e  2026-07-20 13:15:00 +04:00  turns=8   agents=researcher, writer
+  9e8d7c6b5a4f  2026-07-21 22:42:30 +04:00  turns=11  agents=researcher, writer
+```
+
+Timestamps are stored UTC and displayed in **your local timezone**, with the offset shown — identical in both SDKs for the same stored value.
+
+Color is automatic (git-style ANSI) and turns off whenever stdout isn't a real terminal, or when [`NO_COLOR`](https://no-color.org) is set — the output below has `NO_COLOR=1` so it pastes cleanly.
 
 ### `ctxdiff diff --turn N --turn M`
 
@@ -305,9 +329,52 @@ hint: a dynamic value inside an early system block breaks the prefix every turn 
 
 A run with a stable prefix throughout prints a single green `✓ prefix stable across all N turn pairs` line instead.
 
-### `ctxdiff runs`
+Two more diff shapes fall out of the selectors, both reusing the exact same differ:
 
-Lists every `*.ctrace` in the working directory with its project, provider, and turn count — a quick "what runs do I have here" before picking one with `--run`. With a [database configured](#storage-backends) it lists that store's sessions instead, like every other read command.
+**Cross-session** — the regression case. Same agent, same turn, two runs:
+
+```
+$ ctxdiff diff --session 4f3a2b1c9d8e:8 --session 9e8d7c6b5a4f:8 --agent researcher
+── 4f3a2b1c9d8e · researcher · turn 8  →  9e8d7c6b5a4f · researcher · turn 8 ──
+── turn 8 → turn 8 · 1 blocks changed · +17 −18 tokens ──
+~ [user·user] More detail ([-goo-]{+ba+}d)?
+= 3 unchanged blocks · 45 tok
+```
+
+(`--turn 8` once, instead of the `:8` suffixes, means turn 8 on both sides.)
+
+**Cross-agent** — two agents inside one session, when you want to know why the writer sees a different context than the researcher:
+
+```
+$ ctxdiff diff --session 4f3a2b1c9d8e --agent researcher:1 --agent writer:2
+── researcher · turn 1  →  writer · turn 2 ──
+── turn 1 → turn 2 · 2 blocks changed · +30 −33 tokens ──
+```
+
+The scope header appears only for those two shapes — an ordinary same-session diff is unchanged, since `turn 7 → turn 8` already says everything.
+
+### `ctxdiff sessions`
+
+The session picker's data source: what `--session` can be set to. One row per session with its **local** start time, project, provider, turn count and agents. With no `--project` it scans every `*.ctrace` in the working directory (discovery is the one job where narrowing to the newest file would defeat the purpose); with a [database configured](#storage-backends) it lists that store's sessions.
+
+```
+$ ctxdiff sessions
+support-agent.ctrace          2026-07-19 11:02:14 +04:00  project=support-agent  provider=openai  turns=4   agents=-
+pipeline.ctrace#4f3a2b1c9d8e  2026-07-20 13:15:00 +04:00  project=pipeline       provider=openai  turns=8   agents=researcher, writer
+pipeline.ctrace#9e8d7c6b5a4f  2026-07-21 22:42:30 +04:00  project=pipeline       provider=openai  turns=11  agents=researcher, writer
+```
+
+A file holding one session is labeled by its bare filename; one holding several gets a `#<session id>` suffix per row, so every row names something you can select. `ctxdiff runs` is kept as a hidden alias and behaves identically.
+
+### `ctxdiff agents`
+
+Every agent in the project, aggregated **across all its sessions** — because "how much does the researcher cost" is a question about the project, not about whichever run happens to be newest. `tokens` is the provider-reported total (input + output), or `-` when none of that agent's calls reported usage.
+
+```
+$ ctxdiff agents --project pipeline.ctrace
+researcher  sessions=2  calls=12  tokens=48,210
+writer      sessions=2  calls=7   tokens=19,884
+```
 
 ### `ctxdiff export [--out FILE.html]` / `ctxdiff view [--no-open]`
 
@@ -387,16 +454,19 @@ Same *semantics*, too, not just the same shape:
 
 ### Reading from a database
 
-The CLI and the dashboard read from the configured store too. With `CTXDIFF_STORE` set (or after `configure()`), the read commands analyze the **newest session** in the database rather than looking for a `.ctrace` in the working directory:
+The CLI and the dashboard read from the configured store too. With `CTXDIFF_STORE` set (or after `configure()`), the read commands analyze a session in the database rather than looking for a `.ctrace` in the working directory:
 
 ```bash
-ctxdiff tokens                   # newest session in the configured store
-ctxdiff diff --turn 7 --turn 8
-ctxdiff runs                     # every session in the store, oldest first
-ctxdiff export --out run.html    # same self-contained dashboard
+ctxdiff sessions                       # every session in the store, oldest first
+ctxdiff agents                         # every agent, aggregated across all of them
+ctxdiff tokens --session 4f3a2b1c9d8e  # ...one of them (no flag needed if there's one)
+ctxdiff diff --session 4f3a2b1c9d8e --turn 7 --turn 8
+ctxdiff export --session 4f3a2b1c9d8e --out run.html
 ```
 
-`--run PATH` always wins: a path names a file, so it reads that `.ctrace` even when a database is configured. The same rule applies on the write side — `trace.init(project, path=...)` is always a local file.
+A shared database fills up with sessions fast, so the same [ambiguity rule](#the-cli) applies: with more than one session, `--session` is required and the error lists them. `ctxdiff sessions` is how you get that list on purpose.
+
+`--project PATH` (or its `--run` alias) always wins: a path names a file, so it reads that `.ctrace` even when a database is configured — and `--project <dsn>` reads *that* database whatever is configured. The same rule applies on the write side — `trace.init(project, path=...)` is always a local file.
 
 ### A database is never allowed to break your agent
 
@@ -581,7 +651,7 @@ tracer.close()
 - **`mark(step)`** — sets a **sticky** step label applied to every subsequent call in the **current execution context** until the next `mark()`; `mark(None)` clears it. (Contrast `tag()`, which is next-call-only.) Stickiness is per context: `asyncio.gather`/`to_thread` copy the context per task, so a task's `mark()` never relabels a sibling's calls. **Caveat — raw thread pools:** a `ThreadPoolExecutor` reuses workers without resetting their context, so a `mark()` lingers on that worker — a later task on the same worker that does *not* call `mark()` inherits the previous step. Under a raw pool, call `mark()` at the start of every task, or use the scoped form below.
 - **`with tracer.step("phase"): ...`** *(recommended under concurrency)* — scopes the step label to the block and **resets it on exit**, so it can't leak across logical tasks even in a reused thread pool (and stays correct under asyncio). A task that opens no `step()` block records `step=None`, never a sibling's leftover label.
 - **`--agent NAME`** — filters `ctxdiff diff`, `tokens`, and `cache` to one agent's calls. Turn numbers stay global `seq` values everywhere; `diff --agent` validates that both `--turn` values belong to that agent.
-- **Agent-aware analysis** — cache-prefix stability is computed **within each agent's own timeline**, so an adjacent cross-agent hand-off is never mistaken for a cache break. `ctxdiff tokens` prints a per-agent token summary, `ctxdiff runs` lists each trace's agents, and the [HTML dashboard](#html-dashboard) shows a colored chip per agent, an agent-colored underline on each turn bar, and an "agent hand-off" marker (diffing against that agent's *own* previous turn).
+- **Agent-aware analysis** — cache-prefix stability is computed **within each agent's own timeline**, so an adjacent cross-agent hand-off is never mistaken for a cache break. `ctxdiff tokens` prints a per-agent token summary, `ctxdiff agents` rolls every agent up across all of a project's sessions, `ctxdiff sessions` lists each session's agents, and the [HTML dashboard](#html-dashboard) shows a colored chip per agent, an agent-colored underline on each turn bar, and an "agent hand-off" marker (diffing against that agent's *own* previous turn).
 
 `ctxdiff tokens` also opens with a run-level rollup of **provider-reported** usage (input/output tokens, normalized across all four provider key shapes), with an honest coverage fraction and a per-agent breakdown:
 

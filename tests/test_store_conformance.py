@@ -577,3 +577,149 @@ def test_live_concurrent_cold_start_records_every_session(live_backend):
         assert sum(s.turn_count for s in sessions) == n
     finally:
         reader.close()
+
+
+# --- the session/agent CLI, against EVERY backend -----------------------------
+#
+# The selectors (`--project`/`--session`/`--agent`) are the one place the CLI
+# reaches past "the newest session" and asks a store to answer for a NAMED one.
+# That path is trivially right for SQLite (one file, one connection, every read
+# takes a session id) and genuinely different for a network store, where the
+# analyzers consume an in-memory snapshot taken of a chosen session rather than
+# the handle's own binding. So the whole surface is asserted against every
+# backend — SQLite, the stub-driver Postgres/MySQL adapters, and a real server
+# when a DSN is configured — with the live variants skipping loudly.
+
+
+def _seed_two_sessions(backend) -> tuple[str, str]:
+    """Write the PROJECT fixture into `backend`: two sessions, each with a
+    researcher and a writer, with one block differing between the runs. Returns
+    both session ids, oldest first."""
+    ids = []
+    for started, tail in ((T_FIRST, "good"), (T_SECOND, "bad")):
+        store = backend.open_session(project="pipeline", provider="openai",
+                                     started_at=started)
+        try:
+            store.record_call(seq=1, params={"model": "gpt-4o"},
+                              usage={"prompt_tokens": 100, "completion_tokens": 20},
+                              latency_ms=5, error=None,
+                              call_blocks=[_cb("you are the researcher", 0, "system"),
+                                           _cb("find facts", 1)],
+                              agent="researcher")
+            store.record_call(seq=2, params={"model": "gpt-4o"},
+                              usage={"prompt_tokens": 40, "completion_tokens": 8},
+                              latency_ms=6, error=None,
+                              call_blocks=[_cb("you are the writer", 0, "system"),
+                                           _cb("write it up", 1)],
+                              agent="writer")
+            store.record_call(seq=3, params={"model": "gpt-4o"}, usage=None,
+                              latency_ms=7, error=None,
+                              call_blocks=[_cb("you are the researcher", 0, "system"),
+                                           _cb("find facts", 1),
+                                           _cb(f"more detail ({tail})", 2)],
+                              agent="researcher")
+            ids.append(store.get_run().id)
+        finally:
+            store.close()
+    return ids[0], ids[1]
+
+
+def test_cli_sessions_lists_every_session_of_a_configured_store(backend, tmp_path,
+                                                                monkeypatch, capsys):
+    """`ctxdiff sessions` reads a configured store session-by-session, with the
+    local start time and agent list every backend must report identically."""
+    from ctxdiff.cli import main
+    from ctxdiff.store import config as store_config
+
+    good, bad = _seed_two_sessions(backend)
+    monkeypatch.chdir(tmp_path)          # no stray *.ctrace in the cwd to fall back to
+    store_config.configure(backend)
+    try:
+        assert main(["sessions"]) == 0
+        out = capsys.readouterr().out
+    finally:
+        store_config.configure(None)
+
+    lines = out.strip().splitlines()
+    assert len(lines) == 2
+    # The label differs by backend on purpose — a file store labels by filename,
+    # a database by short session id — but the id is always selectable from it.
+    assert good[:12] in lines[0]
+    assert bad[:12] in lines[1]
+    for line in lines:
+        assert "project=pipeline" in line
+        assert "turns=3" in line
+        assert "agents=researcher, writer" in line
+
+
+def test_cli_agents_aggregates_across_a_configured_stores_sessions(backend, tmp_path,
+                                                                   monkeypatch, capsys):
+    """`ctxdiff agents` rolls every session in the store up per agent — the
+    query shape a shared team database exists for."""
+    from ctxdiff.cli import main
+    from ctxdiff.store import config as store_config
+
+    _seed_two_sessions(backend)
+    monkeypatch.chdir(tmp_path)
+    store_config.configure(backend)
+    try:
+        assert main(["agents"]) == 0
+        out = capsys.readouterr().out
+    finally:
+        store_config.configure(None)
+
+    lines = out.strip().splitlines()
+    assert lines[0] == "researcher  sessions=2  calls=4  tokens=240"
+    assert lines[1] == "writer  sessions=2  calls=2  tokens=96"
+
+
+def test_cli_session_selector_scopes_a_configured_store(backend, tmp_path,
+                                                        monkeypatch, capsys):
+    """Two sessions in the store make a bare `tokens` ambiguous (exit 2 with the
+    listing), and `--session <id>` resolves it — the defaulting contract, proven
+    against the reader path each backend actually uses."""
+    from ctxdiff.cli import main
+    from ctxdiff.store import config as store_config
+
+    good, bad = _seed_two_sessions(backend)
+    monkeypatch.chdir(tmp_path)
+    store_config.configure(backend)
+    try:
+        assert main(["tokens"]) == 2
+        ambiguous = capsys.readouterr()
+        assert main(["tokens", "--session", bad[:12], "--agent", "writer"]) == 0
+        scoped = capsys.readouterr()
+    finally:
+        store_config.configure(None)
+
+    assert ambiguous.out == ""
+    assert "pass --session to pick one" in ambiguous.err
+    assert good[:12] in ambiguous.err and bad[:12] in ambiguous.err
+    assert "turn 2 ·" in scoped.out
+    assert "turn 1 ·" not in scoped.out
+
+
+def test_cli_cross_session_diff_against_a_configured_store(backend, tmp_path,
+                                                           monkeypatch, capsys):
+    """The regression case end to end on a shared store: the same agent's turn
+    3 in two different runs, aligned by the ordinary differ, with the scope
+    header naming both sessions."""
+    from ctxdiff.cli import main
+    from ctxdiff.store import config as store_config
+
+    good, bad = _seed_two_sessions(backend)
+    monkeypatch.chdir(tmp_path)
+    store_config.configure(backend)
+    try:
+        code = main(["diff", "--session", f"{good}:3", "--session", f"{bad}:3",
+                     "--agent", "researcher"])
+        out = capsys.readouterr().out
+    finally:
+        store_config.configure(None)
+
+    assert code == 0
+    lines = out.strip().splitlines()
+    assert lines[0] == (f"── {good[:12]} · researcher · turn 3  →  "
+                        f"{bad[:12]} · researcher · turn 3 ──")
+    # Char-level inline diff: the shared trailing "d" of good/bad stays equal.
+    assert "[-goo-]" in out and "{+ba+}" in out
