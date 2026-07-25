@@ -97,12 +97,21 @@ export class StoreSnapshot implements ReadableStore {
   }
 }
 
-/** What `snapshotStore` may read BEYOND the session it was pointed at. */
+/** Which session `snapshotStore` reads, and what it may read BEYOND it. */
 export interface SnapshotOptions {
-  /** Also materialize every session in the store (`ctxdiff runs`' listing).
+  /** Also materialize every session in the store (`ctxdiff sessions`' listing).
    * Off by default: it is the one read whose cost grows with the DATABASE
    * rather than with the run — see `snapshotStore`. */
   sessions?: boolean;
+  /** Snapshot THIS session instead of the one the handle is bound to (the
+   * newest) — how `--session` reaches a networked store, where a handle cannot
+   * be rebound but every read already accepts a session id. */
+  sessionId?: string;
+  /** A session list the caller ALREADY fetched. The CLI must fetch one to
+   * resolve `--session` at all, and passing it here means the expensive listing
+   * query (see below) is paid once per command rather than twice. Takes
+   * precedence over `sessions`. */
+  sessionList?: Session[];
 }
 
 /**
@@ -135,11 +144,16 @@ export async function snapshotStore(
   opts: SnapshotOptions = {},
 ): Promise<StoreSnapshot> {
   try {
-    const run = await store.getRun();
-    const calls = await store.getCalls();
+    // `getRun`/`getCalls` take the session id when one was chosen and fall back
+    // to the handle's own binding (the newest) when it wasn't — the same
+    // default every store already implements, so nothing changes for a caller
+    // that names no session.
+    const run = await store.getRun(opts.sessionId);
+    const calls = await store.getCalls(opts.sessionId);
     const blocks = new Map<string, CallBlock[]>();
     for (const call of calls) blocks.set(call.id, await store.getCallBlocks(call.id));
-    const sessions = opts.sessions === true ? await store.listSessions() : null;
+    const sessions =
+      opts.sessionList ?? (opts.sessions === true ? await store.listSessions() : null);
     return new StoreSnapshot(run, calls, blocks, sessions);
   } finally {
     try {

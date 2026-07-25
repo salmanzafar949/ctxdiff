@@ -20,6 +20,7 @@
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { CTrace } from "./ctrace.js";
+import { pyRepr } from "../render.js";
 import type { FileStoreBackend, OpenSessionArgs } from "./base.js";
 
 /** Whether `path` exists AND is a directory. `statSync` with `throwIfNoEntry`
@@ -98,12 +99,18 @@ export class SQLiteStore implements FileStoreBackend {
    * (the project name is a write-time input only), so this throws a message
    * pointing at `--run`, which is how the CLI already selects a file in that
    * case.
+   *
+   * The path is quoted with `pyRepr`, not `JSON.stringify`: the Python twin of
+   * this message interpolates `{path!r}`, which prefers SINGLE quotes and only
+   * switches to double ones when the path itself contains a single quote. The
+   * message reaches the user through both CLIs, so it has to be the same bytes.
    */
   openReader(): CTrace {
     if (this.path === null || isDirectory(this.path)) {
       throw new Error(
         "ctxdiff: SQLiteStore has no single file to read " +
-          `(path=${JSON.stringify(this.path)}); pass an explicit .ctrace path`,
+          `(path=${this.path === null ? "None" : pyRepr(this.path)}); ` +
+          "pass an explicit .ctrace path",
       );
     }
     return CTrace.open(this.path);

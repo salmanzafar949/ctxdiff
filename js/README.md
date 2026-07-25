@@ -72,7 +72,7 @@ It's built to sit **alongside** your observability stack, not replace it.
 - 💸 **Prompt-cache profiling** — `npx ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
 - 🖥️ **Self-contained HTML dashboard** — `npx ctxdiff view` / `export`: a one-file, zero-external-request dashboard with a turn scrubber, diff panel, token heatmap, cache findings, and block inspector — safe to attach to a bug ticket.
 - 🏷️ **Semantic tagging** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
-- 🤝 **Multi-agent runs** — `tracer.wrap(client, { agent: "researcher" })` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters `diff`/`tokens`/`cache`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
+- 🤝 **Multi-agent runs** — `tracer.wrap(client, { agent: "researcher" })` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters `diff`/`tokens`/`cache` (and names a side of a cross-agent diff), `npx ctxdiff agents` rolls every agent up across a project's sessions, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `configure({ store: new PostgresStore({ dsn }) })` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, the drivers are optional peers, and a dead database degrades capture without ever touching your agent.
 - 🔒 **Privacy first** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **Honest numbers** — exact `o200k_base` token counts for OpenAI (matching Python's `tiktoken`); estimates are always *marked* as estimates.
@@ -142,17 +142,47 @@ ct.close();
 
 `npx ctxdiff <command>` — read-only analysis over any `.ctrace`, including traces written by the **Python** SDK. Output is byte-identical to the Python CLI.
 
+> **What "byte-identical" covers:** every command's **output** — stdout, the operational errors on stderr, the selector errors (`no session …`, `no agent …`, the ambiguity listings) and the **exit code** — for the same trace and the same `TZ`. It does **not** cover argparse's help/usage chrome: `--help` text and the `usage: …` block Python prints above a bad-flag message have no equivalent here, so those errors match on exit code 2 and on the `error: …` line's substance rather than byte for byte. This CLI also accepts a leading positional `.ctrace` path as an alias for `--project`, which the Python CLI does not — an addition, never a difference in what either prints.
+
 | Command | What it does |
 |---|---|
 | `diff --turn N --turn M` | git-style block diff between two turns (char-level inline diffs) |
 | `tokens [--turn N]` | per-label token heatmap, provider reconciliation, schema-bloat report |
 | `cache` | prompt-cache prefix-break profiler + price-free wasted-spend estimate |
-| `runs` | list `.ctrace` files in the working directory (or, with a [database configured](#storage-backends), that store's sessions) |
+| `sessions` | list every session ctxdiff can see — id, **local** start time, turns, agents |
+| `agents` | every agent in the project, aggregated across **all** its sessions |
 | `view [--no-open]` | open a self-contained HTML dashboard in your browser |
-| `export [--out FILE.html]` | write a self-contained HTML dashboard for a run |
+| `export [--out FILE.html]` | write a self-contained HTML dashboard for a session |
 | `demo [--out FILE] [--keep] [--no-open]` | build a sample multi-agent dashboard — no API keys, no setup |
 
-Common options: `--agent A` scopes to one agent; `--run PATH` picks a trace (default: most recently modified `*.ctrace` in the cwd). A positional path also works, e.g. `npx ctxdiff tokens my-run.ctrace`.
+(`runs` is kept as a hidden alias of `sessions`, so existing scripts keep working.)
+
+### Selectors
+
+Every analysis command takes the same four, resolved identically:
+
+| Selector | Means | Default |
+| --- | --- | --- |
+| `--project PATH\|DSN` | which project DB — a `.ctrace` path or a [database DSN](#storage-backends) | the configured store, else the most recently modified `*.ctrace` in the cwd |
+| `--session ID` | which session in it (an id, or any unambiguous prefix) | the only session — **required when the project holds several** |
+| `--agent NAME` | scope to one agent | all agents |
+| `--turn N` | a specific turn | every turn |
+
+`--run` remains an alias for `--project`, and a positional path still works (`npx ctxdiff tokens my-run.ctrace`).
+
+**Ambiguity is never guessed at.** One session and no flag is needed; several, and the command stops with a usage error (exit 2) that *lists the sessions* — quietly analyzing "the newest" would answer confidently about a run you weren't asking about. An `--agent` matching nobody is likewise a bad flag, not an empty report.
+
+Two extra diff shapes fall out of the selectors, both reusing the same differ:
+
+```bash
+# cross-session — the regression case: same agent, same turn, two runs
+npx ctxdiff diff --session 4f3a2b1c9d8e:8 --session 9e8d7c6b5a4f:8 --agent researcher
+
+# cross-agent — two agents inside one session
+npx ctxdiff diff --session 4f3a2b1c9d8e --agent researcher:1 --agent writer:2
+```
+
+Both print a scope header naming the two sides (an ordinary same-session diff is unchanged). Timestamps are stored UTC and displayed in **your local timezone** with the offset shown — identical to the Python CLI for the same stored value.
 
 ---
 
@@ -215,16 +245,19 @@ Same *semantics*, too, not just the same shape:
 
 ### Reading from a database
 
-The CLI and the dashboard read from the configured store too. With `CTXDIFF_STORE` set (or after `configure()`), the read commands analyze the **newest session** in the database rather than looking for a `.ctrace` in the working directory:
+The CLI and the dashboard read from the configured store too. With `CTXDIFF_STORE` set (or after `configure()`), the read commands analyze a session in the database rather than looking for a `.ctrace` in the working directory:
 
 ```bash
-npx ctxdiff tokens                   # newest session in the configured store
-npx ctxdiff diff --turn 7 --turn 8
-npx ctxdiff runs                     # every session in the store, oldest first
-npx ctxdiff export --out run.html    # same self-contained dashboard
+npx ctxdiff sessions                       # every session in the store, oldest first
+npx ctxdiff agents                         # every agent, aggregated across all of them
+npx ctxdiff tokens --session 4f3a2b1c9d8e  # ...one of them (no flag needed if there's one)
+npx ctxdiff diff --session 4f3a2b1c9d8e --turn 7 --turn 8
+npx ctxdiff export --session 4f3a2b1c9d8e --out run.html
 ```
 
-`--run PATH` always wins: a path names a file, so it reads that `.ctrace` even when a database is configured. The same rule applies on the write side — `trace.init(project, { path })` is always a local file. `export`/`view` need an explicit `--out` against a database, since there is no trace filename to derive one from.
+A shared database fills up with sessions fast, so the same [ambiguity rule](#selectors) applies: with more than one session `--session` is required, and the error lists them.
+
+`--project PATH` (or its `--run` alias) always wins: a path names a file, so it reads that `.ctrace` even when a database is configured. The same rule applies on the write side — `trace.init(project, { path })` is always a local file. `export`/`view` need an explicit `--out` against a database, since there is no trace filename to derive one from.
 
 ### A database is never allowed to break your agent
 

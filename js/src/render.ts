@@ -65,8 +65,13 @@ function isNonPrintable(ch: string): boolean {
  * `\uNNNN` in the BMP, `\UNNNNNNNN` for astral — and pass every printable
  * character (including café/emoji) through. Iterates code points (`for..of`)
  * like Python, so astral characters are handled as single units.
+ *
+ * Exported because diff snippets are not the only place Python's repr quoting
+ * has to be reproduced: `SQLiteStore.openReader` interpolates a path with `!r`
+ * on the Python side, and `JSON.stringify` there would print double quotes
+ * where Python prints single ones.
  */
-function pyRepr(s: string): string {
+export function pyRepr(s: string): string {
   const quote = s.includes("'") && !s.includes('"') ? '"' : "'";
   let out = quote;
   for (const ch of s) {
@@ -362,17 +367,61 @@ export function renderCacheReport(report: CacheReport): string {
   return lines.join("\n");
 }
 
-/** Render `ctxdiff runs`' listing. Mirrors Python `render_runs_list`. */
-export function renderRunsList(
-  rows: { filename: string; project: string; provider: string; turns: number; agents: string }[],
+/** One row of the `sessions` listing. `label` is deliberately not named after
+ * any one thing it can be: a filename when listing the `.ctrace` files in a
+ * directory, `<filename>#<short id>` when one of those files holds several
+ * sessions, and a bare short session id when listing a configured database
+ * (which has no filenames at all). `started` arrives ALREADY formatted (see
+ * `selectors.formatLocal`) — this module never touches a clock or a timezone,
+ * it only lays out columns. */
+export interface SessionRow {
+  label: string;
+  started: string;
+  project: string;
+  provider: string;
+  turns: number;
+  agents: string;
+}
+
+/** Render `ctxdiff sessions`' listing (and its hidden `runs` alias): one line
+ * per session, or `empty` when there is nothing to list — the caller supplies
+ * that message because "no .ctrace files in the current directory" would be the
+ * wrong answer for a user whose traces live in Postgres. Mirrors Python
+ * `render_sessions_list`. */
+export function renderSessionsList(
+  rows: SessionRow[],
   empty = "no .ctrace files in the current directory",
 ): string {
   if (rows.length === 0) return empty;
   return rows
     .map(
       (r) =>
-        `${r.filename}  project=${r.project}  provider=${r.provider}  turns=${r.turns}` +
-        `  agents=${r.agents}`,
+        `${r.label}  ${r.started}  project=${r.project}  provider=${r.provider}` +
+        `  turns=${r.turns}  agents=${r.agents}`,
     )
+    .join("\n");
+}
+
+/** One row of the `agents` listing. `tokens` is already a string: the caller
+ * formats it as a thousands-separated PROVIDER-REPORTED total (input + output),
+ * or '-' when not one of that agent's calls carried usage — the same "never fake
+ * precision" rule the token report follows, since printing `tokens=0` for
+ * unreported usage would read as free. */
+export interface AgentRow {
+  name: string;
+  sessions: number;
+  calls: number;
+  tokens: string;
+}
+
+/** Render `ctxdiff agents`' listing: one line per agent with how many SESSIONS
+ * it appears in, how many calls it made in total, and its token spend — all
+ * aggregated across every session in the project, which is the whole point of
+ * the command (an agent's cost is a property of the project, not of whichever
+ * run you happened to open). Mirrors Python `render_agents_list`. */
+export function renderAgentsList(rows: AgentRow[], empty = "no agents in this project"): string {
+  if (rows.length === 0) return empty;
+  return rows
+    .map((r) => `${r.name}  sessions=${r.sessions}  calls=${r.calls}  tokens=${r.tokens}`)
     .join("\n");
 }

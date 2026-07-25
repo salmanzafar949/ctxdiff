@@ -82,8 +82,8 @@ export type {
 } from "./analyze/tokens.js";
 export { analyzeCache } from "./analyze/cache.js";
 export type { PrefixBreak, CacheReport } from "./analyze/cache.js";
-export { listRuns } from "./analyze/runs.js";
-export type { RunRow } from "./analyze/runs.js";
+export { listFileSessions, listFileCalls } from "./analyze/sessions.js";
+export type { FileSessions } from "./analyze/sessions.js";
 export {
   renderTurnDiff,
   renderRunTokens,
@@ -92,8 +92,21 @@ export {
   renderUsageSummary,
   renderAgentSummary,
   renderCacheReport,
-  renderRunsList,
+  renderSessionsList,
+  renderAgentsList,
 } from "./render.js";
+export type { SessionRow, AgentRow } from "./render.js";
+
+// --- session/agent selection (parity with Python's `ctxdiff.cli.select`) -----
+export {
+  SelectionError,
+  chooseSession,
+  distinctAgentNames,
+  formatLocal,
+  parseSelector,
+  shortId,
+} from "./selectors.js";
+export type { DiffSide, Selector } from "./selectors.js";
 
 // --- viewer + demo (parity with Python's `ctxdiff.viewer` / `ctxdiff.demo`) --
 export { buildPayload, exportHtml, exportStore } from "./viewer/export.js";

@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 /**
  * ctxdiff's command-line entry point (`npx ctxdiff <cmd>`). Matches the Python
- * CLI's command surface — `diff`, `tokens`, `cache`, `runs` (read-only
- * analysis) plus `view`, `export`, `demo` (the HTML dashboard) — with the same
- * flags (`--turn`, `--agent`, `--run`, `--out`, `--no-open`, `--keep`), output,
- * and exit codes. Uses Node's built-in `util.parseArgs`; no CLI framework
- * dependency. As an ergonomic extra over the Python CLI, a positional `.ctrace`
- * path is accepted as an alias for `--run`.
+ * CLI's command surface — `diff`, `tokens`, `cache` (analysis), `sessions`,
+ * `agents` (discovery, with `runs` kept as a hidden alias of `sessions`), plus
+ * `view`, `export`, `demo` (the HTML dashboard) — with the same flags
+ * (`--project`/`--run`, `--session`, `--agent`, `--turn`, `--out`, `--no-open`,
+ * `--keep`), the same output, and the same exit codes. Uses Node's built-in
+ * `util.parseArgs`; no CLI framework dependency. As an ergonomic extra over the
+ * Python CLI, a positional `.ctrace` path is accepted as an alias for
+ * `--project`.
+ *
+ * The surface is SESSION- and AGENT-aware because a project store holds many
+ * sessions and each session many agents. Which session/agent a command reads is
+ * resolved by `selectors.ts` — shared, identical rules for every command, and a
+ * byte-identical port of Python's `cli/select.py` down to the error text.
  */
 import { parseArgs } from "node:util";
 import { readdirSync, statSync } from "node:fs";
@@ -19,31 +26,59 @@ import { CTrace } from "./store/ctrace.js";
 import {
   EmptyStoreError,
   isFileBackend,
+  type Call,
+  type CallBlock,
   type ReadableStore,
+  type Run,
   type Session,
+  type Store,
   type StoreBackend,
 } from "./store/base.js";
-import { resolve as resolveConfigured } from "./store/config.js";
+import { fromDsn, resolve as resolveConfigured } from "./store/config.js";
 import { SQLiteStore } from "./store/sqlite.js";
 import { snapshotStore } from "./store/snapshot.js";
-import { diffTurns } from "./analyze/diff.js";
-import { analyzeRun, registeredToolNames } from "./analyze/tokens.js";
+import { diffCalls, diffTurns } from "./analyze/diff.js";
+import { analyzeRun, registeredToolNames, usageTotals } from "./analyze/tokens.js";
 import { analyzeCache } from "./analyze/cache.js";
-import { listRuns } from "./analyze/runs.js";
+import { isTraceFile, listFileCalls, listFileSessions } from "./analyze/sessions.js";
 import { exportHtml, exportStore } from "./viewer/export.js";
 import { buildDemoTrace } from "./demo.js";
 import {
   renderTurnDiff,
   renderRunTokens,
   renderCacheReport,
-  renderRunsList,
+  renderSessionsList,
+  renderAgentsList,
   renderUsageSummary,
   renderAgentSummary,
+  type AgentRow,
+  type SessionRow,
 } from "./render.js";
+import {
+  agentsText,
+  chooseSession,
+  diffScopeLine,
+  distinctAgentNames,
+  formatLocal,
+  parseSelector,
+  requireAgent,
+  requireSingleAgent,
+  SelectionError,
+  shortId,
+  turnArg,
+  turnList,
+  UNLABELED,
+  type DiffSide,
+  type Selector,
+  type TurnArg,
+} from "./selectors.js";
 
-/** Most recently modified `*.ctrace` in `dir`, or null. Backs the `--run`
- * default so the common case (one run in the cwd) needs no flag. Mirrors Python
- * `_find_default_run`. */
+/** Most recently modified `*.ctrace` in `dir`, or null. Backs the `--project`
+ * default so the common case (one project DB in the cwd) needs no flag. Mirrors
+ * Python `_find_default_run`, including its `glob("*.ctrace")` blindness to
+ * dot-prefixed files (see `isTraceFile`) — this one picks the file every later
+ * number is computed from, so the two CLIs choosing differently here means they
+ * report on different runs entirely. */
 function findDefaultRun(dir: string): string | null {
   let entries: string[];
   try {
@@ -51,7 +86,7 @@ function findDefaultRun(dir: string): string | null {
   } catch {
     return null;
   }
-  const candidates = entries.filter((f) => f.endsWith(".ctrace")).map((f) => join(dir, f));
+  const candidates = entries.filter(isTraceFile).map((f) => join(dir, f));
   if (!candidates.length) return null;
   return candidates.reduce((best, p) =>
     statSync(p).mtimeMs > statSync(best).mtimeMs ? p : best,
@@ -59,71 +94,142 @@ function findDefaultRun(dir: string): string | null {
 }
 
 /**
- * A trace opened for READING, whichever backend it came from: a `CTrace` on a
- * local file, or an in-memory snapshot of one session of a Postgres/MySQL store.
- * Both are synchronous and both close the same way, so every command below reads
- * one of these without knowing which it got.
- *
- * Deliberately just ONE session's worth of reading plus `close`. `ctxdiff runs`
- * is the only command that wants a store's whole session list, and it takes its
- * own path to it (`runsFromStore`) rather than snapshotting a run it does not
- * need — see `store/snapshot.ts` for why that listing is not free.
+ * A trace opened for READING and pinned to ONE session, whichever backend it
+ * came from: a `SessionView` over a local `CTrace`, or an in-memory snapshot of
+ * one session of a Postgres/MySQL store. Both are synchronous and both close the
+ * same way, so every command below reads one of these without knowing which it
+ * got.
  */
 interface Reader extends ReadableStore {
   close(): void;
 }
 
-/** No trace to read: no `--run`, no configured backend, and no `*.ctrace` in the
- * working directory. Its own type so callers can print the friendly "did the run
- * capture?" line for this case while still reporting a genuine open FAILURE
+/**
+ * A read handle PINNED to one session of a (possibly many-session) `CTrace`.
+ *
+ * Why it exists: every analyzer and the dashboard exporter call
+ * `getRun()`/`getCalls()` with no arguments and get the store's default binding
+ * — the NEWEST session. Once `--session` can name any session, those calls have
+ * to answer for the CHOSEN one instead. Rebinding a `CTrace` is not an option
+ * (it binds its run id at open time), so this thin forwarder substitutes the
+ * chosen session id on the two reads that take one and passes everything else
+ * straight through. Mirrors Python `_SessionView`.
+ *
+ * `close()` is a NO-OP: the underlying `CTrace` is owned by the project handle
+ * that created this view (see `openProject`), which may hand out two views for a
+ * cross-session diff and must outlive both.
+ */
+class SessionView implements Reader {
+  private readonly store: CTrace;
+  readonly sessionId: string;
+
+  constructor(store: CTrace, sessionId: string) {
+    this.store = store;
+    this.sessionId = sessionId;
+  }
+
+  /** The pinned session's run row (an explicit `sessionId` still wins, so a
+   * caller that knows exactly what it wants is never overridden). */
+  getRun(sessionId?: string): Run {
+    return this.store.getRun(sessionId ?? this.sessionId);
+  }
+
+  /** The pinned session's calls, in turn order. */
+  getCalls(sessionId?: string): Call[] {
+    return this.store.getCalls(sessionId ?? this.sessionId);
+  }
+
+  /** One call's blocks — call ids are globally unique, so no pinning. */
+  getCallBlocks(callId: string): CallBlock[] {
+    return this.store.getCallBlocks(callId);
+  }
+
+  close(): void {
+    /* the project handle owns the CTrace; see the class docstring */
+  }
+}
+
+/** No trace to read: no `--project`, no configured backend, and no `*.ctrace` in
+ * the working directory. Its own type so callers can print the friendly "did the
+ * run capture?" line for this case while still reporting a genuine open FAILURE
  * (corrupt file, unreachable database) as an error. Mirrors Python
  * `_NoTraceFound`. */
 class NoTraceFound extends Error {}
 
 /**
- * Open the store the read commands should analyze, and report the default HTML
- * output path that goes with it (null when there is no file to derive one from —
- * a networked store).
+ * The ONE project store a command should read, or null meaning "there is no
+ * single project here — scan the working directory instead".
  *
  * Resolution mirrors the write side's explicit-beats-ambient rule:
- * 1. `--run PATH` (or the positional) — always that file. A path names a file,
- *    so it wins even when a database is configured.
- * 2. A configured NETWORKED backend (`configure()` / `CTXDIFF_STORE`) — read its
- *    newest session, materialized into a snapshot so the synchronous analyzers
- *    can consume it (see `store/snapshot.ts`). Detected by the ABSENCE of
- *    `pathFor`, the same file-backend capability check `Tracer` uses, rather than
- *    an instanceof chain against every backend class.
- * 3. A configured SQLite backend pointing at a concrete file — that file, opened
- *    THROUGH the backend so the read side goes via the same protocol the write
- *    side does.
- * 4. Nothing configured — the most recently modified `*.ctrace` in the cwd,
- *    exactly as before.
+ * 1. `--project VALUE` (or the positional) — always that, whether it is a
+ *    `.ctrace` path or a database DSN. `fromDsn` already knows both spellings (a
+ *    value with no recognizable scheme is a filesystem path), so one flag covers
+ *    both and a path still beats an ambient database, as it always has.
+ * 2. A configured NETWORKED backend (`configure()` / `CTXDIFF_STORE`) — detected
+ *    by the ABSENCE of `pathFor`, the same file-backend capability check
+ *    `Tracer` uses, rather than an instanceof chain over every backend class.
+ * 3. A configured SQLite backend pointing at a concrete FILE — that file.
+ * 4. Anything else (nothing configured, or a backend naming a whole directory of
+ *    traces, which is not one project) — null.
  *
- * Throws `NoTraceFound` when nothing resolves, and lets a real open error
- * (corrupt file, dead database, missing driver) propagate with its own message.
+ * Returning null rather than throwing is what lets the discovery commands
+ * (`sessions`, `agents`) list every `.ctrace` in the cwd while the analysis
+ * commands narrow that to the newest one — see `resolveBackend`.
  */
-async function openSource(
-  explicit: string | undefined,
-): Promise<{ reader: Reader; htmlDefault: string | null }> {
-  if (explicit) return { reader: CTrace.open(explicit), htmlDefault: defaultHtmlFor(explicit) };
-
+function discoveryBackend(project: string | undefined): StoreBackend | null {
+  if (project) return fromDsn(project);
   const backend = resolveConfigured();
-  if (backend !== null && !isFileBackend(backend)) {
-    return { reader: await snapshotStore(await backend.openReader()), htmlDefault: null };
-  }
   if (backend !== null) {
+    if (!isFileBackend(backend)) return backend;
     const configuredPath = (backend as SQLiteStore).path;
-    if (configuredPath && !isDirectory(configuredPath)) {
-      return {
-        reader: backend.openReader() as CTrace,
-        htmlDefault: defaultHtmlFor(configuredPath),
-      };
-    }
+    if (configuredPath && !isDirectory(configuredPath)) return backend;
   }
+  return null;
+}
 
+/** The store an analysis command will read, plus the path it was DISCOVERED at
+ * (null whenever the user named the project themselves). `discovered` is carried
+ * purely so selector errors can name the file — see `sessionWhere`. */
+interface ResolvedBackend {
+  backend: StoreBackend;
+  discovered: string | null;
+}
+
+/** The store an ANALYSIS command should read: whatever `discoveryBackend`
+ * resolves, else the most recently modified `*.ctrace` in the cwd — the
+ * zero-config default that has always made `ctxdiff diff` work with no flags in
+ * a directory holding one project DB. Throws `NoTraceFound` when even that finds
+ * nothing. Mirrors Python `_resolve_backend`.
+ *
+ * Only the cwd fall-through reports a `discovered` path: it is the one branch
+ * where the user never said which project this is, so it is the one branch whose
+ * errors have to. */
+function resolveBackend(project: string | undefined): ResolvedBackend {
+  const backend = discoveryBackend(project);
+  if (backend !== null) return { backend, discovered: null };
   const path = findDefaultRun(process.cwd());
   if (path === null) throw new NoTraceFound();
-  return { reader: CTrace.open(path), htmlDefault: defaultHtmlFor(path) };
+  return { backend: new SQLiteStore({ path }), discovered: path };
+}
+
+/**
+ * The scope label a selector error uses for one session: `session 4f3a2b1c9d8e`
+ * normally, and `one.ctrace (session 4f3a2b1c9d8e)` when the project was
+ * DISCOVERED by scanning the working directory rather than named with
+ * `--project`.
+ *
+ * Why the filename earns its place exactly there: `ctxdiff agents` lists agents
+ * from EVERY .ctrace in the directory, so the obvious next command —
+ * `ctxdiff tokens --agent alpha` — can name an agent that really exists, just
+ * not in the one file the no-flag default happened to pick. Unqualified, the
+ * error then names a session short id that appears NOWHERE in the `sessions`
+ * listing (whose rows are labeled by filename), leaving no hint that a different
+ * project was chosen or that `--project` is the way out. Naming the file turns a
+ * dead end into a pointer. Mirrors Python `_session_where`.
+ */
+function sessionWhere(sessionId: string, discovered: string | null): string {
+  const where = `session ${shortId(sessionId)}`;
+  return discovered ? `${basename(discovered)} (${where})` : where;
 }
 
 /** Whether `path` is an existing directory — used to tell a configured
@@ -131,6 +237,16 @@ async function openSource(
 function isDirectory(path: string): boolean {
   const st = statSync(path, { throwIfNoEntry: false });
   return st !== undefined && st.isDirectory();
+}
+
+/** The dashboard path `export`/`view` default to for `backend`:
+ * `<trace-stem>.html` beside a file-backed store, and null for a networked one
+ * (a database has no filename to borrow, so those commands ask for `--out`). */
+function htmlDefaultForBackend(backend: StoreBackend): string | null {
+  if (!isFileBackend(backend)) return null;
+  const path = (backend as SQLiteStore).path;
+  if (path && !isDirectory(path)) return defaultHtmlFor(path);
+  return null;
 }
 
 /** The dashboard path `export`/`view` default to for a file-backed trace:
@@ -143,8 +259,129 @@ function defaultHtmlFor(ctracePath: string): string {
 }
 
 /**
- * Print the right message for a failed `openSource` and return the exit code, so
- * all five read commands report identically: the friendly "did the run capture?"
+ * An opened project: everything a command needs to choose WITHIN it, plus a way
+ * to materialize any one of its sessions as a synchronous `Reader`.
+ *
+ * The session list is fetched eagerly because ambiguity has to be DETECTED
+ * before anything is analyzed — a command cannot know whether it may default to
+ * the newest session without knowing how many there are. That is one extra query
+ * against a networked store, paid once per command.
+ */
+interface ProjectHandle {
+  /** Every session in the project, oldest first. */
+  sessions: Session[];
+  /** The session the store binds to by default: the newest. */
+  defaultId: string;
+  /** Where `export`/`view` write with no `--out`, or null for a database. */
+  htmlDefault: string | null;
+  /** The path this project was DISCOVERED at, or null when the user named it.
+   * Selector errors name it — see `sessionWhere`. */
+  discovered: string | null;
+  /** Materialize one session as a synchronous reader. Called twice (with two
+   * different ids) by a cross-session diff, which is exactly why this is a
+   * factory rather than a single pre-opened reader. */
+  read(sessionId: string): Promise<Reader>;
+  /** Release anything still held open — safe to call whether or not `read` was
+   * ever reached (a selector error aborts before it is). */
+  close(): Promise<void>;
+}
+
+/**
+ * Open the resolved project store. Two shapes, because the two families of
+ * backend have genuinely different costs:
+ *
+ * - A FILE backend is synchronous and cheap to keep open, so one `CTrace` is
+ *   opened and every `read()` is a `SessionView` over it. Two sessions of one
+ *   file cost one file handle.
+ * - A NETWORKED backend is read into an in-memory snapshot (the analyzers are
+ *   synchronous — see `store/snapshot.ts`), and `snapshotStore` closes the
+ *   connection it was handed. So the connection opened for the session listing
+ *   is HANDED TO the first `read()` rather than closed and reopened, and only a
+ *   genuine second session (a cross-session diff) pays for a second connection.
+ *   The already-fetched session list is passed along so the expensive listing
+ *   query is never run twice.
+ */
+async function openProject(project: string | undefined): Promise<ProjectHandle> {
+  const { backend, discovered } = resolveBackend(project);
+  const htmlDefault = htmlDefaultForBackend(backend);
+
+  if (isFileBackend(backend)) {
+    const ct = backend.openReader() as CTrace;
+    let sessions: Session[];
+    let defaultId: string;
+    try {
+      sessions = ct.listSessions();
+      defaultId = ct.getRun().id;
+    } catch (err) {
+      // Never leak the handle when the follow-up reads fail: the caller only
+      // gets a project it can close on success.
+      ct.close();
+      throw err;
+    }
+    return {
+      sessions,
+      defaultId,
+      htmlDefault,
+      discovered,
+      read: async (sessionId: string) => new SessionView(ct, sessionId),
+      close: async () => ct.close(),
+    };
+  }
+
+  const first = await backend.openReader();
+  let sessions: Session[];
+  let defaultId: string;
+  try {
+    sessions = await first.listSessions();
+    defaultId = (await first.getRun()).id;
+  } catch (err) {
+    await first.close();
+    throw err;
+  }
+  let pending: Store | null = first;
+  return {
+    sessions,
+    defaultId,
+    htmlDefault,
+    discovered,
+    read: async (sessionId: string) => {
+      const store = pending ?? (await backend.openReader());
+      pending = null;
+      return snapshotStore(store, { sessionId, sessionList: sessions });
+    },
+    close: async () => {
+      if (pending) {
+        const store = pending;
+        pending = null;
+        await store.close();
+      }
+    },
+  };
+}
+
+/** Open the resolved project bound to ONE session — the entry point every
+ * single-session command (`tokens`, `cache`, `export`, `view`, and the ordinary
+ * `diff`) uses. Throws `SelectionError` when the session cannot be resolved
+ * (unknown id, ambiguous prefix, or several sessions and no `--session`), always
+ * closing the handle on the way out. Mirrors Python `_open_session`. */
+async function openSession(
+  project: string | undefined,
+  session: string | null,
+): Promise<{ reader: Reader; sessionId: string; htmlDefault: string | null; handle: ProjectHandle }> {
+  const handle = await openProject(project);
+  try {
+    const sessionId = chooseSession(handle.sessions, session, handle.defaultId);
+    const reader = await handle.read(sessionId);
+    return { reader, sessionId, htmlDefault: handle.htmlDefault, handle };
+  } catch (err) {
+    await handle.close();
+    throw err;
+  }
+}
+
+/**
+ * Print the right message for a failed store open and return the exit code, so
+ * every read command reports identically: the friendly "did the run capture?"
  * line when there was nothing to open, and `ctxdiff: <error>` for a genuine
  * failure — both exit 1.
  *
@@ -165,10 +402,36 @@ function reportOpenFailure(err: unknown): number {
   return 1;
 }
 
+/**
+ * Print an unresolvable `--session`/`--agent` and return exit code 2.
+ *
+ * Exit 2 (not 1) because this is a USAGE error in argparse's sense — the flags
+ * as given cannot be acted on — and the message is printed verbatim because
+ * `selectors.ts` already built it complete with the listing of what could be
+ * picked instead. Mirrors Python `_report_selection_error`.
+ */
+function reportSelectionError(err: SelectionError): number {
+  process.stderr.write(err.message + "\n");
+  return 2;
+}
+
+/** Route any error out of a command to the right reporter: a selector problem is
+ * a usage error (exit 2, with its listing), anything else is an open/read
+ * failure (exit 1). One helper so all five read commands agree. */
+function reportCommandFailure(err: unknown): number {
+  if (err instanceof SelectionError) return reportSelectionError(err);
+  return reportOpenFailure(err);
+}
+
 interface ParsedArgs {
-  turns: number[];
-  agent: string | null;
-  run: string | undefined;
+  /** Every `--turn` value, in order, each carrying the text the user typed. */
+  turns: TurnArg[];
+  /** Every `--agent` value, in order. Non-repeatable commands see at most one. */
+  agents: string[];
+  /** Every `--session` value, in order. */
+  sessions: string[];
+  /** `--project`, its `--run` alias, or a leading positional path. */
+  project: string | undefined;
 }
 
 /** A usage error (bad flags/values). Carries the one-line `ctxdiff: error: …`
@@ -177,9 +440,19 @@ interface ParsedArgs {
 class UsageError extends Error {}
 
 /** Format an int array like Python's list repr: `[1, 2, 3]` (space after each
- * comma), unlike `JSON.stringify` which omits the spaces. */
+ * comma), unlike `JSON.stringify` which omits the spaces. For lists holding a
+ * turn the USER typed, use `turnList` instead — it echoes the digits rather than
+ * a double's rendering of them. */
 function pyIntList(arr: number[]): string {
   return "[" + arr.join(", ") + "]";
+}
+
+/** Integer thousands-separator formatting, matching Python's `{n:,}` — used for
+ * the `agents` table's token column. */
+function comma(n: number): string {
+  return String(Math.trunc(Math.abs(n)))
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+    .replace(/^/, n < 0 ? "-" : "");
 }
 
 /** Python `int(str)` acceptance: optional surrounding whitespace, optional
@@ -206,73 +479,298 @@ function usageErrorFromParse(err: unknown): UsageError {
   return new UsageError(`ctxdiff: error: ${e.message ?? "invalid arguments"}`);
 }
 
-/** Parse the flags common to the analysis commands. `--turn` is `multiple` so
- * `diff` can pass it twice; the callers apply their own count rules. A leading
- * positional is treated as the `.ctrace` path (alias for `--run`). Throws
- * `UsageError` (→ exit 2) on an unknown flag, a missing option value, or a
- * non-integer `--turn`, matching the Python CLI's exit code and message text. */
-function parseCommon(rest: string[]): ParsedArgs {
+/** The three selectors a command may register beyond `--project`/`--run`. */
+type SelectorFlag = "turn" | "agent" | "session";
+const ALL_SELECTORS: SelectorFlag[] = ["turn", "agent", "session"];
+
+/** argparse's own `_negative_number_matcher`. Reproduced rather than
+ * approximated so `--turn -1` and `--turn -1.5` are classified exactly as
+ * Python classifies them — see `joinNegativeTurnValues`. */
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+
+/**
+ * Rewrite `--turn -1` into `--turn=-1` before parsing.
+ *
+ * Why: `parseArgs` treats ANY token starting with `-` as an option, so a
+ * negative turn value fails with "expected one argument" (exit 2) where
+ * argparse — which, having no options that look like negative numbers, applies
+ * its negative-number heuristic — accepts `-1` as the value and reports
+ * "turn -1 not found" (exit 1). The `=` form is the same thing `parseArgs`
+ * would have done had the value not begun with a dash. Using argparse's own
+ * matcher also routes `--turn -1.5` to the int check, so it fails with Python's
+ * "invalid int value: '-1.5'" rather than a parser error about a missing value.
+ *
+ * Scanning stops at a bare `--`, exactly as argparse's does.
+ */
+function joinNegativeTurnValues(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--") {
+      out.push(...args.slice(i));
+      break;
+    }
+    if (args[i] === "--turn" && i + 1 < args.length && NEGATIVE_NUMBER.test(args[i + 1])) {
+      out.push(`--turn=${args[i + 1]}`);
+      i++;
+      continue;
+    }
+    out.push(args[i]);
+  }
+  return out;
+}
+
+/**
+ * Parse the flags shared by the analysis commands. `--turn` is always
+ * `multiple` so `diff` can pass it twice (the callers apply their own count
+ * rules); `--session`/`--agent` are `multiple` ONLY for `diff`, which is the one
+ * command that names two sides — everywhere else a repeated flag means
+ * last-wins, exactly as argparse behaves without `action="append"`. `--project`
+ * and its hidden `--run` alias write the same value, and a leading positional is
+ * treated as that path too. Throws `UsageError` (→ exit 2) on an unknown flag, a
+ * missing option value, or a non-integer `--turn`, matching the Python CLI's
+ * exit code and message text.
+ *
+ * `only` names the selectors THIS command actually acts on, and defaults to all
+ * three. It is not cosmetic: Python registers each flag on the one subparser
+ * that honors it, so `ctxdiff agents --agent researcher` is exit 2 there.
+ * Registering every flag everywhere and reading a subset made that command print
+ * EVERY agent and exit 0 — which reads as "the filter matched everything", so a
+ * script grepping the output is wrong forever and never finds out. Unregistered
+ * flags now reach `ERR_PARSE_ARGS_UNKNOWN_OPTION` and the shared
+ * `usageErrorFromParse`, instead of each command growing its own parser.
+ */
+function parseCommon(
+  rest: string[],
+  opts: { repeatable?: boolean; only?: SelectorFlag[] } = {},
+): ParsedArgs {
+  const repeatable = opts.repeatable === true;
+  const only = opts.only ?? ALL_SELECTORS;
+  const options: Record<string, { type: "string"; multiple?: boolean }> = {
+    project: { type: "string" },
+    run: { type: "string" },
+  };
+  if (only.includes("turn")) options.turn = { type: "string", multiple: true };
+  if (only.includes("agent")) options.agent = { type: "string", multiple: repeatable };
+  if (only.includes("session")) options.session = { type: "string", multiple: repeatable };
+
   let parsed;
   try {
     parsed = parseArgs({
-      args: rest,
-      options: {
-        turn: { type: "string", multiple: true },
-        agent: { type: "string" },
-        run: { type: "string" },
-      },
+      args: only.includes("turn") ? joinNegativeTurnValues(rest) : rest,
+      options,
       allowPositionals: true,
     });
   } catch (err) {
     throw usageErrorFromParse(err);
   }
   const rawTurns = (parsed.values.turn as string[] | undefined) ?? [];
-  const turns: number[] = [];
+  const turns: TurnArg[] = [];
   for (const raw of rawTurns) {
     if (!INT_RE.test(raw)) {
       throw new UsageError(`ctxdiff: error: argument --turn: invalid int value: '${raw}'`);
     }
-    turns.push(Number.parseInt(raw.trim(), 10));
+    turns.push(turnArg(raw));
   }
+  const many = (v: unknown): string[] =>
+    v === undefined ? [] : Array.isArray(v) ? (v as string[]) : [v as string];
   return {
     turns,
-    agent: (parsed.values.agent as string | undefined) ?? null,
-    run: (parsed.values.run as string | undefined) ?? (parsed.positionals[0] as string | undefined),
+    agents: many(parsed.values.agent),
+    sessions: many(parsed.values.session),
+    project:
+      (parsed.values.project as string | undefined) ??
+      (parsed.values.run as string | undefined) ??
+      (parsed.positionals[0] as string | undefined),
   };
 }
 
-/** `ctxdiff diff --turn N --turn M [--agent A] [--run PATH]`. */
+/** Reject an `--agent` naming nobody in the session under analysis, listing the
+ * agents that ARE there.
+ *
+ * Why this is worth a read: without it a typo'd or stale agent name filters every
+ * call away and the command cheerfully reports "no calls in this run" —
+ * technically true, actively misleading, and exit 0, so a CI check built on it
+ * would pass forever. Throwing `SelectionError` turns it into what it is: a bad
+ * flag (exit 2) with the correct values printed underneath. Mirrors Python
+ * `_check_agent_filter`. */
+function checkAgentFilter(
+  reader: Reader,
+  sessionId: string,
+  agent: string | null,
+  discovered: string | null,
+): void {
+  if (agent === null) return;
+  requireAgent(agent, distinctAgentNames(reader.getCalls()), sessionWhere(sessionId, discovered));
+}
+
+// --- diff ----------------------------------------------------------------------
+
+/** Which turn one side of a cross diff should read, in priority order: the
+ * side's own `:TURN` suffix; else the matching one of two `--turn` flags; else a
+ * single `--turn` applied to BOTH sides (the common regression shape — "turn 8
+ * in the good run vs turn 8 in the bad one"). null means the user named no turn
+ * for this side, which is a usage error the caller reports. Mirrors Python
+ * `_side_turn`. */
+function sideTurn(selector: Selector, index: number, turns: TurnArg[]): TurnArg | null {
+  if (selector.turn !== null) return selector.turn;
+  if (turns.length === 2) return turns[index];
+  if (turns.length === 1) return turns[0];
+  return null;
+}
+
+/** Assemble one `DiffSide`, turning "no turn was named for this side" into a
+ * `SelectionError` (exit 2) that spells out both ways to name one. */
+function makeSide(
+  sessionId: string,
+  agent: string | null,
+  selector: Selector,
+  index: number,
+  turns: TurnArg[],
+  axis: string,
+): DiffSide {
+  const turn = sideTurn(selector, index, turns);
+  if (turn === null) {
+    throw new SelectionError(
+      `ctxdiff: each side of a cross-${axis} diff needs a turn — pass ` +
+        `--${axis} VALUE:TURN twice, or --turn N --turn M`,
+    );
+  }
+  return { sessionId, agent, turn };
+}
+
+/** Load the ordered blocks of the ONE call a diff side names, validating that
+ * the turn exists (and belongs to the named agent) first. Throws with a
+ * session-qualified message — a cross diff spans two sessions, so "turn 8 not
+ * found" without saying WHERE is unusable. Mirrors Python `_side_blocks`. */
+function sideBlocks(
+  reader: Reader,
+  side: DiffSide,
+  discovered: string | null,
+): CallBlock[] {
+  const calls = reader.getCalls(side.sessionId);
+  const where = sessionWhere(side.sessionId, discovered);
+  let match: Call | undefined;
+  if (side.agent !== null) {
+    const owned = calls.filter((c) => c.agent === side.agent);
+    match = owned.find((c) => c.seq === side.turn.value);
+    if (!match) {
+      throw new Error(
+        `${where}: turn ${side.turn.text} is not a call of agent '${side.agent}' ` +
+          `(that agent's turns: ${pyIntList(owned.map((c) => c.seq))})`,
+      );
+    }
+  } else {
+    match = calls.find((c) => c.seq === side.turn.value);
+    if (!match) {
+      throw new Error(
+        `${where}: turn ${side.turn.text} not found (available turns: ` +
+          `${pyIntList(calls.map((c) => c.seq).sort((a, b) => a - b))})`,
+      );
+    }
+  }
+  return reader.getCallBlocks(match.id);
+}
+
+/** `ctxdiff diff` in its three shapes, dispatched purely on how many times
+ * `--session`/`--agent` were passed:
+ *
+ * - twice `--session` -> CROSS-SESSION (same agent, two runs);
+ * - twice `--agent`   -> CROSS-AGENT (two agents, one run);
+ * - otherwise         -> the ordinary two-turn diff within one session.
+ *
+ * Everything `parseArgs` cannot express is checked here: at most two of each
+ * flag, never both axes at once, and a `:TURN` suffix only where it means
+ * something. All of those are usage errors (exit 2). Mirrors Python `_cmd_diff`.
+ */
 async function cmdDiff(rest: string[]): Promise<number> {
-  const args = parseCommon(rest);
-  if (args.turns.length !== 2) {
+  const args = parseCommon(rest, { repeatable: true });
+  const sessionSels = args.sessions.map(parseSelector);
+  const agentSels = args.agents.map(parseSelector);
+
+  if (sessionSels.length > 2 || agentSels.length > 2) {
     process.stderr.write(
-      "ctxdiff diff requires exactly two --turn flags, e.g. " +
-        "'ctxdiff diff --turn 7 --turn 8'\n",
+      "ctxdiff diff compares exactly two sides: pass --session (or --agent) " +
+        "at most twice\n",
     );
     return 2;
   }
-  let ct: Reader;
-  try {
-    ({ reader: ct } = await openSource(args.run));
-  } catch (err) {
-    return reportOpenFailure(err);
+  if (sessionSels.length === 2 && agentSels.length === 2) {
+    process.stderr.write(
+      "ctxdiff diff compares along ONE axis: pass two --session values " +
+        "(cross-session) or two --agent values (cross-agent), not both\n",
+    );
+    return 2;
   }
+
+  const crossSession = sessionSels.length === 2;
+  const crossAgent = agentSels.length === 2;
+  if (!crossSession && !crossAgent) {
+    if ([...sessionSels, ...agentSels].some((s) => s.turn !== null)) {
+      process.stderr.write(
+        "ctxdiff diff: a ':TURN' suffix only means something on a " +
+          "cross-session or cross-agent diff — use --turn N --turn M here\n",
+      );
+      return 2;
+    }
+    if (args.turns.length !== 2) {
+      process.stderr.write(
+        "ctxdiff diff requires exactly two --turn flags, e.g. " +
+          "'ctxdiff diff --turn 7 --turn 8'\n",
+      );
+      return 2;
+    }
+    return await diffWithinSession(args, sessionSels, agentSels);
+  }
+
+  if (args.turns.length > 2) {
+    process.stderr.write("ctxdiff diff accepts at most two --turn flags\n");
+    return 2;
+  }
+  return await diffCross(args, sessionSels, agentSels, crossSession);
+}
+
+/** The ordinary diff: two turns of ONE session, optionally filtered to one
+ * agent. Unchanged in behavior from before sessions existed — same ownership
+ * check, same messages, same exit codes — except that the session it reads is
+ * now chosen rather than assumed. */
+async function diffWithinSession(
+  args: ParsedArgs,
+  sessionSels: Selector[],
+  agentSels: Selector[],
+): Promise<number> {
+  const wanted = sessionSels.length ? sessionSels[0].name : null;
+  const agent = agentSels.length ? agentSels[0].name : null;
+  let opened;
   try {
+    opened = await openSession(args.project, wanted);
+  } catch (err) {
+    return reportCommandFailure(err);
+  }
+  const { reader: ct, sessionId, handle } = opened;
+  try {
+    try {
+      checkAgentFilter(ct, sessionId, agent, handle.discovered);
+    } catch (err) {
+      return reportCommandFailure(err);
+    }
     const [turnOld, turnNew] = args.turns;
-    if (args.agent !== null) {
-      const agentSeqs = ct.getCalls().filter((c) => c.agent === args.agent).map((c) => c.seq);
-      const bad = [turnOld, turnNew].filter((t) => !agentSeqs.includes(t));
+    // --agent: validate BOTH turns belong to that agent before diffing. Turns
+    // stay global seq numbers (what every view shows); we only check ownership,
+    // then diffTurns resolves them against the whole session as usual.
+    if (agent !== null) {
+      const agentSeqs = ct.getCalls().filter((c) => c.agent === agent).map((c) => c.seq);
+      const bad = [turnOld, turnNew].filter((t) => !agentSeqs.includes(t.value));
       if (bad.length) {
         process.stderr.write(
-          `ctxdiff: turn(s) ${pyIntList(bad)} are not calls of agent ` +
-            `'${args.agent}' (that agent's turns: ${pyIntList(agentSeqs)})\n`,
+          `ctxdiff: turn(s) ${turnList(bad)} are not calls of agent ` +
+            `'${agent}' (that agent's turns: ${pyIntList(agentSeqs)})\n`,
         );
         return 1;
       }
     }
     let diff;
     try {
-      diff = diffTurns(ct, turnOld, turnNew);
+      diff = diffTurns(ct, turnOld.value, turnNew.value, [turnOld.text, turnNew.text]);
     } catch (err) {
       process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
       return 1;
@@ -281,36 +779,169 @@ async function cmdDiff(rest: string[]): Promise<number> {
     return 0;
   } finally {
     ct.close();
+    await handle.close();
   }
 }
 
-/** `ctxdiff tokens [--turn N] [--agent A] [--run PATH]`. */
-async function cmdTokens(rest: string[]): Promise<number> {
-  const args = parseCommon(rest);
-  let ct: Reader;
+/**
+ * The cross-session / cross-agent diff. Reuses `diffCalls` verbatim — the differ
+ * aligns two ordered block lists by content hash and has never cared where they
+ * came from, so comparing turn 8 of a good run against turn 8 of a bad one is
+ * the SAME operation as comparing two turns of one run. All this adds is
+ * resolving which two calls those are, and a scope header naming them (without
+ * which two `turn 8`s in one header would be indistinguishable).
+ */
+async function diffCross(
+  args: ParsedArgs,
+  sessionSels: Selector[],
+  agentSels: Selector[],
+  crossSession: boolean,
+): Promise<number> {
+  let handle: ProjectHandle;
   try {
-    ({ reader: ct } = await openSource(args.run));
+    handle = await openProject(args.project);
   } catch (err) {
     return reportOpenFailure(err);
   }
   try {
+    let left: DiffSide;
+    let right: DiffSide;
+    let leftReader: Reader;
+    let rightReader: Reader;
+    try {
+      const built = crossSession
+        ? await crossSessionSides(handle, sessionSels, agentSels, args.turns)
+        : await crossAgentSides(handle, sessionSels, agentSels, args.turns);
+      [left, right] = built.sides;
+      [leftReader, rightReader] = built.readers;
+    } catch (err) {
+      return reportCommandFailure(err);
+    }
+    let oldBlocks: CallBlock[];
+    let newBlocks: CallBlock[];
+    try {
+      oldBlocks = sideBlocks(leftReader, left, handle.discovered);
+      newBlocks = sideBlocks(rightReader, right, handle.discovered);
+    } catch (err) {
+      process.stderr.write(`ctxdiff: ${(err as Error).message}\n`);
+      return 1;
+    }
+    const diff = diffCalls(oldBlocks, newBlocks, left.turn.value, right.turn.value);
+    const scope = diffScopeLine(left, right);
+    if (scope) process.stdout.write(scope + "\n");
+    process.stdout.write(renderTurnDiff(diff) + "\n");
+    return 0;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Both sides of a CROSS-SESSION diff — the regression case: the same agent, two
+ * runs. Resolves each `--session` value to a real session id, then settles the
+ * agent ONCE for both sides, since "the same agent in two runs" is the entire
+ * premise: an explicit `--agent` is validated against both sessions, and with
+ * none given the agent is inferred only when it cannot be wrong (exactly one
+ * agent, or none at all) — otherwise the user is asked. Mirrors Python
+ * `_cross_session_sides`. */
+async function crossSessionSides(
+  handle: ProjectHandle,
+  sessionSels: Selector[],
+  agentSels: Selector[],
+  turns: TurnArg[],
+): Promise<{ sides: DiffSide[]; readers: Reader[] }> {
+  const ids = sessionSels.map((s) => chooseSession(handle.sessions, s.name, handle.defaultId));
+  const first = await handle.read(ids[0]);
+  // Two `--session` values that resolve to the SAME session need only one
+  // reader — and against a database that is one fewer connection.
+  const second = ids[1] === ids[0] ? first : await handle.read(ids[1]);
+  const readers = [first, second];
+  const perSessionAgents = readers.map((r) => distinctAgentNames(r.getCalls()));
+
+  let agent: string | null = agentSels.length ? agentSels[0].name : null;
+  if (agent === null) {
+    const combined: string[] = [];
+    for (const names of perSessionAgents) {
+      for (const n of names) if (!combined.includes(n)) combined.push(n);
+    }
+    requireSingleAgent(combined, "these sessions");
+    agent = combined.length ? combined[0] : null;
+  } else {
+    for (let i = 0; i < ids.length; i++) {
+      requireAgent(agent, perSessionAgents[i], sessionWhere(ids[i], handle.discovered));
+    }
+  }
+
+  return {
+    sides: [0, 1].map((i) => makeSide(ids[i], agent, sessionSels[i], i, turns, "session")),
+    readers,
+  };
+}
+
+/** Both sides of a CROSS-AGENT diff: two agents, one session — "why does the
+ * writer see a different context than the researcher?". The session is resolved
+ * exactly as for any single-session command (so it may be omitted when the
+ * project holds one), and both agent names are validated against that session
+ * before any turn is looked up. Mirrors Python `_cross_agent_sides`. */
+async function crossAgentSides(
+  handle: ProjectHandle,
+  sessionSels: Selector[],
+  agentSels: Selector[],
+  turns: TurnArg[],
+): Promise<{ sides: DiffSide[]; readers: Reader[] }> {
+  const wanted = sessionSels.length ? sessionSels[0].name : null;
+  const sessionId = chooseSession(handle.sessions, wanted, handle.defaultId);
+  const reader = await handle.read(sessionId);
+  const names = distinctAgentNames(reader.getCalls());
+  for (const sel of agentSels) {
+    requireAgent(sel.name, names, sessionWhere(sessionId, handle.discovered));
+  }
+  return {
+    sides: [0, 1].map((i) =>
+      makeSide(sessionId, agentSels[i].name, agentSels[i], i, turns, "agent"),
+    ),
+    readers: [reader, reader],
+  };
+}
+
+// --- tokens / cache -------------------------------------------------------------
+
+/** `ctxdiff tokens [--turn N] [--project P] [--session S] [--agent A]`. */
+async function cmdTokens(rest: string[]): Promise<number> {
+  const args = parseCommon(rest);
+  // --session/--agent are single here: last value wins, matching argparse
+  // without action="append".
+  const session = args.sessions.length ? args.sessions[args.sessions.length - 1] : null;
+  const agent = args.agents.length ? args.agents[args.agents.length - 1] : null;
+  let opened;
+  try {
+    opened = await openSession(args.project, session);
+  } catch (err) {
+    return reportCommandFailure(err);
+  }
+  const { reader: ct, sessionId, handle } = opened;
+  try {
+    try {
+      checkAgentFilter(ct, sessionId, agent, handle.discovered);
+    } catch (err) {
+      return reportCommandFailure(err);
+    }
     // tokens' --turn is single: last value wins (matching argparse without append).
     const turn = args.turns.length ? args.turns[args.turns.length - 1] : null;
-    const runTokens = analyzeRun(ct, args.agent);
+    const runTokens = analyzeRun(ct, agent);
     const bySeq = new Map(runTokens.calls.map((c) => [c.seq, c]));
 
     let selected;
     if (turn !== null) {
-      if (!bySeq.has(turn)) {
-        const where = args.agent !== null ? `agent '${args.agent}'` : "this run";
+      if (!bySeq.has(turn.value)) {
+        const where = agent !== null ? `agent '${agent}'` : "this run";
         const available = [...bySeq.keys()].sort((a, b) => a - b);
         process.stderr.write(
-          `ctxdiff: turn ${turn} not found in ${where} ` +
+          `ctxdiff: turn ${turn.text} not found in ${where} ` +
             `(available turns: ${pyIntList(available)})\n`,
         );
         return 1;
       }
-      selected = [bySeq.get(turn)!];
+      selected = [bySeq.get(turn.value)!];
     } else {
       selected = runTokens.calls;
     }
@@ -321,7 +952,7 @@ async function cmdTokens(rest: string[]): Promise<number> {
       totalTools = registeredToolNames(allBlocks).size;
     }
 
-    const usageSummary = renderUsageSummary(runTokens.usage, args.agent);
+    const usageSummary = renderUsageSummary(runTokens.usage, agent);
     const agentSummary = renderAgentSummary(runTokens);
     process.stdout.write(
       renderRunTokens(selected, runTokens.bloat, totalTools, agentSummary, usageSummary) + "\n",
@@ -329,93 +960,240 @@ async function cmdTokens(rest: string[]): Promise<number> {
     return 0;
   } finally {
     ct.close();
+    await handle.close();
   }
 }
 
-/** `ctxdiff cache [--agent A] [--run PATH]`. */
+/** `ctxdiff cache [--project P] [--session S] [--agent A]`. No `--turn`: the
+ * profiler works on consecutive-call PAIRS, and a single turn has no pair to be
+ * stable against. */
 async function cmdCache(rest: string[]): Promise<number> {
-  const args = parseCommon(rest);
-  let ct: Reader;
+  // No `--turn`: the profiler works on consecutive-call PAIRS, so Python's
+  // subparser never registered one, and neither does this.
+  const args = parseCommon(rest, { only: ["agent", "session"] });
+  const session = args.sessions.length ? args.sessions[args.sessions.length - 1] : null;
+  const agent = args.agents.length ? args.agents[args.agents.length - 1] : null;
+  let opened;
   try {
-    ({ reader: ct } = await openSource(args.run));
+    opened = await openSession(args.project, session);
   } catch (err) {
-    return reportOpenFailure(err);
+    return reportCommandFailure(err);
   }
+  const { reader: ct, sessionId, handle } = opened;
   try {
-    process.stdout.write(renderCacheReport(analyzeCache(ct, args.agent)) + "\n");
+    try {
+      checkAgentFilter(ct, sessionId, agent, handle.discovered);
+    } catch (err) {
+      return reportCommandFailure(err);
+    }
+    process.stdout.write(renderCacheReport(analyzeCache(ct, agent)) + "\n");
     return 0;
   } finally {
     ct.close();
+    await handle.close();
   }
 }
 
-/**
- * `ctxdiff runs`: list the sessions ctxdiff can see. No flags (matches Python).
- *
- * Where it looks mirrors `openSource` (and therefore every other read command):
- * a configured NETWORKED backend, or a configured SQLite backend naming ONE
- * concrete file, is listed session-by-session through the store protocol; with
- * nothing configured it falls back to listing every `*.ctrace` in the cwd. Why
- * that matters: with `CTXDIFF_STORE` set, a `runs` that globbed the working
- * directory would answer "no .ctrace files" about a machine whose traces all
- * live in Postgres.
- */
-async function cmdRuns(): Promise<number> {
-  try {
-    const backend = resolveConfigured();
-    if (backend !== null) {
-      const configuredPath = isFileBackend(backend) ? (backend as SQLiteStore).path : null;
-      if (!isFileBackend(backend) || (configuredPath && !isDirectory(configuredPath))) {
-        return await runsFromStore(backend);
-      }
-    }
-  } catch (err) {
-    // A bad DSN or a dead database is reported, not crashed.
-    return reportOpenFailure(err);
-  }
-  process.stdout.write(renderRunsList(listRuns(process.cwd())) + "\n");
-  return 0;
-}
+// --- discovery: sessions / agents ------------------------------------------------
 
-/**
- * List `ctxdiff runs` out of a CONFIGURED store rather than the cwd: one row per
- * SESSION (oldest first) keyed by a short session id instead of a filename,
- * since a store holds many sessions and no filenames at all. Turn counts and
- * agent lists come straight off the `Session` summary, so this is one query set
- * rather than an open-per-file. An EMPTY store is not an error — it prints an
- * empty listing and exits 0, exactly as an empty directory does.
- */
-async function runsFromStore(backend: StoreBackend): Promise<number> {
-  const empty = "no sessions in the configured store";
-  let sessions: Session[];
-  try {
-    // Straight through the store protocol rather than via `openSource`: a
-    // listing needs the session SUMMARIES only, and snapshotting would drag the
-    // newest session's every call and block across the network to print one line
-    // per session.
-    const reader = await backend.openReader();
-    try {
-      sessions = await reader.listSessions();
-    } finally {
-      await reader.close();
-    }
-  } catch (err) {
-    if (err instanceof EmptyStoreError) {
-      process.stdout.write(renderRunsList([], empty) + "\n");
-      return 0;
-    }
-    throw err;
-  }
-  const rows = sessions.map((s) => ({
-    filename: s.id.slice(0, 12),
+const EMPTY_CWD = "no .ctrace files in the current directory";
+const EMPTY_PROJECT = "no sessions in this project";
+const EMPTY_STORE = "no sessions in the configured store";
+
+/** Turn one `.ctrace` file's sessions into `sessions`-table rows. The label is
+ * the bare filename when the file holds ONE session — the overwhelmingly common
+ * case, and what a user recognizes — and `<filename>#<short id>` when it holds
+ * several, so each row names something that can actually be selected
+ * (`--project <filename> --session <short id>`). Mirrors Python
+ * `_file_session_rows`. */
+function fileSessionRows(filename: string, sessions: Session[]): SessionRow[] {
+  const multi = sessions.length > 1;
+  return sessions.map((s) => ({
+    label: multi ? `${filename}#${shortId(s.id)}` : filename,
+    started: formatLocal(s.startedAt),
     project: s.project,
     provider: s.provider,
     turns: s.turnCount,
-    agents: s.agents.length ? s.agents.join(", ") : "-",
+    agents: agentsText(s.agents),
   }));
-  process.stdout.write(renderRunsList(rows, empty) + "\n");
+}
+
+/** Every session in `backend`, with the handle always released. An empty store is
+ * reported as an empty list rather than an error — a database that exists but
+ * holds nothing yet is a perfectly normal state, and the caller prints an empty
+ * listing for it exactly as it would for an empty directory. */
+async function readSessions(backend: StoreBackend): Promise<Session[]> {
+  let reader: Store;
+  try {
+    reader = await backend.openReader();
+  } catch (err) {
+    if (err instanceof EmptyStoreError) return [];
+    throw err;
+  }
+  try {
+    return await reader.listSessions();
+  } finally {
+    await reader.close();
+  }
+}
+
+/**
+ * `ctxdiff sessions` (and its hidden `runs` alias): the answer to "what can I
+ * pass to --session?".
+ *
+ * Where it looks mirrors every other command with ONE deliberate exception: with
+ * no `--project` and nothing configured, it lists every `*.ctrace` in the working
+ * directory rather than narrowing to the newest. Discovery is the one job where
+ * narrowing would defeat the purpose — you cannot pick a project you were never
+ * shown. A file that fails to open is skipped rather than aborting the listing.
+ */
+async function cmdSessions(rest: string[]): Promise<number> {
+  // Discovery takes `--project`/`--run` and nothing else: this command answers
+  // "what can I pass to --session?", so accepting `--session` would be circular
+  // and accepting `--agent` would promise a filter it does not apply.
+  const args = parseCommon(rest, { only: [] });
+  let backend: StoreBackend | null;
+  try {
+    backend = discoveryBackend(args.project);
+  } catch (err) {
+    // A bad DSN is reported, not crashed.
+    return reportOpenFailure(err);
+  }
+
+  if (backend === null) {
+    const rows: SessionRow[] = [];
+    for (const f of listFileSessions(process.cwd())) {
+      rows.push(...fileSessionRows(f.filename, f.sessions));
+    }
+    process.stdout.write(renderSessionsList(rows, EMPTY_CWD) + "\n");
+    return 0;
+  }
+
+  const empty = args.project ? EMPTY_PROJECT : EMPTY_STORE;
+  let sessions: Session[];
+  try {
+    sessions = await readSessions(backend);
+  } catch (err) {
+    return reportOpenFailure(err);
+  }
+
+  const path = isFileBackend(backend) ? (backend as SQLiteStore).path : null;
+  const rows: SessionRow[] = path
+    ? fileSessionRows(basename(path), sessions)
+    : // A networked store has no filenames at all, so the short session id is
+      // the only label there is — and it is exactly what `--session` takes.
+      sessions.map((s) => ({
+        label: shortId(s.id),
+        started: formatLocal(s.startedAt),
+        project: s.project,
+        provider: s.provider,
+        turns: s.turnCount,
+        agents: agentsText(s.agents),
+      }));
+  process.stdout.write(renderSessionsList(rows, empty) + "\n");
   return 0;
 }
+
+/**
+ * Aggregate per-session call lists into the `agents` table's rows: for each
+ * agent, how many SESSIONS it appears in, how many calls it made in total, and
+ * its provider-reported token spend.
+ *
+ * How: one pass over every session's calls, bucketing by agent name (calls with
+ * no label share the same `(unlabeled)` bucket the token report uses) in
+ * first-appearance order, counting a session once per agent it contains. The
+ * token column is delegated to `usageTotals`, the same rollup `ctxdiff tokens`
+ * prints, so the two commands can never report different numbers for the same
+ * calls — and it renders '-' rather than 0 when NO call of that agent reported
+ * usage, because 0 would read as "this agent was free". Mirrors Python
+ * `_agent_rows`.
+ */
+function agentRows(sessionsCalls: Call[][]): AgentRow[] {
+  const order: string[] = [];
+  const callsByAgent = new Map<string, Call[]>();
+  const sessionCounts = new Map<string, number>();
+  for (const calls of sessionsCalls) {
+    const seenHere = new Set<string>();
+    for (const c of calls) {
+      const name = c.agent ? c.agent : UNLABELED;
+      if (!callsByAgent.has(name)) {
+        order.push(name);
+        callsByAgent.set(name, []);
+      }
+      callsByAgent.get(name)!.push(c);
+      if (!seenHere.has(name)) {
+        seenHere.add(name);
+        sessionCounts.set(name, (sessionCounts.get(name) ?? 0) + 1);
+      }
+    }
+  }
+  return order.map((name) => {
+    const calls = callsByAgent.get(name)!;
+    const totals = usageTotals(calls);
+    return {
+      name,
+      sessions: sessionCounts.get(name)!,
+      calls: calls.length,
+      tokens: totals.callsWithUsage
+        ? comma(totals.inputTokens + totals.outputTokens)
+        : "-",
+    };
+  });
+}
+
+/**
+ * `ctxdiff agents`: every agent in the project with its footprint aggregated
+ * ACROSS all sessions.
+ *
+ * Why aggregated: "how much does the researcher cost" is a question about the
+ * project, not about whichever run happens to be newest — a per-session answer
+ * would change every time the user re-ran their agent. Project resolution is the
+ * same as `sessions`', including the cwd-wide scan when nothing is configured, so
+ * the two discovery commands always describe the same set of traces.
+ */
+async function cmdAgents(rest: string[]): Promise<number> {
+  // `--project`/`--run` only, exactly as Python's subparser registers it: the
+  // rollup is over EVERY session and EVERY agent by definition, so a selector
+  // here could only ever be ignored.
+  const args = parseCommon(rest, { only: [] });
+  let backend: StoreBackend | null;
+  try {
+    backend = discoveryBackend(args.project);
+  } catch (err) {
+    return reportOpenFailure(err);
+  }
+
+  let sessionsCalls: Call[][] = [];
+  try {
+    if (backend === null) {
+      sessionsCalls = listFileCalls(process.cwd());
+    } else {
+      let reader: Store | null;
+      try {
+        reader = await backend.openReader();
+      } catch (err) {
+        if (err instanceof EmptyStoreError) reader = null;
+        else throw err;
+      }
+      if (reader !== null) {
+        try {
+          for (const s of await reader.listSessions()) {
+            sessionsCalls.push(await reader.getCalls(s.id));
+          }
+        } finally {
+          await reader.close();
+        }
+      }
+    }
+  } catch (err) {
+    return reportOpenFailure(err);
+  }
+
+  process.stdout.write(renderAgentsList(agentRows(sessionsCalls)) + "\n");
+  return 0;
+}
+
+// --- viewer commands -------------------------------------------------------------
 
 /** Open `filePath` in the default browser via the OS opener (`open` on macOS,
  * `start` on Windows, `xdg-open` on Linux). Best-effort and fully guarded: a
@@ -461,34 +1239,52 @@ function parseViewerArgs(
   }
 }
 
-/** `ctxdiff export [--run PATH] [--out FILE.html]`: write a self-contained HTML
- * dashboard beside the trace (or to `--out`) and print the path. */
+/** The `--project` / `--run` / positional trio every viewer command accepts,
+ * resolved in the same explicit-beats-ambient order the analysis commands use. */
+function viewerProject(values: Record<string, unknown>, positionals: string[]): string | undefined {
+  return (
+    (values.project as string | undefined) ??
+    (values.run as string | undefined) ??
+    (positionals[0] as string | undefined)
+  );
+}
+
+/** `ctxdiff export [--project P] [--session S] [--out FILE.html]`: write a
+ * self-contained HTML dashboard for ONE session beside the trace (or to
+ * `--out`) and print the path. */
 async function cmdExport(rest: string[]): Promise<number> {
   const { values, positionals } = parseViewerArgs(rest, {
+    project: { type: "string" },
     run: { type: "string" },
+    session: { type: "string" },
     out: { type: "string" },
   });
-  const explicit = (values.run as string | undefined) ?? (positionals[0] as string | undefined);
   try {
-    const out = await writeDashboard(explicit, values.out as string | undefined);
+    const out = await writeDashboard(
+      viewerProject(values, positionals),
+      (values.session as string | undefined) ?? null,
+      values.out as string | undefined,
+    );
     process.stdout.write(out + "\n");
     return 0;
   } catch (err) {
-    return reportOpenFailure(err);
+    return reportCommandFailure(err);
   }
 }
 
 /**
- * Render a dashboard for whichever trace `openSource` resolves and return the
- * path written. `out` wins; otherwise the trace's own `<stem>.html` is used, and
- * a store with no file (Postgres/MySQL) says so rather than inventing a
- * filename. Shared by `export` and `view` so both reach a database identically.
+ * Render a dashboard for ONE session of whichever project `openSession` resolves
+ * and return the path written. `out` wins; otherwise the trace's own
+ * `<stem>.html` is used, and a store with no file (Postgres/MySQL) says so rather
+ * than inventing a filename. Shared by `export` and `view` so both reach a
+ * database identically.
  */
 async function writeDashboard(
-  explicit: string | undefined,
+  project: string | undefined,
+  session: string | null,
   out: string | undefined,
 ): Promise<string> {
-  const { reader, htmlDefault } = await openSource(explicit);
+  const { reader, htmlDefault, handle } = await openSession(project, session);
   try {
     const target = out ?? htmlDefault;
     if (target === null) {
@@ -500,23 +1296,30 @@ async function writeDashboard(
     return exportStore(reader, target);
   } finally {
     reader.close();
+    await handle.close();
   }
 }
 
-/** `ctxdiff view [--run PATH] [--no-open]`: export the dashboard to a temp file,
- * print its path, and open it in the browser unless `--no-open`. */
+/** `ctxdiff view [--project P] [--session S] [--no-open]`: export the dashboard
+ * to a temp file, print its path, and open it in the browser unless
+ * `--no-open`. */
 async function cmdView(rest: string[]): Promise<number> {
   const { values, positionals } = parseViewerArgs(rest, {
+    project: { type: "string" },
     run: { type: "string" },
+    session: { type: "string" },
     "no-open": { type: "boolean" },
   });
-  const explicit = (values.run as string | undefined) ?? (positionals[0] as string | undefined);
   const tmp = join(tmpdir(), `ctxdiff-${randomUUID()}.html`);
   let out: string;
   try {
-    out = await writeDashboard(explicit, tmp);
+    out = await writeDashboard(
+      viewerProject(values, positionals),
+      (values.session as string | undefined) ?? null,
+      tmp,
+    );
   } catch (err) {
-    return reportOpenFailure(err);
+    return reportCommandFailure(err);
   }
   process.stdout.write(out + "\n");
   if (!values["no-open"]) openInBrowser(out);
@@ -571,6 +1374,8 @@ function cmdDemo(rest: string[]): number {
   return 0;
 }
 
+// `runs` is deliberately absent: it still dispatches (see `main`), it just isn't
+// offered to anyone reading the usage for the first time.
 const USAGE =
   "usage: ctxdiff <command> [options]\n" +
   "\n" +
@@ -578,12 +1383,13 @@ const USAGE =
   "  diff --turn N --turn M   git-style block diff between two turns\n" +
   "  tokens [--turn N]        token heatmap + schema-bloat report\n" +
   "  cache                    prefix-stability report + wasted-spend estimate\n" +
-  "  runs                     list .ctrace files in the working directory\n" +
+  "  sessions                 list the sessions ctxdiff can see\n" +
+  "  agents                   list every agent in the project, across all sessions\n" +
   "  view                     open a self-contained HTML dashboard in your browser\n" +
-  "  export [--out FILE]      write a self-contained HTML dashboard for a run\n" +
+  "  export [--out FILE]      write a self-contained HTML dashboard for a session\n" +
   "  demo                     build a sample dashboard — no API keys, no setup\n" +
   "\n" +
-  "common options: [--agent A] [--run PATH | positional PATH]\n";
+  "common options: [--project PATH|DSN] [--session ID] [--agent NAME]\n";
 
 /** Dispatch on the first argument (the command); return an exit code. With no
  * command, print usage and return 2 (matching the Python CLI's convention). */
@@ -598,8 +1404,14 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdTokens(rest);
       case "cache":
         return await cmdCache(rest);
+      case "sessions":
+      // `runs` is the HIDDEN alias of `sessions`. The command was renamed once a
+      // `.ctrace` became a project holding many runs, but every existing script,
+      // README and muscle memory says `runs` — so it keeps working, forever.
       case "runs":
-        return await cmdRuns();
+        return await cmdSessions(rest);
+      case "agents":
+        return await cmdAgents(rest);
       case "export":
         return await cmdExport(rest);
       case "view":

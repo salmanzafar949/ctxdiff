@@ -191,6 +191,34 @@ describe("project-scoped store: UTC-canonical timestamps", () => {
       Date.UTC(2026, 6, 24, 12, 0, 0, 123),
     );
   });
+
+  it("parseStartedAt accepts every spelling Python's fromisoformat does", () => {
+    // Only reachable from a FOREIGN or hand-edited database — ctxdiff itself
+    // always writes `...Z` — but a row one CLI renders and the other echoes raw
+    // is exactly the kind of silent disagreement the two SDKs exist to avoid.
+    // A TWO-DIGIT offset (`+05`, ISO 8601's hour-only form).
+    expect(parseStartedAt("2026-07-04T10:00:00+05").getTime()).toBe(
+      Date.UTC(2026, 6, 4, 5, 0, 0),
+    );
+    expect(parseStartedAt("2026-07-04T10:00:00-05").getTime()).toBe(
+      Date.UTC(2026, 6, 4, 15, 0, 0),
+    );
+    // The ISO BASIC form (no separators), with each zone spelling.
+    expect(parseStartedAt("20260704T100000Z").getTime()).toBe(
+      Date.UTC(2026, 6, 4, 10, 0, 0),
+    );
+    expect(parseStartedAt("20260704T100000+0530").getTime()).toBe(
+      Date.UTC(2026, 6, 4, 4, 30, 0),
+    );
+    // Basic form with no zone at all is UTC, like every other naive value.
+    expect(parseStartedAt("20260704T100000").getTime()).toBe(
+      Date.UTC(2026, 6, 4, 10, 0, 0),
+    );
+    // A date with no time is still midnight UTC, not local midnight.
+    expect(parseStartedAt("2026-07-04").getTime()).toBe(Date.UTC(2026, 6, 4));
+    // ...and a value neither side can parse still throws.
+    expect(() => parseStartedAt("not a timestamp")).toThrow(/invalid started_at/);
+  });
 });
 
 describe("project-scoped store: fail-open on setup failure", () => {

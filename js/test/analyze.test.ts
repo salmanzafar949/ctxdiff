@@ -6,7 +6,7 @@ import { CTrace } from "../src/store/ctrace.js";
 import { diffTurns } from "../src/analyze/diff.js";
 import { analyzeRun, detectBloat, extractToolName } from "../src/analyze/tokens.js";
 import { analyzeCache } from "../src/analyze/cache.js";
-import { listRuns } from "../src/analyze/runs.js";
+import { listFileSessions } from "../src/analyze/sessions.js";
 import { makeFixtures } from "./helpers/fixtures.js";
 
 let dir: string;
@@ -157,19 +157,20 @@ describe("cache analyzer", () => {
   });
 });
 
-describe("runs analyzer", () => {
-  it("lists every .ctrace in a directory with summary stats, sorted by filename", () => {
-    const rows = listRuns(dir);
-    const names = rows.map((r) => r.filename);
+describe("session scanner", () => {
+  it("lists every .ctrace in a directory with its sessions, sorted by filename", () => {
+    const files = listFileSessions(dir);
+    const names = files.map((f) => f.filename);
     expect(names).toContain("multiturn.ctrace");
     expect(names).toContain("multiagent.ctrace");
     expect(names).toEqual([...names].sort());
-    const ma = rows.find((r) => r.filename === "multiagent.ctrace")!;
-    expect(ma.project).toBe("pipeline");
-    expect(ma.provider).toBe("openai");
-    expect(ma.turns).toBe(4);
-    expect(ma.agents).toBe("researcher, writer");
-    const mt = rows.find((r) => r.filename === "multiturn.ctrace")!;
-    expect(mt.agents).toBe("-"); // no named agents
+    const ma = files.find((f) => f.filename === "multiagent.ctrace")!;
+    expect(ma.sessions).toHaveLength(1);
+    expect(ma.sessions[0].project).toBe("pipeline");
+    expect(ma.sessions[0].provider).toBe("openai");
+    expect(ma.sessions[0].turnCount).toBe(4);
+    expect(ma.sessions[0].agents).toEqual(["researcher", "writer"]);
+    const mt = files.find((f) => f.filename === "multiturn.ctrace")!;
+    expect(mt.sessions[0].agents).toEqual([]); // no named agents
   });
 });

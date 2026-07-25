@@ -34,7 +34,7 @@ import { EmptyStoreError } from "../src/store/base.js";
 import { SQLiteStore } from "../src/store/sqlite.js";
 import { PostgresStore } from "../src/store/postgres.js";
 import { MySQLStore } from "../src/store/mysql.js";
-import { ENV_VAR } from "../src/store/config.js";
+import { configure, ENV_VAR } from "../src/store/config.js";
 import { init } from "../src/trace.js";
 import { main } from "../src/cli.js";
 
@@ -1470,3 +1470,141 @@ describe("model roll-up fallback (Python `or`, not JS `??`)", () => {
     }
   });
 });
+
+/**
+ * The session/agent CLI, against EVERY backend.
+ *
+ * The selectors (`--project`/`--session`/`--agent`) are the one place the CLI
+ * reaches past "the newest session" and asks a store to answer for a NAMED one.
+ * That path is trivially right for `node:sqlite` (one file, one connection,
+ * every read takes a session id) and genuinely different for a network store,
+ * where the synchronous analyzers consume an in-memory SNAPSHOT taken of a
+ * chosen session rather than of the handle's own binding — and where a
+ * cross-session diff has to materialize two of them. So the whole surface is
+ * asserted against every backend, with the live ones skipping loudly by name.
+ */
+for (const backendCase of CASES) {
+  const title = backendCase.enabled
+    ? `session/agent CLI: ${backendCase.name}`
+    : `session/agent CLI: ${backendCase.name} — SKIPPED (${backendCase.skipHint})`;
+
+  describe.skipIf(!backendCase.enabled)(title, () => {
+    let store: StoreBackend;
+    /** The two seeded session ids, oldest ("good") first. */
+    let good: string;
+    let bad: string;
+    let cwd: string;
+    let originalCwd: string;
+
+    beforeEach(async () => {
+      await backendCase.reset();
+      store = backendCase.create();
+      // Seed the PROJECT fixture: two sessions, each with a researcher and a
+      // writer, differing in exactly one block of turn 3.
+      const ids: string[] = [];
+      for (const [startedAt, tail] of [
+        ["2026-07-20T09:15:00+00:00", "good"],
+        ["2026-07-21T18:42:30+00:00", "bad"],
+      ] as [string, string][]) {
+        const s = await store.openSession({
+          project: "pipeline", provider: "openai", model: "", startedAt,
+        });
+        try {
+          await s.recordCall({
+            seq: 1, params: { model: "gpt-4o" },
+            usage: { prompt_tokens: 100, completion_tokens: 20 },
+            latencyMs: 5, error: null,
+            callBlocks: [block("r-sys", "you are the researcher", 0, { role: "system" }),
+                         block("r-q", "find facts", 1)],
+            agent: "researcher",
+          });
+          await s.recordCall({
+            seq: 2, params: { model: "gpt-4o" },
+            usage: { prompt_tokens: 40, completion_tokens: 8 },
+            latencyMs: 6, error: null,
+            callBlocks: [block("w-sys", "you are the writer", 0, { role: "system" }),
+                         block("w-q", "write it up", 1)],
+            agent: "writer",
+          });
+          await s.recordCall({
+            seq: 3, params: { model: "gpt-4o" }, usage: null, latencyMs: 7, error: null,
+            callBlocks: [block("r-sys", "you are the researcher", 0, { role: "system" }),
+                         block("r-q", "find facts", 1),
+                         block(`r-more-${tail}`, `more detail (${tail})`, 2)],
+            agent: "researcher",
+          });
+          ids.push((await s.getRun()).id);
+        } finally {
+          await s.close();
+        }
+      }
+      [good, bad] = ids;
+      // An EMPTY cwd, so the CLI can only resolve the configured store — a
+      // stray *.ctrace would let the file fallback answer instead.
+      cwd = mkdtempSync(join(tmpdir(), "ctxdiff-sel-cwd-"));
+      tempDirs.push(cwd);
+      originalCwd = process.cwd();
+      process.chdir(cwd);
+      configure({ store });
+    });
+
+    afterEach(() => {
+      configure({ store: null });
+      process.chdir(originalCwd);
+    });
+
+    it("sessions lists every session with its local time and agents", async () => {
+      const r = await runCli(["sessions"]);
+      expect(r.code).toBe(0);
+      const lines = r.out.trimEnd().split("\n");
+      expect(lines).toHaveLength(2);
+      // The label differs by backend on purpose — a file store labels by
+      // filename, a database by short session id — but the id is always
+      // selectable from the row.
+      expect(lines[0]).toContain(good.slice(0, 12));
+      expect(lines[1]).toContain(bad.slice(0, 12));
+      for (const line of lines) {
+        expect(line).toContain("project=pipeline");
+        expect(line).toContain("turns=3");
+        expect(line).toContain("agents=researcher, writer");
+      }
+    });
+
+    it("agents rolls every session in the store up per agent", async () => {
+      const r = await runCli(["agents"]);
+      expect(r.code).toBe(0);
+      const lines = r.out.trimEnd().split("\n");
+      expect(lines[0]).toBe("researcher  sessions=2  calls=4  tokens=240");
+      expect(lines[1]).toBe("writer  sessions=2  calls=2  tokens=96");
+    });
+
+    it("--session resolves what a bare command refuses to guess", async () => {
+      const ambiguous = await runCli(["tokens"]);
+      expect(ambiguous.code).toBe(2);
+      expect(ambiguous.out).toBe("");
+      expect(ambiguous.err).toContain("pass --session to pick one");
+      expect(ambiguous.err).toContain(good.slice(0, 12));
+      expect(ambiguous.err).toContain(bad.slice(0, 12));
+
+      const scoped = await runCli(["tokens", "--session", bad.slice(0, 12), "--agent", "writer"]);
+      expect(scoped.code).toBe(0);
+      expect(scoped.out).toContain("turn 2 ·");
+      expect(scoped.out).not.toContain("turn 1 ·");
+    });
+
+    it("cross-session diff compares one agent's turn across two runs", async () => {
+      const r = await runCli([
+        "diff", "--session", `${good}:3`, "--session", `${bad}:3`, "--agent", "researcher",
+      ]);
+      expect(r.code).toBe(0);
+      const lines = r.out.trimEnd().split("\n");
+      expect(lines[0]).toBe(
+        `── ${good.slice(0, 12)} · researcher · turn 3  →  ` +
+          `${bad.slice(0, 12)} · researcher · turn 3 ──`,
+      );
+      // Char-level inline diff: the shared trailing "d" of good/bad stays equal.
+      expect(r.out).toContain("[-goo-]");
+      expect(r.out).toContain("{+ba+}");
+    });
+  });
+}

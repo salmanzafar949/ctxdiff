@@ -86,20 +86,56 @@ function isLockedError(err: unknown): boolean {
 }
 
 /**
- * Parse a session's stored `started_at` into a Date, tolerant of ALL formats a
+ * A stored `started_at` split into its date-time part and its zone designator.
+ * The zone is recognized only AFTER a time: the `-04` ending a bare date like
+ * `2026-07-04` is a day, not an offset.
+ */
+const ZONED = /^(\d{4}-?\d{2}-?\d{2}[T ][\d:.]+)([Zz]|[+-]\d{2}:?\d{2}|[+-]\d{2})$/;
+
+/** The date-time part in EXTENDED form (`YYYY-MM-DDTHH:MM:SS`), whether it was
+ * written that way or in the separator-free ISO BASIC form (`20260704T100000`).
+ * Anything that is not a recognizable ISO date-time is returned untouched, so
+ * `Date` still gets its say — and still rejects it. */
+function expandBasicIso(text: string): string {
+  const m = /^(\d{4})-?(\d{2})-?(\d{2})(?:([T ])(\d{2}):?(\d{2})(?::?(\d{2})(\.\d+)?)?)?$/
+    .exec(text);
+  if (!m) return text;
+  const [, y, mo, d, sep, hh, mi, ss, frac] = m;
+  if (!sep) return `${y}-${mo}-${d}`;
+  return `${y}-${mo}-${d}T${hh}:${mi}:${ss ?? "00"}${frac ?? ""}`;
+}
+
+/**
+ * Parse a session's stored `started_at` into a Date, tolerant of every format a
  * file may carry: the canonical UTC string new sessions write (a trailing `Z`),
- * a `+00:00`/`-07:00` offset string, AND a legacy naive string (no zone). A
- * naive value is assumed to be UTC — the store always writes UTC — and coerced
- * by appending `Z`, so downstream local-time rendering is unambiguous regardless
- * of which format produced the row. Mirrors Python's `parse_started_at`; throws
+ * an offset string, and a legacy naive string (no zone). A naive value is
+ * assumed to be UTC — the store always writes UTC — so downstream local-time
+ * rendering is unambiguous regardless of which format produced the row. Throws
  * on a value that can't be parsed.
+ *
+ * Acceptance deliberately matches Python's `parse_started_at`, which is
+ * `datetime.fromisoformat` and therefore takes two spellings `Date` alone does
+ * not: an HOUR-ONLY offset (`+05`) and the ISO BASIC form (`20260704T100000Z`).
+ * Neither is anything ctxdiff writes, but a foreign or hand-edited database can
+ * hold them — and a row one CLI renders as a local time while the other echoes
+ * it raw is the kind of silent disagreement the two SDKs exist to prevent. So
+ * the zone is peeled off first, normalized to the `±HH:MM`/`Z` spelling `Date`
+ * understands (a missing zone meaning UTC), and the date-time part expanded to
+ * extended form.
  */
 export function parseStartedAt(value: string): Date {
   const text = value.trim();
-  // Has an explicit zone? A trailing Z, or a +HH:MM / -HHMM offset at the end.
-  const hasZone = /[Zz]$/.test(text) || /[+-]\d{2}:?\d{2}$/.test(text);
-  const normalized = hasZone ? text.replace(/z$/, "Z") : `${text}Z`;
-  const d = new Date(normalized);
+  const m = ZONED.exec(text);
+  const body = expandBasicIso(m ? m[1] : text);
+  let zone = "Z";
+  if (m) {
+    const raw = m[2];
+    if (/^[Zz]$/.test(raw)) zone = "Z";
+    else if (raw.length === 3) zone = `${raw}:00`; // +05  -> +05:00
+    else if (raw.length === 5) zone = `${raw.slice(0, 3)}:${raw.slice(3)}`; // +0530
+    else zone = raw; // already +HH:MM
+  }
+  const d = new Date(body + zone);
   if (Number.isNaN(d.getTime())) {
     throw new Error(`invalid started_at: ${JSON.stringify(value)}`);
   }

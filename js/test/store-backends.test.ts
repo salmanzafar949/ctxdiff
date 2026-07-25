@@ -428,6 +428,12 @@ describe("a wedged database never reaches the host", () => {
  * round trips scale with the RUN and not with the database it lives in. */
 class CountingStore implements Store {
   readonly calls = { getRun: 0, getCalls: 0, getCallBlocks: 0, listSessions: 0, close: 0 };
+  /** The session ids the snapshot asked for, so `--session` reaching a network
+   * store can be asserted rather than assumed. */
+  readonly asked: { getRun: (string | undefined)[]; getCalls: (string | undefined)[] } = {
+    getRun: [],
+    getCalls: [],
+  };
   async recordCall(): Promise<string> {
     return "c";
   }
@@ -446,10 +452,11 @@ class CountingStore implements Store {
       },
     ];
   }
-  async getRun(): Promise<Run> {
+  async getRun(sessionId?: string): Promise<Run> {
     this.calls.getRun += 1;
+    this.asked.getRun.push(sessionId);
     return {
-      id: "r1",
+      id: sessionId ?? "r1",
       project: "p",
       startedAt: "2026-01-01",
       provider: "openai",
@@ -457,12 +464,13 @@ class CountingStore implements Store {
       ctxdiffVersion: "0.1.0",
     };
   }
-  async getCalls(): Promise<Call[]> {
+  async getCalls(sessionId?: string): Promise<Call[]> {
     this.calls.getCalls += 1;
+    this.asked.getCalls.push(sessionId);
     return [
       {
         id: "call-1",
-        runId: "r1",
+        runId: sessionId ?? "r1",
         seq: 1,
         params: {},
         usage: null,
@@ -510,6 +518,28 @@ describe("snapshotStore reads the RUN, not the database", () => {
     const snapshot = await snapshotStore(store, { sessions: true });
     expect(store.calls.listSessions).toBe(1);
     expect(snapshot.listSessions().map((s) => s.id)).toEqual(["r1"]);
+  });
+
+  it("snapshots a CHOSEN session, not just the handle's binding", async () => {
+    // How `--session` reaches a network store: a `CTrace` can be pinned with a
+    // forwarding view, but a snapshot is materialized once and cannot be
+    // re-pointed — so the session id has to travel INTO the reads.
+    const store = new CountingStore();
+    const snapshot = await snapshotStore(store, { sessionId: "chosen" });
+    expect(store.asked).toEqual({ getRun: ["chosen"], getCalls: ["chosen"] });
+    expect(snapshot.getRun().id).toBe("chosen");
+  });
+
+  it("reuses a session list the caller already fetched", async () => {
+    // The CLI must list sessions to resolve `--session` at all; passing that
+    // list in means the expensive listing query is paid once per command, not
+    // twice.
+    const store = new CountingStore();
+    const sessionList = await store.listSessions();
+    store.calls.listSessions = 0;
+    const snapshot = await snapshotStore(store, { sessionId: "r1", sessionList });
+    expect(store.calls.listSessions).toBe(0); // not re-queried
+    expect(snapshot.listSessions()).toBe(sessionList);
   });
 
   it("closes the store even when the read fails", async () => {

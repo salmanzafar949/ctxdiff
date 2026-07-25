@@ -16,7 +16,7 @@ const cliPath = resolve(process.cwd(), "dist", "cli.js");
 const hasBuild = existsSync(cliPath);
 
 let dir: string;
-let fx: { multiturn: string; multiagent: string; dynamic: string; bidi: string };
+let fx: ReturnType<typeof makeFixtures>;
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "ctxdiff-cli-smoke-"));
@@ -60,6 +60,29 @@ describe.skipIf(!hasBuild)("ctxdiff CLI (dist/cli.js) smoke", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("multiturn.ctrace");
     expect(r.out).toContain("provider=openai");
+  });
+
+  it("sessions lists each session with a local timestamp column", () => {
+    const r = run(["sessions"], dir);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("multiturn.ctrace");
+    // Two sessions in the project fixture => each row is <file>#<short id>.
+    expect(r.out).toContain("project.ctrace#");
+    expect(r.out).toMatch(/ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2} /);
+  });
+
+  it("agents aggregates the project's agents across sessions", () => {
+    const r = run(["agents", "--project", fx.project]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("researcher  sessions=2  calls=4");
+    expect(r.out).toContain("writer  sessions=2  calls=2");
+  });
+
+  it("an ambiguous project exits 2 and lists the sessions to pick from", () => {
+    const r = run(["tokens", "--project", fx.project]);
+    expect(r.code).toBe(2);
+    expect(r.out).toBe("");
+    expect(r.err).toContain("pass --session to pick one");
   });
 
   it("diff with the wrong --turn count is a usage error (exit 2)", () => {

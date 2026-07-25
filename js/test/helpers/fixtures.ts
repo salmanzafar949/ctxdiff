@@ -124,16 +124,108 @@ export function writeBidi(dir: string): string {
   return path;
 }
 
+/**
+ * A PROJECT trace: one file, TWO sessions ("good" then "bad"), each with the
+ * same two agents on the same turn numbers, and one block whose text differs
+ * between the runs. This is the regression shape the session CLI exists for —
+ * `diff --session GOOD:3 --session BAD:3 --agent researcher` must show exactly
+ * that one changed block — and it doubles as the ambiguity fixture, since a
+ * two-session project is precisely what makes a bare `--session`-less command
+ * refuse to guess.
+ *
+ * Timestamps are fixed and UTC so the local-time column is a pure function of
+ * `TZ`, which is what lets the cross-language conformance suite pin a timezone
+ * and compare bytes.
+ */
+export function writeProject(dir: string): string {
+  const path = join(dir, "project.ctrace");
+  const rSys: Row = ["system", "message", "You are the RESEARCHER. Gather facts."];
+  const wSys: Row = ["system", "message", "You are the WRITER. Compose prose."];
+  for (const [startedAt, tail, bump] of [
+    ["2026-07-20T09:15:00+00:00", "good", 0],
+    ["2026-07-21T18:42:30+00:00", "bad", 1],
+  ] as [string, string, number][]) {
+    const ct = CTrace.openOrCreateSession(path, "pipeline", "openai", "", startedAt);
+    ct.recordCall({
+      seq: 1, params: { model: "gpt-4o" },
+      usage: { prompt_tokens: 100 + bump, completion_tokens: 20, total_tokens: 120 + bump },
+      latencyMs: 100, error: null,
+      callBlocks: blocks([rSys, ["user", "message", "Find facts about Mars."]]),
+      agent: "researcher", step: "gather", provider: "openai",
+    });
+    ct.recordCall({
+      seq: 2, params: { model: "gpt-4o" },
+      usage: { prompt_tokens: 40, completion_tokens: 8, total_tokens: 48 },
+      latencyMs: 110, error: null,
+      callBlocks: blocks([wSys, ["user", "message", "Write an intro about Mars."]]),
+      agent: "writer", step: "compose", provider: "openai",
+    });
+    ct.recordCall({
+      seq: 3, params: { model: "gpt-4o" }, usage: null, latencyMs: 120, error: null,
+      callBlocks: blocks([
+        rSys,
+        ["user", "message", "Find facts about Mars."],
+        ["assistant", "message", "Mars is the fourth planet."],
+        ["user", "message", `More detail (${tail})?`],
+      ]),
+      agent: "researcher", step: "gather", provider: "openai",
+    });
+    ct.close();
+  }
+  return path;
+}
+
+/**
+ * A trace whose sessions carry AWKWARD `started_at` values — every spelling and
+ * edge the local-time column has to survive, in one file:
+ *
+ * - the two `datetime` boundaries (year 9999 and year 1), which OVERFLOW when a
+ *   local offset shifts them past MINYEAR/MAXYEAR and so must be echoed raw by
+ *   both CLIs rather than rendered as a year one of them cannot represent;
+ * - an 1800 instant, when most zones still ran on LOCAL MEAN TIME with SECONDS
+ *   in the offset (`America/New_York` was -04:56:02) — the case where flooring
+ *   and truncating whole minutes disagree;
+ * - an hour-only offset (`+05`) and the ISO BASIC form (`20260704T100000Z`),
+ *   both of which Python's `fromisoformat` accepts;
+ * - a value neither side can parse, which must be echoed unchanged.
+ *
+ * Nothing ctxdiff writes looks like these — a foreign or hand-edited database
+ * does, and that is exactly when the two SDKs must not disagree.
+ */
+export function writeEdgeTimestamps(dir: string): string {
+  const path = join(dir, "edge.ctrace");
+  for (const startedAt of [
+    "9999-12-31T23:59:59+00:00",
+    "0001-01-01T00:00:00+00:00",
+    "1800-06-01T12:00:00Z",
+    "2026-07-04T10:00:00+05",
+    "20260704T100000Z",
+    "not a timestamp",
+  ]) {
+    const ct = CTrace.openOrCreateSession(path, "edge", "openai", "", startedAt);
+    ct.recordCall({
+      seq: 1, params: { model: "gpt-4o" }, usage: null, latencyMs: 10, error: null,
+      callBlocks: blocks([["user", "message", "hi"]]), agent: "solo", provider: "openai",
+    });
+    ct.close();
+  }
+  return path;
+}
+
 export function makeFixtures(dir: string): {
   multiturn: string;
   multiagent: string;
   dynamic: string;
   bidi: string;
+  project: string;
+  edge: string;
 } {
   return {
     multiturn: writeMultiturn(dir),
     multiagent: writeMultiagent(dir),
     dynamic: writeDynamic(dir),
     bidi: writeBidi(dir),
+    project: writeProject(dir),
+    edge: writeEdgeTimestamps(dir),
   };
 }
