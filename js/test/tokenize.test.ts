@@ -57,4 +57,19 @@ describe("countTokens", () => {
     expect(countTokens("<|endofprompt|>", "openai")).toEqual([7, "tiktoken"]);
     expect(countTokens("hello world", "openai")).toEqual([2, "tiktoken"]);
   });
+
+  it("the estimate counts CODE POINTS, not UTF-16 code units", () => {
+    // Regression. JS strings are UTF-16, so `"🚀".length` is 2 while Python's
+    // `len("🚀")` is 1 — and since every provider except openai is estimated,
+    // `.length` made bedrock/anthropic/gemini traces render different token
+    // numbers in the two SDKs for identical content. Eight astral characters
+    // are 8 code points -> ceil(8/4) = 2, not the 16 units -> 4 they used to be.
+    expect(countTokens("🚀".repeat(8), "anthropic")).toEqual([2, "estimate"]);
+    // The reviewer's repro: a Converse system block. 23 code points -> 6; it
+    // counted 7 as 25 UTF-16 units, the flag's two code points being four of them.
+    expect(countTokens("Répondez en français 🇫🇷", "bedrock")).toEqual([6, "estimate"]);
+    // BMP text is unaffected — the fix must not move any existing number.
+    expect(countTokens("a".repeat(400), "gemini")).toEqual([100, "estimate"]);
+    expect(countTokens("日本語のトークン化テスト", "anthropic")).toEqual([3, "estimate"]);
+  });
 });

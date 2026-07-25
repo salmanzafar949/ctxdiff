@@ -1,0 +1,23 @@
+run total · in 538 tok · out 153 tok (3/3 calls reported usage)
+
+turn 1 · 95 tokens (~approx) [translator·draft]
+  ███████████████████            tool_schema        61 tok   64.2%
+  █████████                      user               28 tok   29.5%
+  ██                             system              6 tok    6.3%
+  provider reports 96 prompt tokens · Δ +1
+
+turn 2 · 156 tokens (~approx) [translator·draft]
+  ████████████                   user               64 tok   41.0%
+  ████████████                   tool_schema        61 tok   39.1%
+  █████                          history            25 tok   16.0%
+  █                              system              6 tok    3.8%
+  provider reports 178 prompt tokens · Δ +22
+
+turn 3 · 211 tokens (~approx) [translator·review]
+  ██████████████                 user              100 tok   47.4%
+  █████████                      tool_schema        61 tok   28.9%
+  ██████                         history            44 tok   20.9%
+  █                              system              6 tok    2.8%
+  provider reports 264 prompt tokens · Δ +53
+
+⚠ schema bloat: gloss_emoji — 1 of 1 registered tools never used this run — 61 tok (39.6% of avg context) spent on dead schemas every call

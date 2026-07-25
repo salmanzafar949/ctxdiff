@@ -1,0 +1,4 @@
+── turn 2 → turn 3 · 2 blocks changed · +55 −0 tokens ──
++ [history·assistant] "Chaque séquence est restituée à l'identique : 👨\u200d👩\u200d👧\u200d👦 🏳️\u200d🌈 🏴\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f 🤦🏽\u200d…"  +19 tok
++ [user·user] 'Dernier lot, uniquement hors du plan multilingue de base : 𝕌𝕟𝕚𝕔𝕠𝕕𝕖 𝓶𝓪𝓽…'  +36 tok
+= 5 unchanged blocks · 156 tok

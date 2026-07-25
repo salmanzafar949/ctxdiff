@@ -36,10 +36,26 @@ function tiktokenCount(text: string): number {
  * Estimate tokens when no exact tokenizer exists. Uses the well-known
  * ~4-characters-per-token rule of thumb, rounded up so any non-empty text is at
  * least 1 token. Empty text is zero. Mirrors Python `_estimate_count`.
+ *
+ * A CHARACTER HERE MEANS A UNICODE CODE POINT, which is why this spreads the
+ * string rather than reading `.length`. JS strings are UTF-16, so `.length`
+ * counts CODE UNITS and every astral-plane character — emoji, flag sequences,
+ * skin-tone modifiers, math alphanumerics, CJK ext-B — counts twice; Python's
+ * `len()` counts code points and counts it once. Since every provider EXCEPT
+ * openai is counted by this function, `.length` made bedrock, anthropic and
+ * gemini traces render DIFFERENT token numbers in the two SDKs for byte-identical
+ * content (a system block of `Répondez en français 🇫🇷` was 7 tokens here and 6
+ * in Python) — exactly the cross-SDK divergence the pinned tokenizers and the
+ * golden corpus exist to prevent. Hashes were never affected (counts are not
+ * hashed), but `ctxdiff tokens`, the cache profiler's re-billed totals and the
+ * dashboard's percentages all were. Iterating the string yields code points, so
+ * the two SDKs now agree by construction. Grapheme CLUSTERS are deliberately not
+ * the unit: Python does not use them either, and the rule of thumb is about
+ * character volume, not user-perceived glyphs.
  */
 function estimateCount(text: string): number {
   if (!text) return 0;
-  return Math.max(1, Math.ceil(text.length / 4));
+  return Math.max(1, Math.ceil([...text].length / 4));
 }
 
 /**

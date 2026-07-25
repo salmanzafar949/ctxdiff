@@ -1389,24 +1389,33 @@ function makeInterceptor(
     const streaming =
       interpretedStreaming ?? (isStreamHelper || isNamedStreamMethod || !!kwargs["stream"]);
 
-    // Snapshot the request NOW for the deferred streaming record, on the SAME
-    // tick as consumeContext() — before the stream is handed back. The proxy
-    // records only after iteration ends, by which point the host may have
-    // mutated its own live `messages` array / params object (append an
-    // assistant placeholder to fill during streaming, or reuse it for the next
-    // turn). Recording off the live ref would then capture blocks that were
-    // never sent in THIS call. A deep clone freezes exactly what went out; the
-    // cloned text is identical, so tag() needle-matching still resolves.
-    // Fail-open: if the payload isn't structured-cloneable, fall back to the
-    // live ref rather than throw into the host. Non-streaming needs no snapshot
-    // — it records synchronously in `.then`/on return, before the host resumes.
-    let streamKwargs: Record<string, unknown> = kwargs;
-    if (streaming) {
-      try {
-        streamKwargs = structuredClone(kwargs);
-      } catch {
-        streamKwargs = kwargs;
-      }
+    // Snapshot the request NOW, on the SAME tick as consumeContext() — before
+    // the real method is even called. EVERY record below is written from this
+    // snapshot; nothing is ever recorded off the host's live object.
+    //
+    // Why it cannot be streaming-only (it was, and that was a bug). Recording
+    // happens after an AWAIT BOUNDARY on every path that matters: the streaming
+    // proxy records when iteration ends, and the non-streaming path records in
+    // `.then`, which by definition runs on a later microtask. In between, the
+    // host's other async branches have run — a concurrent fan-out that pushes
+    // onto the SAME `messages` array (or a loop reusing one params object for
+    // the next turn) mutates the very object the interceptor is holding, and the
+    // deferred record then stores blocks THIS call never sent. Reproduced with a
+    // single Bedrock `ConverseCommand` plus a concurrent `messages.push(...)`
+    // during the await: the trace held both blocks, one of which was never on
+    // the wire. Fabricated evidence is worse than missing evidence in a debugger,
+    // so the snapshot is unconditional. A deep clone freezes exactly what went
+    // out; the cloned text is identical, so tag() needle-matching still resolves.
+    //
+    // Fail-open: if the payload isn't structured-cloneable (a class instance, a
+    // function-valued option), fall back to the live ref rather than throw into
+    // the host — degraded capture, never a broken call. The REAL method still
+    // receives the host's own `args` untouched; this clone is for recording only.
+    let recordKwargs: Record<string, unknown> = kwargs;
+    try {
+      recordKwargs = structuredClone(kwargs);
+    } catch {
+      recordKwargs = kwargs;
     }
 
     let result: unknown;
@@ -1416,7 +1425,7 @@ function makeInterceptor(
       // Sync throw: a construction-time error, or a sync SDK failing outright.
       const latencyMs = Math.round(performance.now() - start);
       ctx.tracer.onCreate({
-        kwargs,
+        kwargs: recordKwargs,
         response: null,
         latencyMs,
         error: errName(exc),
@@ -1433,10 +1442,10 @@ function makeInterceptor(
       // but with the tags/step SNAPSHOTTED above (not re-read post-await).
       return result.then(
         (resolved: unknown) => {
-          if (streaming) return wrapStreamResult(resolved, streamKwargs, ctx, start, tags, step);
+          if (streaming) return wrapStreamResult(resolved, recordKwargs, ctx, start, tags, step);
           const latencyMs = Math.round(performance.now() - start);
           ctx.tracer.onCreate({
-            kwargs,
+            kwargs: recordKwargs,
             response: resolved,
             latencyMs,
             error: null,
@@ -1450,7 +1459,7 @@ function makeInterceptor(
         (exc: unknown) => {
           const latencyMs = Math.round(performance.now() - start);
           ctx.tracer.onCreate({
-            kwargs,
+            kwargs: recordKwargs,
             response: null,
             latencyMs,
             error: errName(exc),
@@ -1465,12 +1474,12 @@ function makeInterceptor(
     }
 
     // Synchronous return — the `.stream()` helper hands back its stream directly.
-    if (streaming) return wrapStreamResult(result, streamKwargs, ctx, start, tags, step);
+    if (streaming) return wrapStreamResult(result, recordKwargs, ctx, start, tags, step);
 
     // Non-streaming sync return (unusual for openai) — record now.
     const latencyMs = Math.round(performance.now() - start);
     ctx.tracer.onCreate({
-      kwargs,
+      kwargs: recordKwargs,
       response: result,
       latencyMs,
       error: null,

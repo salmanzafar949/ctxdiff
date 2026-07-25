@@ -392,6 +392,41 @@ describe("wrap Bedrock: non-Converse commands", () => {
   });
 });
 
+// --- request snapshotting ---------------------------------------------------
+
+describe("wrap Bedrock: the request is snapshotted at call time", () => {
+  // The reviewer's repro for the shared trace.ts defect: the snapshot used to be
+  // taken only for STREAMING calls, so a plain `ConverseCommand` recorded off
+  // the host's live object. `command.input.messages` IS the array the host built
+  // the command from — the AWS SDK does not copy it — so a concurrent branch
+  // pushing onto that array during the in-flight await landed in the trace as a
+  // block that was never on the wire. The provider-agnostic twin lives in
+  // wrap.test.ts.
+  it("a concurrent push during a non-streaming await is NOT recorded", async () => {
+    const path = tmpTrace();
+    const client = stubClient(jsonBody(CONVERSE_RESPONSE));
+    const tracer = init("proj", { path });
+    const wrapped = tracer.wrap(client) as BedrockRuntimeClient;
+
+    // The host's live history array, shared with the command it built.
+    const messages = [{ role: "user" as const, content: [{ text: "what is 2+2" }] }];
+    const inFlight = wrapped.send(new ConverseCommand({ modelId: "m", messages }));
+    const mutator = (async () => {
+      await Promise.resolve();
+      messages.push({ role: "user" as const, content: [{ text: "NEVER-SENT" }] });
+    })();
+    await Promise.all([inFlight, mutator]);
+    await tracer.close();
+
+    const r = CTrace.open(path);
+    const calls = r.getCalls();
+    expect(calls).toHaveLength(1);
+    // Only the block the model actually received.
+    expect(r.getCallBlocks(calls[0].id).map((cb) => cb.block.text)).toEqual(["what is 2+2"]);
+    r.close();
+  });
+});
+
 // --- the legacy callback overload -------------------------------------------
 
 describe("wrap Bedrock: send(command, callback)", () => {

@@ -425,6 +425,92 @@ for text in json.loads(sys.argv[1]):
   );
 });
 
+/**
+ * Cross-language conformance for the ESTIMATE path — the OTHER tokenizer, and
+ * the one that covers MORE of ctxdiff: openai is the only provider counted
+ * exactly, so bedrock, anthropic and gemini traces are all rendered from
+ * `_estimate_count`/`estimateCount`. Until this test existed, nothing compared
+ * the two implementations of it across the language boundary.
+ *
+ * The battery is astral-plane text on purpose, because that is the ONE input on
+ * which the two used to disagree. Both divide a character count by four, but JS
+ * strings are UTF-16 and `text.length` counts CODE UNITS, so every character
+ * outside the BMP — emoji, ZWJ sequences, regional-indicator flags, skin-tone
+ * modifiers, math alphanumerics, CJK ext-B — counted DOUBLE against Python's
+ * `len()`, which counts code points. A Converse system block of
+ * `Répondez en français 🇫🇷` was 7 tokens in JS and 6 in Python: same trace, same
+ * hash, different rendered number depending on which SDK wrote it. Hashes were
+ * never at risk (token counts are not part of the hashed tuple), but `ctxdiff
+ * tokens`, the cache profiler's re-billed totals and the dashboard's percentages
+ * all were — which is precisely the class of divergence the pinned tokenizers
+ * and the golden corpus exist to catch, and this one slipped past both because
+ * no golden fixture had astral text on an estimate provider.
+ *
+ * Run across all three estimate providers, not just one, so a future
+ * per-provider branch in either counter cannot diverge unnoticed.
+ */
+describe("cross-language conformance (estimate counts agree on astral text)", () => {
+  const hasVenv = existsSync(venvPython);
+
+  it.skipIf(!hasVenv)("Python and JS return identical (count, method) for astral text", () => {
+    const probes = [
+      "Répondez en français 🇫🇷", // the reviewer's repro: a Converse system block
+      "🚀", // a single astral character: 1 code point, 2 UTF-16 units
+      "👨‍👩‍👧‍👦", // ZWJ family — four astral emoji joined by three ZWJs
+      "🏳️‍🌈 🏴󠁧󠁢󠁳󠁣󠁴󠁿", // flag sequences, incl. a tag-sequence flag (all astral tags)
+      "🤦🏽‍♀️ 👍🏿", // skin-tone modifiers (themselves astral)
+      "𝕌𝕟𝕚𝕔𝕠𝕕𝕖 𝓶𝓪𝓽𝓱 𝔞𝔩𝔭𝔥𝔞", // math alphanumerics
+      "𠜎 𤭢 𰻞", // CJK extension B/G
+      "🚀".repeat(64), // long enough that the /4 divide, not the max(1,…), decides
+      "plain ascii with no astral characters at all",
+      "combining é vs precomposed é — BMP only, must be unchanged by the fix",
+      "日本語のトークン化テスト", // BMP CJK: a control that must not move
+      "", // empty stays zero under either counter
+    ];
+    const providers = ["bedrock", "anthropic", "gemini"];
+
+    const js = providers.flatMap((p) => probes.map((t) => countTokens(t, p)));
+
+    // Probes AND providers are handed over as JSON arguments rather than
+    // interpolated into source, so nothing in a probe can change the program.
+    const pyScript = `
+import json, sys
+from ctxdiff.tokenize.counter import count_tokens
+probes = json.loads(sys.argv[1])
+for provider in json.loads(sys.argv[2]):
+    for text in probes:
+        count, method = count_tokens(text, provider)
+        print(count, method)
+`;
+    const proc = spawnSync(
+      venvPython,
+      ["-c", pyScript, JSON.stringify(probes), JSON.stringify(providers)],
+      { encoding: "utf8", env: { ...process.env, PYTHONPATH: pySrc } },
+    );
+    expect(proc.status, `python tokenizer failed (status ${proc.status}):\n${proc.stderr}`).toBe(0);
+
+    const py = proc.stdout
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const [count, method] = line.split(" ");
+        return [Number(count), method] as [number, string];
+      });
+
+    expect(py).toHaveLength(js.length);
+    expect(js).toEqual(py);
+
+    // ...and every one of them really went through the ESTIMATE path, so the
+    // agreement above cannot be the vacuous kind (both SDKs exact-counting).
+    expect(js.map(([, method]) => method)).toEqual(js.map(() => "estimate"));
+
+    // The specific number from the bug report, pinned: `Répondez en français 🇫🇷`
+    // is 23 code points (the flag is two regional indicators) -> ceil(23/4) = 6.
+    // Under `.length` it was 25 UTF-16 units -> ceil(25/4) = 7.
+    expect(countTokens("Répondez en français 🇫🇷", "bedrock")).toEqual([6, "estimate"]);
+  });
+});
+
 
 /**
  * Cross-language IMAGE conformance — the fourth and newest byte-for-byte

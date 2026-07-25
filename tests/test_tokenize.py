@@ -125,3 +125,25 @@ def test_a_per_text_encode_failure_estimates_that_text_alone(monkeypatch):
     assert (count, method) == (1, "estimate")  # ceil(4/4), marked honestly
     assert count_tokens("hello world", "openai") == (2, "tiktoken")
     assert counter._ENCODER is not counter._ENCODER_UNAVAILABLE
+
+
+def test_estimate_counts_code_points_not_utf16_units():
+    """The estimate's unit is the CODE POINT, and this pins it as a cross-SDK
+    contract rather than an implementation detail of `len()`.
+
+    Python gets this for free — `len("🚀")` is 1 — but JS strings are UTF-16 and
+    `"🚀".length` is 2, so the JS twin counted every astral character twice. Since
+    openai is the ONLY provider counted exactly, that made bedrock, anthropic and
+    gemini render different token numbers in the two SDKs for byte-identical
+    content (a Converse system block of `Répondez en français 🇫🇷` was 6 here and
+    7 there). The numbers below are the shared expectation; `js/test/
+    tokenize.test.ts` asserts the same ones, and `js/test/conformance.test.ts`
+    compares the two implementations directly across a spread of astral inputs."""
+    assert count_tokens("🚀" * 8, "anthropic") == (2, "estimate")   # 8 code points
+    assert count_tokens("Répondez en français 🇫🇷", "bedrock") == (6, "estimate")
+    assert count_tokens("👨‍👩‍👧‍👦", "gemini") == (2, "estimate")        # 4 emoji + 3 ZWJ
+    assert count_tokens("𝕌𝕟𝕚𝕔𝕠𝕕𝕖", "anthropic") == (2, "estimate")  # math alphanumerics
+    assert count_tokens("𠜎𤭢𰻞", "bedrock") == (1, "estimate")      # CJK ext B/G
+    # BMP text is untouched by the distinction — a control on both sides.
+    assert count_tokens("a" * 400, "gemini") == (100, "estimate")
+    assert count_tokens("日本語のトークン化テスト", "anthropic") == (3, "estimate")
