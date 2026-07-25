@@ -16,7 +16,8 @@
  * byte-identical port of Python's `cli/select.py` down to the error text.
  */
 import { parseArgs } from "node:util";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -1882,12 +1883,51 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
+/**
+ * True when THIS module is the process entry point, i.e. the user ran the CLI
+ * rather than a test importing `main`.
+ *
+ * The test is "does `process.argv[1]` resolve to this very file", with BOTH
+ * sides put through `realpathSync` — because the path Node reports is very
+ * often not the file's own path:
+ *
+ *  - `npm install` publishes `bin` as a SYMLINK at `node_modules/.bin/ctxdiff`
+ *    → `../ctxdiff/dist/cli.js`. Run through the shim (which is what `npx
+ *    ctxdiff` and every installed invocation do), `process.argv[1]` is the
+ *    SHIM's path. ctxdiff 0.2.0 asked `argv[1].endsWith("cli.js")` instead;
+ *    `/…/node_modules/.bin/ctxdiff` does not end in `cli.js`, so the guard was
+ *    false, `main()` never ran, and the published CLI was a silent no-op that
+ *    printed nothing and exited 0. `test/packaging.test.ts` covers exactly
+ *    this, by driving the INSTALLED shim rather than the built file.
+ *  - macOS `/tmp` → `/private/tmp` and other symlinked parents make the two
+ *    paths differ even with no shim involved.
+ *
+ * `import.meta.url` is the module's own URL in the ESM build; tsup's `shims`
+ * option rewrites it to a `__filename`-derived URL in the CJS build, so
+ * `dist/cli.js` and `dist/cli.cjs` behave identically. Any failure to resolve
+ * either side falls back to the original 0.2.0 filename check rather than
+ * throwing — a CLI that mis-detects its own entry must still start.
+ */
+function isEntryPoint(): boolean {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p; // not on disk (a virtual/bundled entry) — compare as given
+    }
+  };
+  try {
+    return real(argv1) === real(fileURLToPath(import.meta.url));
+  } catch {
+    return argv1.endsWith("cli.js") || argv1.endsWith("cli.cjs");
+  }
+}
+
 // Direct execution: run and exit with the command's code. (Importing this module
-// — e.g. from tests — does not trigger this.)
-if (
-  process.argv[1] &&
-  (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.cjs"))
-) {
+// — e.g. from tests, seven of which do — does not trigger this.)
+if (isEntryPoint()) {
   // `main` is async now (a configured database is read over the network), so the
   // exit is deferred to its resolution. The catch is the last fail-safe: an
   // unexpected rejection prints one line and exits 2 rather than surfacing an
