@@ -24,5 +24,15 @@ export default defineConfig({
   sourcemap: false,
   target: "node22",
   platform: "node",
+  // `src/cli.ts` decides whether it is the process entry point by comparing
+  // `realpath(process.argv[1])` against its own `fileURLToPath(import.meta.url)`
+  // — the only check that survives npm publishing `bin` as a SYMLINK
+  // (`node_modules/.bin/ctxdiff` → `dist/cli.js`). `import.meta` does not exist
+  // in CJS, and esbuild leaves it EMPTY there with only a warning, which would
+  // silently give `dist/cli.cjs` a broken guard. `shims` makes tsup rewrite it
+  // to a `__filename`-derived URL in the CJS output, so both builds behave
+  // identically; it only injects into files that actually reference
+  // `import.meta.url`/`__dirname`, so the other entries are untouched.
+  shims: true,
   external: ["openai", "@anthropic-ai/sdk", "@google/genai", "gpt-tokenizer", "pg", "mysql2", "mysql2/promise"],
 });
