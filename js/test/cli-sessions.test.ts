@@ -10,7 +10,7 @@
  * header that keeps `turn 3 → turn 3` from being ambiguous.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, renameSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/cli.js";
@@ -143,7 +143,6 @@ describe("session ambiguity", () => {
       ["tokens", "--project", projectPath],
       ["cache", "--project", projectPath],
       ["diff", "--project", projectPath, "--turn", "1", "--turn", "3"],
-      ["export", "--project", projectPath],
     ]) {
       const r = await run(argv);
       expect(r.code, `exit code for ${argv[0]}`).toBe(2);
@@ -153,6 +152,41 @@ describe("session ambiguity", () => {
       );
       expect(r.err).toContain(good.slice(0, 12));
       expect(r.err).toContain(bad.slice(0, 12));
+    }
+  });
+
+  it("export/view need no --session: the dashboard covers every session", async () => {
+    // The DASHBOARD is the one read surface a many-session project is not
+    // ambiguous for — the HTML covers all of them, so these two focus the newest
+    // session and land the user on the agent listing. This is the behavior
+    // change the three-level dashboard introduced; `export` used to exit 2 here.
+    for (const argv of [
+      ["export", "--project", projectPath],
+      ["view", "--no-open", "--project", projectPath],
+    ]) {
+      const r = await run(argv);
+      expect(r.code, `exit code for ${argv[0]}`).toBe(0);
+      expect(r.err).toBe("");
+      const html = readFileSync(r.out.trim(), "utf-8");
+      expect(html).toContain(good);
+      expect(html).toContain(bad);
+    }
+  });
+
+  it("export --session opens the dashboard ON the session that was named", async () => {
+    // The page boots with `openSession(start.session)`, so a `start` naming any
+    // other session silently repoints the level-3 view — breadcrumb, header and
+    // blocks table — at a run nobody asked for. Checked on the OLDER session
+    // (`good`), because the bug read the NEWEST row of a newest-first list and
+    // only an older `--session` can tell the two apart.
+    for (const extra of [[], ["--agent", "researcher"]]) {
+      const r = await run(["export", "--project", projectPath, "--session", good, ...extra]);
+      expect(r.code, `exit code with ${extra.join(" ")}`).toBe(0);
+      const html = readFileSync(r.out.trim(), "utf-8");
+      const agent = extra.length ? `"${extra[1]}"` : "null";
+      expect(html).toContain(`"start": {"level": 3, "agent": ${agent}, "session": "${good}"}`);
+      expect(html).toContain(`"focus": "${good}"`);
+      expect(html).toContain(bad); // the other session is still in the file
     }
   });
 

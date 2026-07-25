@@ -155,6 +155,39 @@ describe.skipIf(!hasBuild)("ctxdiff CLI (dist/cli.js) smoke", () => {
     rmSync(p, { force: true });
   });
 
+  it("export --agent preselects the level; an unknown one exits 2 with the list", () => {
+    // `--agent` on the dashboard commands PRESELECTS which of the three levels
+    // the page opens on rather than filtering what the file contains — the HTML
+    // still covers the whole project either way.
+    const outHtml = join(dir, "smoke-agent.html");
+    const ok = run(["export", "--run", fx.multiagent, "--agent", "researcher", "--out", outHtml]);
+    expect(ok.code).toBe(0);
+    const html = readFileSync(outHtml, "utf-8");
+    expect(html).toContain('"start": {"level": 3, "agent": "researcher"');
+    expect(html).toContain('"name": "writer"'); // the other agent is still there
+
+    const bad = run(["view", "--no-open", "--run", fx.multiagent, "--agent", "nobody"]);
+    expect(bad.code).toBe(2);
+    expect(bad.err).toContain("no agent 'nobody' in this project");
+    expect(bad.err).toContain("researcher");
+  });
+
+  it("demo's dashboard lands on the agent listing (two agents in the sample)", () => {
+    const demoCtrace = join(dir, "smoke-demo-levels.ctrace");
+    const r = run(["demo", "--no-open", "--out", demoCtrace]);
+    expect(r.code).toBe(0);
+    const htmlPath = r.out
+      .split("\n")
+      .find((l) => l.startsWith("dashboard"))!
+      .split("->")[1]
+      .trim();
+    const html = readFileSync(htmlPath, "utf-8");
+    expect(html).toContain('"start": {"level": 1, "agent": null, "session": null}');
+    expect(html).toContain('"name": "researcher"');
+    expect(html).toContain('"name": "writer"');
+    expect(html).not.toMatch(/https?:\/\//);
+  });
+
   it("demo --no-open --out writes a sample trace + dashboard (exit 0)", () => {
     const demoCtrace = join(dir, "smoke-demo.ctrace");
     const r = run(["demo", "--no-open", "--out", demoCtrace]);

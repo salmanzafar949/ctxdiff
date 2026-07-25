@@ -97,6 +97,129 @@ export class StoreSnapshot implements ReadableStore {
   }
 }
 
+/**
+ * An in-memory, synchronous view of a WHOLE project: every session's row and
+ * calls, and the blocks of only those sessions whose turn-by-turn detail the
+ * dashboard will embed.
+ *
+ * Why a second snapshot class rather than a flag on `StoreSnapshot`: the two
+ * answer different questions and have different costs, and conflating them
+ * would make every single-session command pay a project-wide read. A
+ * `StoreSnapshot` is ONE session, materialized completely, for the analyzers.
+ * This is the whole project materialized ASYMMETRICALLY — calls for everything
+ * (cheap, and what levels 1 and 2 aggregate) but blocks only for the capped set
+ * (expensive, and what level 3 needs). Nothing but the dashboard wants that
+ * shape, and the dashboard wants nothing else.
+ *
+ * A session outside the detail set answers `getCallBlocks` with `[]` rather than
+ * throwing: its level-3 view was never going to be built, and the page renders
+ * it as a listing row marked "detail not embedded".
+ */
+export class ProjectSnapshot implements ReadableStore {
+  constructor(
+    private readonly sessions: Session[],
+    private readonly runs: Map<string, Run>,
+    private readonly calls: Map<string, Call[]>,
+    private readonly blocks: Map<string, CallBlock[]>,
+    private readonly focusId: string,
+  ) {}
+
+  /** One session's run row; no argument means the focus session. Only the
+   * sessions with embedded detail have one — the aggregate levels read the
+   * session LIST, which carries the same facts without a per-session query. */
+  getRun(sessionId?: string): Run {
+    const id = sessionId ?? this.focusId;
+    const run = this.runs.get(id);
+    if (run === undefined) {
+      throw new Error(`ctxdiff: session ${id} is not in this project snapshot`);
+    }
+    return run;
+  }
+
+  /** One session's calls, in turn order; every session in the project has them. */
+  getCalls(sessionId?: string): Call[] {
+    return this.calls.get(sessionId ?? this.focusId) ?? [];
+  }
+
+  /** One call's blocks, or `[]` for a call in a session outside the detail set. */
+  getCallBlocks(callId: string): CallBlock[] {
+    return this.blocks.get(callId) ?? [];
+  }
+
+  /** Every session in the project, oldest first — what levels 1 and 2 list. */
+  listSessions(): Session[] {
+    return this.sessions;
+  }
+
+  /** Present for symmetry with `CTrace`/`StoreSnapshot` so CLI code can
+   * `finally { r.close() }`. The connection is already gone. */
+  close(): void {
+    /* nothing to release: the snapshot owns no connection */
+  }
+}
+
+/** Which project `snapshotProject` reads, and how much of it. */
+export interface ProjectSnapshotOptions {
+  /** The session whose detail the dashboard focuses on; also the default of
+   * every no-argument read. */
+  focusId: string;
+  /** The session list the caller already fetched — the CLI always has one,
+   * because it needed it to resolve `--session` at all. */
+  sessionList: Session[];
+  /** The sessions whose BLOCKS to read: the dashboard's detail set, decided by
+   * `detailSessionIds` in the viewer so the cap lives in exactly one place. */
+  detailIds: string[];
+}
+
+/**
+ * Materialize a whole project into a `ProjectSnapshot` and CLOSE the store —
+ * the networked-store path behind `ctxdiff view`/`export`.
+ *
+ * The read is deliberately asymmetric, because the two halves of the dashboard
+ * have completely different costs against a shared database:
+ *
+ * - CALLS for every session: one query per session, no joins to the block
+ *   tables. This is what levels 1 and 2 aggregate, and it is the same read
+ *   `ctxdiff agents` already does across the project, so listing every agent is
+ *   affordable even against a database holding thousands of sessions.
+ * - BLOCKS for the detail set only: one query per CALL of those sessions, which
+ *   is the expensive axis and the reason the detail set is capped at all.
+ *
+ * Closing here rather than leaving it to the caller matches `snapshotStore`:
+ * after this returns, every byte the exporter will read is in memory, and
+ * holding a connection open for the duration of an HTML render is exactly the
+ * liability a debugging tool should not add to someone's production database.
+ */
+export async function snapshotProject(
+  store: Store,
+  opts: ProjectSnapshotOptions,
+): Promise<ProjectSnapshot> {
+  try {
+    const detail = new Set(opts.detailIds);
+    const runs = new Map<string, Run>();
+    const calls = new Map<string, Call[]>();
+    const blocks = new Map<string, CallBlock[]>();
+    for (const s of opts.sessionList) {
+      const sessionCalls = await store.getCalls(s.id);
+      calls.set(s.id, sessionCalls);
+      if (!detail.has(s.id)) continue;
+      runs.set(s.id, await store.getRun(s.id));
+      for (const call of sessionCalls) blocks.set(call.id, await store.getCallBlocks(call.id));
+    }
+    // A focus session missing from the listing (a store that lists nothing but
+    // is bound to a run) still has to answer `getRun`, or the export cannot even
+    // name the project.
+    if (!runs.has(opts.focusId)) runs.set(opts.focusId, await store.getRun(opts.focusId));
+    return new ProjectSnapshot(opts.sessionList, runs, calls, blocks, opts.focusId);
+  } finally {
+    try {
+      await store.close();
+    } catch {
+      /* the data is already read; a failed goodbye must not lose it */
+    }
+  }
+}
+
 /** Which session `snapshotStore` reads, and what it may read BEYOND it. */
 export interface SnapshotOptions {
   /** Also materialize every session in the store (`ctxdiff sessions`' listing).

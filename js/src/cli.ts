@@ -36,12 +36,12 @@ import {
 } from "./store/base.js";
 import { fromDsn, resolve as resolveConfigured } from "./store/config.js";
 import { SQLiteStore } from "./store/sqlite.js";
-import { snapshotStore } from "./store/snapshot.js";
+import { snapshotProject, snapshotStore } from "./store/snapshot.js";
 import { diffCalls, diffTurns } from "./analyze/diff.js";
 import { analyzeRun, registeredToolNames, usageTotals } from "./analyze/tokens.js";
 import { analyzeCache } from "./analyze/cache.js";
 import { isTraceFile, listFileCalls, listFileSessions } from "./analyze/sessions.js";
-import { exportHtml, exportStore } from "./viewer/export.js";
+import { detailSessionIds, exportHtml, exportStore, type ProjectReader } from "./viewer/export.js";
 import { buildDemoTrace } from "./demo.js";
 import {
   renderTurnDiff,
@@ -142,6 +142,12 @@ class SessionView implements Reader {
   /** One call's blocks — call ids are globally unique, so no pinning. */
   getCallBlocks(callId: string): CallBlock[] {
     return this.store.getCallBlocks(callId);
+  }
+
+  /** Every session in the underlying file (pinning scopes READS, not
+   * discovery) — what the dashboard's level-1/level-2 listings are built from. */
+  listSessions(): Session[] {
+    return this.store.listSessions();
   }
 
   close(): void {
@@ -281,9 +287,21 @@ interface ProjectHandle {
    * different ids) by a cross-session diff, which is exactly why this is a
    * factory rather than a single pre-opened reader. */
   read(sessionId: string): Promise<Reader>;
+  /** Materialize the WHOLE project as a synchronous reader focused on
+   * `sessionId` — what the three-level dashboard needs and no analysis command
+   * does. Separate from `read` because the reads are genuinely different: this
+   * one pulls every session's calls for the aggregate levels and only the capped
+   * set's blocks (see `store/snapshot.ts`). */
+  readProject(sessionId: string): Promise<ProjectReaderHandle>;
   /** Release anything still held open — safe to call whether or not `read` was
    * ever reached (a selector error aborts before it is). */
   close(): Promise<void>;
+}
+
+/** A whole-project reader: the synchronous analyzer surface plus the session
+ * listing, closable like every other reader. */
+interface ProjectReaderHandle extends ProjectReader {
+  close(): void;
 }
 
 /**
@@ -324,6 +342,9 @@ async function openProject(project: string | undefined): Promise<ProjectHandle> 
       htmlDefault,
       discovered,
       read: async (sessionId: string) => new SessionView(ct, sessionId),
+      // A file store is synchronous and already open, so the "project reader"
+      // is the same pinned view — it can read any session of the file directly.
+      readProject: async (sessionId: string) => new SessionView(ct, sessionId),
       close: async () => ct.close(),
     };
   }
@@ -349,6 +370,15 @@ async function openProject(project: string | undefined): Promise<ProjectHandle> 
       pending = null;
       return snapshotStore(store, { sessionId, sessionList: sessions });
     },
+    readProject: async (sessionId: string) => {
+      const store = pending ?? (await backend.openReader());
+      pending = null;
+      return snapshotProject(store, {
+        focusId: sessionId,
+        sessionList: sessions,
+        detailIds: detailSessionIds(sessions, sessionId),
+      });
+    },
     close: async () => {
       if (pending) {
         const store = pending;
@@ -373,6 +403,58 @@ async function openSession(
     const sessionId = chooseSession(handle.sessions, session, handle.defaultId);
     const reader = await handle.read(sessionId);
     return { reader, sessionId, htmlDefault: handle.htmlDefault, handle };
+  } catch (err) {
+    await handle.close();
+    throw err;
+  }
+}
+
+/** Every NAMED agent anywhere in the project, in first-appearance order, read
+ * from the session rows the listing already carries — so validating `--agent`
+ * for the dashboard costs no extra query. Mirrors Python
+ * `_project_agent_names`. */
+function projectAgentNames(sessions: Session[]): string[] {
+  const names: string[] = [];
+  for (const s of sessions) for (const n of s.agents) if (!names.includes(n)) names.push(n);
+  return names;
+}
+
+/**
+ * Open a project for `export`/`view`, focused on the session whose detail the
+ * dashboard shows.
+ *
+ * Why this is NOT `openSession`: every other read command analyzes exactly one
+ * session, so several sessions and no `--session` is a question it must refuse
+ * to guess at. The dashboard is the opposite — it exists to show the WHOLE
+ * project, and it opens on the agent listing precisely when there is more than
+ * one thing to choose from. So a bare `ctxdiff view` on a many-session project
+ * is not ambiguous any more; it focuses the newest session and lands the user on
+ * level 1, where picking is what the page is for.
+ *
+ * `--session` still resolves through `chooseSession` (same errors, same
+ * listing), and `--agent` is checked against the whole project so a typo is
+ * caught here rather than silently opening on a level scoped to nobody. Mirrors
+ * Python `_open_dashboard`.
+ */
+async function openDashboard(
+  project: string | undefined,
+  session: string | null,
+  agent: string | null,
+): Promise<{
+  reader: ProjectReaderHandle;
+  htmlDefault: string | null;
+  sessionSelected: boolean;
+  handle: ProjectHandle;
+}> {
+  const handle = await openProject(project);
+  try {
+    const sessionId =
+      session !== null
+        ? chooseSession(handle.sessions, session, handle.defaultId)
+        : handle.defaultId;
+    if (agent !== null) requireAgent(agent, projectAgentNames(handle.sessions), "this project");
+    const reader = await handle.readProject(sessionId);
+    return { reader, htmlDefault: handle.htmlDefault, sessionSelected: session !== null, handle };
   } catch (err) {
     await handle.close();
     throw err;
@@ -1249,20 +1331,22 @@ function viewerProject(values: Record<string, unknown>, positionals: string[]): 
   );
 }
 
-/** `ctxdiff export [--project P] [--session S] [--out FILE.html]`: write a
- * self-contained HTML dashboard for ONE session beside the trace (or to
- * `--out`) and print the path. */
+/** `ctxdiff export [--project P] [--session S] [--agent A] [--out FILE.html]`:
+ * write the project's self-contained three-level HTML dashboard beside the trace
+ * (or to `--out`) and print the path. */
 async function cmdExport(rest: string[]): Promise<number> {
   const { values, positionals } = parseViewerArgs(rest, {
     project: { type: "string" },
     run: { type: "string" },
     session: { type: "string" },
+    agent: { type: "string" },
     out: { type: "string" },
   });
   try {
     const out = await writeDashboard(
       viewerProject(values, positionals),
       (values.session as string | undefined) ?? null,
+      (values.agent as string | undefined) ?? null,
       values.out as string | undefined,
     );
     process.stdout.write(out + "\n");
@@ -1273,18 +1357,23 @@ async function cmdExport(rest: string[]): Promise<number> {
 }
 
 /**
- * Render a dashboard for ONE session of whichever project `openSession` resolves
- * and return the path written. `out` wins; otherwise the trace's own
- * `<stem>.html` is used, and a store with no file (Postgres/MySQL) says so rather
- * than inventing a filename. Shared by `export` and `view` so both reach a
- * database identically.
+ * Render the three-level dashboard for whichever project `openDashboard`
+ * resolves — focused on one session, optionally scoped to one agent — and return
+ * the path written. `out` wins; otherwise the trace's own `<stem>.html` is used,
+ * and a store with no file (Postgres/MySQL) says so rather than inventing a
+ * filename. Shared by `export` and `view` so both reach a database identically.
  */
 async function writeDashboard(
   project: string | undefined,
   session: string | null,
+  agent: string | null,
   out: string | undefined,
 ): Promise<string> {
-  const { reader, htmlDefault, handle } = await openSession(project, session);
+  const { reader, htmlDefault, sessionSelected, handle } = await openDashboard(
+    project,
+    session,
+    agent,
+  );
   try {
     const target = out ?? htmlDefault;
     if (target === null) {
@@ -1293,21 +1382,22 @@ async function writeDashboard(
           "— pass --out FILE.html",
       );
     }
-    return exportStore(reader, target);
+    return exportStore(reader, target, { agent, sessionSelected });
   } finally {
     reader.close();
     await handle.close();
   }
 }
 
-/** `ctxdiff view [--project P] [--session S] [--no-open]`: export the dashboard
- * to a temp file, print its path, and open it in the browser unless
- * `--no-open`. */
+/** `ctxdiff view [--project P] [--session S] [--agent A] [--no-open]`: export
+ * the dashboard to a temp file, print its path, and open it in the browser
+ * unless `--no-open`. */
 async function cmdView(rest: string[]): Promise<number> {
   const { values, positionals } = parseViewerArgs(rest, {
     project: { type: "string" },
     run: { type: "string" },
     session: { type: "string" },
+    agent: { type: "string" },
     "no-open": { type: "boolean" },
   });
   const tmp = join(tmpdir(), `ctxdiff-${randomUUID()}.html`);
@@ -1316,6 +1406,7 @@ async function cmdView(rest: string[]): Promise<number> {
     out = await writeDashboard(
       viewerProject(values, positionals),
       (values.session as string | undefined) ?? null,
+      (values.agent as string | undefined) ?? null,
       tmp,
     );
   } catch (err) {
@@ -1386,7 +1477,7 @@ const USAGE =
   "  sessions                 list the sessions ctxdiff can see\n" +
   "  agents                   list every agent in the project, across all sessions\n" +
   "  view                     open a self-contained HTML dashboard in your browser\n" +
-  "  export [--out FILE]      write a self-contained HTML dashboard for a session\n" +
+  "  export [--out FILE]      write a self-contained HTML dashboard for the project\n" +
   "  demo                     build a sample dashboard — no API keys, no setup\n" +
   "\n" +
   "common options: [--project PATH|DSN] [--session ID] [--agent NAME]\n";

@@ -29,7 +29,8 @@ import {
   type SqlConn,
 } from "../src/store/sql.js";
 import { EmptyStoreError } from "../src/store/base.js";
-import { snapshotStore } from "../src/store/snapshot.js";
+import { snapshotProject, snapshotStore } from "../src/store/snapshot.js";
+import { buildProjectPayload, detailSessionIds } from "../src/viewer/export.js";
 import type {
   Call,
   CallBlock,
@@ -490,6 +491,129 @@ class CountingStore implements Store {
     this.calls.close += 1;
   }
 }
+
+/**
+ * A many-session async `Store` double: `n` sessions, two agents each, every read
+ * counted. Enough to prove the DASHBOARD's project read against a networked
+ * store without a server — which is the case that matters, since a `.ctrace`
+ * reader can walk sessions directly and a snapshot cannot.
+ */
+class ProjectStore implements Store {
+  readonly calls = { getRun: 0, getCalls: 0, getCallBlocks: 0, listSessions: 0, close: 0 };
+  constructor(private readonly sessionCount: number) {}
+  private id(i: number): string {
+    return `s${String(i).padStart(3, "0")}`;
+  }
+  async recordCall(): Promise<string> {
+    return "c";
+  }
+  async noteModel(): Promise<void> {}
+  async listSessions(): Promise<Session[]> {
+    this.calls.listSessions += 1;
+    return Array.from({ length: this.sessionCount }, (_, i) => ({
+      id: this.id(i),
+      project: "fleet",
+      startedAt: `2026-07-${String(i + 1).padStart(2, "0")}T09:00:00+00:00`,
+      provider: "openai",
+      models: ["gpt-4o"],
+      agents: ["alpha", "beta"],
+      turnCount: 2,
+    }));
+  }
+  async getRun(sessionId?: string): Promise<Run> {
+    this.calls.getRun += 1;
+    return {
+      id: sessionId ?? this.id(this.sessionCount - 1),
+      project: "fleet",
+      startedAt: "2026-07-01T09:00:00+00:00",
+      provider: "openai",
+      models: ["gpt-4o"],
+      ctxdiffVersion: "0.1.0",
+    };
+  }
+  async getCalls(sessionId?: string): Promise<Call[]> {
+    this.calls.getCalls += 1;
+    const sid = sessionId ?? this.id(this.sessionCount - 1);
+    return ["alpha", "beta"].map((agent, seq) => ({
+      id: `${sid}-${agent}`,
+      runId: sid,
+      seq: seq + 1,
+      params: { model: "gpt-4o" },
+      usage: { prompt_tokens: 10, completion_tokens: 2 },
+      latencyMs: 1,
+      error: null,
+      agent,
+      step: null,
+      provider: "openai",
+    }));
+  }
+  async getCallBlocks(): Promise<CallBlock[]> {
+    this.calls.getCallBlocks += 1;
+    return [];
+  }
+  async close(): Promise<void> {
+    this.calls.close += 1;
+  }
+}
+
+describe("snapshotProject reads a whole project asymmetrically", () => {
+  it("takes every session's CALLS but only the detail set's BLOCKS", async () => {
+    // The dashboard's scale decision, at the storage layer: levels 1 and 2
+    // aggregate call rows for EVERY session (so no agent is hidden however big
+    // the database), while blocks — the expensive axis, and the only one with
+    // real size — are read only for the sessions whose detail is embedded.
+    const store = new ProjectStore(30);
+    const sessions = await store.listSessions();
+    store.calls.listSessions = 0;
+    const focus = sessions[sessions.length - 1].id;
+
+    const snapshot = await snapshotProject(store, {
+      focusId: focus,
+      sessionList: sessions,
+      detailIds: detailSessionIds(sessions, focus),
+    });
+
+    expect(store.calls.getCalls).toBe(30);          // one per session
+    expect(store.calls.getCallBlocks).toBe(25 * 2); // only the capped set
+    expect(store.calls.listSessions).toBe(0);       // the caller's list was reused
+    expect(store.calls.close).toBe(1);              // connection released
+    expect(snapshot.listSessions()).toHaveLength(30);
+    // A session outside the detail set still answers its calls (the aggregates
+    // need them) and answers `[]` for blocks rather than throwing.
+    expect(snapshot.getCalls(sessions[0].id)).toHaveLength(2);
+    expect(snapshot.getCallBlocks(`${sessions[0].id}-alpha`)).toEqual([]);
+  });
+
+  it("builds the same three-level dashboard a .ctrace would", async () => {
+    const store = new ProjectStore(4);
+    const sessions = await store.listSessions();
+    const focus = sessions[sessions.length - 1].id;
+    const snapshot = await snapshotProject(store, {
+      focusId: focus,
+      sessionList: sessions,
+      detailIds: detailSessionIds(sessions, focus),
+    });
+
+    const project = (buildProjectPayload(snapshot) as {
+      project: {
+        sessions_total: number;
+        focus: string;
+        start: { level: number };
+        agents: { name: string; sessions: number; calls: number; input: number }[];
+        sessions: { id: string; detail: boolean }[];
+      };
+    }).project;
+
+    expect(project.sessions_total).toBe(4);
+    expect(project.focus).toBe(focus);
+    expect(project.start.level).toBe(1);            // two agents, four sessions
+    expect(project.agents.map((a) => a.name)).toEqual(["alpha", "beta"]);
+    expect(project.agents[0]).toMatchObject({ sessions: 4, calls: 4, input: 40 });
+    // Newest first, and every one of them drillable at this size.
+    expect(project.sessions.map((s) => s.id)).toEqual(["s003", "s002", "s001", "s000"]);
+    expect(project.sessions.every((s) => s.detail)).toBe(true);
+  });
+});
 
 describe("snapshotStore reads the RUN, not the database", () => {
   it("skips the session listing unless it is asked for", async () => {
