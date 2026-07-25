@@ -1,6 +1,6 @@
 {
   "name": "ctxdiff",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Find what breaks your LLM agent's prompt cache and wastes its context — git diff for the context window. A local-first context-window debugger for LLM agents. Wrap your OpenAI/Anthropic/Gemini/Bedrock client in one line and record every call's context into a shareable .ctrace, then diff turns, profile prompt-cache breaks, and open a self-contained HTML dashboard. Cross-compatible with the Python ctxdiff SDK.",
   "type": "module",
   "license": "Apache-2.0",
