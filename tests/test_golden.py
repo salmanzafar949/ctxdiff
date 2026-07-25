@@ -119,22 +119,39 @@ def test_fixtures_really_run_the_exact_tokenizer(traces):
     `count_tokens` began falling back to the estimate for every block, the
     goldens would still be internally consistent and every comparison below
     would still pass — while measuring nothing at all about the tokenizer. Every
-    openai-provider block must carry `token_method == 'tiktoken'`."""
+    openai-provider TEXT block must carry `token_method == 'tiktoken'`.
+
+    Image blocks are the one deliberate exception, and they are checked in the
+    opposite direction: their cost comes from the provider's published vision
+    formula applied to the pixel dimensions, never from the tokenizer, so they
+    must ALWAYS read 'estimate'. An image block that came back 'tiktoken' would
+    mean the base64 payload had leaked into the block text again — the exact
+    regression this suite now pins."""
     from ctxdiff.store.ctrace import CTrace
 
     exact = 0
+    images = 0
     for path in traces.values():
         ct = CTrace.open(path)
         try:
             for session in ct.list_sessions():
                 for call in ct.get_calls(session.id):
                     for cb in ct.get_call_blocks(call.id):
-                        if (call.provider or session.provider) == "openai":
+                        if (call.provider or session.provider) != "openai":
+                            continue
+                        if cb.block.kind == "image":
+                            assert cb.block.token_method == "estimate"
+                            assert cb.block.text.startswith("[image")
+                            images += 1
+                        else:
                             assert cb.block.token_method == "tiktoken"
                             exact += 1
         finally:
             ct.close()
     assert exact > 50
+    # …and the image half of the corpus is genuinely on the compared surface,
+    # so this assertion cannot be satisfied by there being no images at all.
+    assert images > 5
 
 
 # --- the expectations ----------------------------------------------------------

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 
+from ctxdiff.images import image_raw_block
 from ctxdiff.models import RawBlock
 
 # Request keys excluded from params verbatim: "system"/"messages"/"toolConfig"
@@ -61,6 +62,14 @@ class BedrockAdapter:
         for msg in kwargs.get("messages") or []:
             role = msg.get("role", "user")
             for part in msg.get("content") or []:
+                # An `{"image": {"format": ..., "source": {"bytes": ...}}}`
+                # part becomes an 'image' block whose text is a short
+                # descriptor and whose identity is the image bytes; see
+                # ctxdiff.images.
+                image = image_raw_block(role, part, self.provider)
+                if image is not None:
+                    blocks.append(image)
+                    continue
                 if isinstance(part, dict) and "text" in part:
                     text = part["text"]
                 else:

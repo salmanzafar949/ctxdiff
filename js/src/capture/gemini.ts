@@ -18,6 +18,7 @@
 import type { Adapter } from "./base.js";
 import type { RawBlock } from "../models.js";
 import { stableStringify } from "../models.js";
+import { imageRawBlock } from "../images.js";
 
 // Request keys that carry block *content* rather than sampling params. `config`
 // also carries sampling fields (temperature etc.) — those are pulled back out
@@ -127,6 +128,16 @@ export class GeminiAdapter implements Adapter {
         const parts = isRecord(entry) ? entry["parts"] : undefined;
         if (Array.isArray(parts)) {
           for (const part of parts) {
+            // An `inlineData`/`fileData` part carrying an image MIME type
+            // becomes an 'image' block whose text is a short descriptor and
+            // whose identity is the image bytes — never the base64 payload.
+            // Non-image inline data (audio, video, PDF) is untouched and still
+            // serializes as before; see src/images.ts.
+            const image = imageRawBlock(role, part, this.provider);
+            if (image !== null) {
+              blocks.push(image);
+              continue;
+            }
             let text: string;
             if (typeof part === "string") {
               text = part;

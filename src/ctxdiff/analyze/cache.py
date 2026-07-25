@@ -23,6 +23,7 @@ from ctxdiff.analyze.differ import (
     distinct_agents,
     filter_calls,
 )
+from ctxdiff.images import IMAGE_KIND
 from ctxdiff.models import CallBlock
 from ctxdiff.store.base import Call, Store
 
@@ -147,6 +148,29 @@ def _first_diff_segment(inline_diff: list[tuple[str, str]]) -> tuple[int, str, s
     return offset, old_part, new_part
 
 
+def _short_digest(content_hash: str, chars: int = 6) -> str:
+    """The first few hex characters of a block's content hash, ellipsized —
+    enough to tell two blocks apart in one line of terminal output and to grep
+    for in the store, without printing 64 characters of noise."""
+    return content_hash[:chars] + "…"
+
+
+def _image_change_detail(label: str, old_block, new_block) -> str:
+    """Explain a same-slot IMAGE change by naming the two blocks rather than by
+    character offset.
+
+    An image block's `text` is a DESCRIPTOR (`[image 1024×768 · ~765 tok]`), not
+    its content, so two different screenshots that share a size produce an
+    inline text diff that is entirely 'equal'. Run through the character-offset
+    explanation, that told the user their prefix "breaks on every turn" and then
+    showed them `first difference at char 7: '' → ''` — a real, expensive break
+    with a blank explanation. The digests are the only thing that actually
+    differs, so they are what gets reported."""
+    old_hash = _short_digest(old_block.content_hash) if old_block is not None else "?"
+    return (f"modified {label} block — a different image at the same position: "
+            f"sha {old_hash} → {_short_digest(new_block.content_hash)}")
+
+
 def _is_dynamic_change(inline_diff: list[tuple[str, str]]) -> bool:
     """Heuristic for 'a small volatile substring inside otherwise-stable
     text' (e.g. a timestamp) as opposed to a wholesale rewrite: true when the
@@ -195,6 +219,14 @@ def _attribute_break(
         None,
     )
     if modified is not None:
+        if modified.block.kind == IMAGE_KIND:
+            # An image's text is a stand-in, so a character offset into it
+            # explains nothing (and its all-'equal' inline diff would satisfy
+            # the dynamic-field heuristic vacuously — a swapped screenshot is
+            # never "a volatile substring in otherwise-stable text").
+            detail = _image_change_detail(modified.label, modified.old_block, modified.block)
+            return ("modified", modified.label, _flatten_snippet(modified.block.text),
+                    detail, False)
         offset, old_part, new_part = _first_diff_segment(modified.inline_diff or [])
         detail = (f"modified {modified.label} block — first difference at "
                   f"char {offset}: '{_truncate(old_part)}' → '{_truncate(new_part)}'")

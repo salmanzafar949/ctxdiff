@@ -34,8 +34,10 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { basicLabel, contentHash } from "../../src/models.js";
-import { countTokens } from "../../src/tokenize.js";
+import type { RawBlock } from "../../src/models.js";
+import { basicLabel } from "../../src/models.js";
+import { buildBlock } from "../../src/capture/recorder.js";
+import { imageRawBlock } from "../../src/images.js";
 import { DDL, SCHEMA_VERSION } from "../../src/store/schema.js";
 
 // vitest runs with cwd = the js/ package dir; the shared corpus lives at the
@@ -65,7 +67,10 @@ interface CorpusCall {
   latency_ms: number | null;
   error: string | null;
   tags?: [string, string][];
-  blocks: [string, string, string][];
+  // `[role, kind, text]`, where `text` is a literal string for an ordinary
+  // block and a provider content-part OBJECT for an `image` block — see
+  // `rawBlock` for why an image cannot be spelled out literally.
+  blocks: [string, string, unknown][];
 }
 
 interface CorpusSession {
@@ -94,6 +99,37 @@ function loadCorpus(manifest: Manifest, fixtureId: string): Corpus {
   const entry = manifest.fixtures.find((f) => f.id === fixtureId);
   if (!entry) throw new Error(`no fixture ${fixtureId} in the golden manifest`);
   return JSON.parse(readFileSync(join(GOLDEN_DIR, entry.corpus), "utf8")) as Corpus;
+}
+
+/**
+ * Turn one corpus block entry into the `RawBlock` an adapter would have produced
+ * for it. The exact twin of `harness.raw_block` in `spec/golden/harness.py`.
+ *
+ * A corpus block is normally the triple `[role, kind, text]` with `text` a
+ * literal string, which becomes a plain RawBlock — unchanged from before.
+ *
+ * The one exception is an IMAGE block, written as `[role, "image", {…the
+ * provider content part…}]` with an OBJECT in the text slot. A scenario file
+ * cannot hard-code an image block's text/hash/token count the way it can for
+ * prose: the descriptor, the byte digest and the vision estimate are all
+ * DERIVED, and hard-coding them would freeze a copy of the very logic the golden
+ * exists to check. So the fixture carries the real provider payload — an OpenAI
+ * `image_url`, an Anthropic `source`, a Gemini `inline_data` — and this SDK's
+ * own `imageRawBlock` derives the block from it, exactly as it does during live
+ * capture.
+ */
+function rawBlock(role: string, kind: string, text: unknown, provider: string): RawBlock {
+  if (kind === "image" && typeof text !== "string") {
+    const raw = imageRawBlock(role, text, provider);
+    if (raw === null) {
+      throw new Error(
+        `corpus block declared kind 'image' but ${JSON.stringify(text)} is not a ` +
+          `recognized image part for provider '${provider}'`,
+      );
+    }
+    return raw;
+  }
+  return { role, kind, text: text as string };
 }
 
 /**
@@ -152,11 +188,18 @@ export function buildCtrace(manifest: Manifest, fixtureId: string, outDir: strin
         const tagged = (call.tags ?? []) as [string, string][];
         const provider = call.provider ?? session.provider;
         call.blocks.forEach(([role, kind, text], position) => {
-          const [tokenCount, tokenMethod] = countTokens(text, provider);
-          const hash = contentHash(role, kind, text);
-          const [label, labelSource] = basicLabel(role, kind, text, tagged);
-          insertBlock.run(hash, role, kind, text, tokenCount, tokenMethod);
-          insertCallBlock.run(call.call_id, hash, position, label, labelSource);
+          const raw = rawBlock(role, kind, text, provider);
+          const block = buildBlock(raw, provider);
+          const [label, labelSource] = basicLabel(raw.role, raw.kind, raw.text, tagged);
+          insertBlock.run(
+            block.contentHash,
+            block.role,
+            block.kind,
+            block.text,
+            block.tokenCount,
+            block.tokenMethod,
+          );
+          insertCallBlock.run(call.call_id, block.contentHash, position, label, labelSource);
         });
       }
     }

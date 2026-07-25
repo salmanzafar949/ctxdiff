@@ -95,7 +95,8 @@ an HTML hash breaks, the CLI goldens beside it usually say why in plain text.
 | `unicode` | Emoji ZWJ families, skin-tone modifiers, flag sequences, CJK/Hangul/Devanagari/Arabic/Hebrew, combining vs. precomposed accents, invisible bidi/zero-width marks, astral math alphanumerics — the likeliest place for two BPE implementations to disagree, and (as it turned out) the place where a UTF-16-vs-code-point truncation bug in the JS CLI was caught. |
 | `code-and-schemas` | Fenced Python/SQL/TypeScript blocks and two long JSON tool schemas, one registered but never invoked. Dense punctuation and indentation runs are the merge-table region that moves most between releases; the unused schema puts the bloat detector's token cost and percentage on the compared surface. |
 | `multiagent-project` | Two sessions in one project file, two agents each: the `sessions` listing (labels, local-time rendering), the `agents` rollup across sessions, per-agent attribution, cross-session and cross-agent diffs, a developer-tagged `rag` block, and a live clock in the system prompt so the cache profiler reports a real prefix break with attribution and a fix hint. |
-| `multipart-content` | Vision/multimodal `content_part` blocks: a base64 `data:` image URI, an audio part, an opaque file id, a nested tool-call argument string and a `function_call_output`. Long base64 runs stress the tokenizer; the `</script>` sequences inside the block text also put the exporter's escaping path under the HTML hash. |
+| `multipart-content` | Multimodal `content_part` blocks around an image: an audio part, an opaque file id, a nested tool-call argument string and a `function_call_output`. The image itself is now an `image` block (its base64 is neither stored nor tokenized), and the SAME image is sent on both turns, so the diff must report it unchanged. The `</script>` sequences inside the block text also put the exporter's escaping path under the HTML hash. |
+| `image-blocks` | The image block representation end to end: every provider shape (OpenAI `image_url` data URI and remote URL at both `detail` levels, OpenAI Responses `input_image` and `file_id`, Anthropic base64/url/file sources, Gemini `inline_data` and `file_data`), all four sniffable formats, both degradations (unknown format, un-fetched remote URL), the three providers' published vision formulas, dedup of a re-sent screenshot, and a SECOND image of the same size whose different bytes must keep it a separate block. The `auditor` agent puts that second image at the SAME position in the next turn of the SAME agent — two different screenshots rendering the identical descriptor — which pins how the cache profiler must explain an image break (the two block digests; a character offset into a stand-in descriptor explains nothing). A non-image `inline_data` sits alongside to prove only image MIME types leave the stable-JSON path. |
 | `round-numbers` | Whole-number floats. Python's `json.dumps` writes `100.0`; JS's `JSON.stringify` writes `100`, which is why the JS viewer needs the `PyFloat` shim. Turn 1 has a single block (exactly `100.0%`) and turn 3's provider usage equals its block total (an exact `Δ +0`), so a regression in the float-spelling shim shows up as a one-character diff. |
 
 Five commands are captured across those fixtures — `diff` (within-session,
@@ -140,7 +141,19 @@ test suites can *assert* the environment matches rather than assume it.
 
 ## Known cross-SDK divergences
 
-**None currently.** Recorded here rather than hidden either way, because a
+**None currently.**
+
+### Regenerated: images stopped being counted as prose
+
+`multipart-content` originally froze the WRONG behavior. Its base64 `data:` image
+URI was JSON-serialized into the block text, so the blob was stored in the
+`.ctrace` and counted by `tiktoken` as ordinary prose — the fixture's `why` even
+said so approvingly ("long base64 runs stress the tokenizer"). That is precisely
+the bug the image block representation fixes, so the fixture and its goldens were
+regenerated together with the change, and `image-blocks` was added to cover the
+representation properly. The resulting numbers are the honest ones: the image is
+costed by OpenAI's published vision formula rather than by tokenizing its
+encoding, and the turn is now correctly reported as approximate. Recorded here rather than hidden either way, because a
 corpus that quietly omits the cases it fails is worse than no corpus.
 
 ### Fixed: a literal `<|endoftext|>` no longer latches the Python tokenizer

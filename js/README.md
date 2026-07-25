@@ -329,12 +329,27 @@ Sync and async clients are both handled. Streaming usage is folded from each pro
 ## How it works
 
 1. **Capture.** `tracer.wrap(client)` returns a transparent `Proxy` over your client. It forwards everything untouched except the completion methods, which it intercepts to record the request's context — verbatim, wire-level — after the real call runs.
-2. **Block model.** Each request is flattened into ordered **blocks** (a message, a content part, a tool schema). A block's identity is `sha256(role · kind · normalized-text)`, so identical content is stored once and referenced many times. Diffing is an ordered hash-list comparison.
+2. **Block model.** Each request is flattened into ordered **blocks** (a message, a content part, a tool schema, an image). A block's identity is `sha256(role · kind · normalized-text)`, so identical content is stored once and referenced many times. Diffing is an ordered hash-list comparison.
 3. **Analysis.** `diff`, `tokens`, and `cache` are pure functions over the stored blocks — re-runnable, and the single source of truth the dashboard embeds.
 
 ### The block model
 
-`role` ∈ `system · user · assistant · tool` · `kind` ∈ `message · content_part · tool_schema`. Labels (`system · user · history · rag · tool_schema · tool_output`) come from a cheap heuristic unless you override them with `tracer.tag(...)`.
+`role` ∈ `system · user · assistant · tool` · `kind` ∈ `message · content_part · tool_schema · image`. Labels (`system · user · history · rag · tool_schema · tool_output`) come from a cheap heuristic unless you override them with `tracer.tag(...)`.
+
+### Images and multimodal content
+
+An image never reaches the store as its bytes. A vision content part — an OpenAI `image_url` or `input_image`, an Anthropic `{ type: "image", source: … }`, a Gemini `inlineData`/`fileData` — becomes a block with `kind: "image"` that looks like this:
+
+```
+[image 1024×768 · ~765 tok]
+```
+
+- **The base64 is not stored and not tokenized.** A `data:image/png;base64,…` part used to be JSON-serialized into the block text, so a 100 KB screenshot bloated the `.ctrace` *and* was counted by the tokenizer as prose — tens of thousands of phantom tokens for an image that really costs a few hundred.
+- **Identity is the pixels, plus what changes their cost.** The hash is taken over a sha256 of the image bytes, so the same screenshot re-sent every turn is **one** block referenced many times — `diff` reports it unchanged and the cache profiler sees a stable prefix — while two *different* images of the same size stay two blocks. The bytes are not the whole request, so the hash also covers OpenAI's `detail` (the same screenshot at `low` and at `high` costs 85 vs 765 tokens, and is two blocks) and anything else the content part carried — notably Anthropic's `cache_control`, so moving a cache breakpoint onto an image is a change the cache profiler reports rather than a silent one.
+- **The count is the provider's own published vision formula** applied to dimensions read from the image header (PNG/JPEG/GIF/WebP, header-only, no image library added as a dependency). It is always `tokenMethod: "estimate"`, so a turn containing an image is reported as approximate — a vision estimate is never presented as an exact tokenizer count.
+- **Nothing is ever fetched.** A remote `https://` URL or a provider-side file id is recorded as a reference and degrades to `[image]` with no estimate. ctxdiff stays local-first, and a trace's numbers never depend on whether the host was online.
+
+Non-image multimodal parts (audio, video, PDFs, opaque file ids) are untouched. Both SDKs produce byte-identical descriptors, hashes and estimates; the full contract is in [`spec/ctrace-schema.md`](../spec/ctrace-schema.md#image-blocks).
 
 ---
 
@@ -460,6 +475,8 @@ One run = one SQLite file, versioned by `schema_version` so an old or foreign fi
 | `call` | one per LLM request | `seq`, `params` (JSON), `usage` (JSON), `latency_ms`, `error`, `agent`, `step` |
 | `block` | one per **distinct** context unit | `content_hash` (PK), `role`, `kind`, `text`, `token_count`, `token_method` |
 | `call_block` | membership of a block in a call | `call_id`, `block_id`, `position`, `label`, `label_source` |
+
+**Block kinds:** `message` · `content_part` · `tool_schema` · `image` · **Token method:** `tiktoken` (exact) · `estimate` (heuristic, or a vision estimate for an `image` block)
 
 ---
 

@@ -8,7 +8,8 @@
  * waste note and fix hint. No I/O, no color.
  */
 import { diffCalls, distinctAgents, filterCalls, type TurnDiff, type InlineSegment } from "./diff.js";
-import type { Call, CallBlock } from "../models.js";
+import { IMAGE_KIND } from "../images.js";
+import type { Block, Call, CallBlock } from "../models.js";
 import type { ReadableStore } from "../store/base.js";
 
 // --- value types -------------------------------------------------------------
@@ -86,6 +87,35 @@ function firstDiffSegment(inlineDiff: InlineSegment[]): [number, string, string]
   return [offset, oldPart, newPart];
 }
 
+/** The first few hex characters of a block's content hash, ellipsized — enough
+ * to tell two blocks apart in one line of terminal output and to grep for in the
+ * store, without printing 64 characters of noise. Mirrors Python
+ * `_short_digest`. */
+function shortDigest(contentHash: string, chars = 6): string {
+  return contentHash.slice(0, chars) + "…";
+}
+
+/**
+ * Explain a same-slot IMAGE change by naming the two blocks rather than by
+ * character offset.
+ *
+ * An image block's `text` is a DESCRIPTOR (`[image 1024×768 · ~765 tok]`), not
+ * its content, so two different screenshots that share a size produce an inline
+ * text diff that is entirely 'equal'. Run through the character-offset
+ * explanation, that told the user their prefix "breaks on every turn" and then
+ * showed them `first difference at char 7: '' → ''` — a real, expensive break
+ * with a blank explanation. The digests are the only thing that actually
+ * differs, so they are what gets reported. Mirrors Python
+ * `_image_change_detail`.
+ */
+function imageChangeDetail(label: string, oldBlock: Block | null, newBlock: Block): string {
+  const oldHash = oldBlock ? shortDigest(oldBlock.contentHash) : "?";
+  return (
+    `modified ${label} block — a different image at the same position: ` +
+    `sha ${oldHash} → ${shortDigest(newBlock.contentHash)}`
+  );
+}
+
 /** Heuristic for 'a small volatile substring inside otherwise-stable text'
  * (e.g. a timestamp): true when there is SOME shared text and the changed text
  * is shorter than the shared text. Mirrors Python `_is_dynamic_change`. Lengths
@@ -122,6 +152,14 @@ function attributeBreak(
     (e) => e.kind === "modified" && e.positionOld === position && e.positionNew === position,
   );
   if (modified) {
+    if (modified.block.kind === IMAGE_KIND) {
+      // An image's text is a stand-in, so a character offset into it explains
+      // nothing (and its all-'equal' inline diff would satisfy the dynamic-field
+      // heuristic vacuously — a swapped screenshot is never "a volatile
+      // substring in otherwise-stable text").
+      const detail = imageChangeDetail(modified.label, modified.oldBlock, modified.block);
+      return ["modified", modified.label, flattenSnippet(modified.block.text), detail, false];
+    }
     const [offset, oldPart, newPart] = firstDiffSegment(modified.inlineDiff ?? []);
     const detail =
       `modified ${modified.label} block — first difference at ` +

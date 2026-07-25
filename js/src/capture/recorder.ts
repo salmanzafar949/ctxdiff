@@ -5,12 +5,50 @@
  * able to crash the program it is debugging. Mirrors Python `Recorder`.
  */
 import type { Adapter } from "./base.js";
-import type { Block, CallBlock } from "../models.js";
+import type { Block, CallBlock, RawBlock } from "../models.js";
 import { basicLabel, contentHash } from "../models.js";
 import { countTokens } from "../tokenize.js";
 import type { Awaitable, RecordCallArgs, Store } from "../store/base.js";
 
 export type RedactHook = (block: Block) => Block;
+
+/**
+ * Turn one adapter-extracted `RawBlock` into the stored, content-addressed
+ * `Block`: give it its identity and its token numbers.
+ *
+ * Two overrides, both defaulting to the original behavior (see `RawBlock`):
+ *
+ *   - IDENTITY is `contentHash(role, kind, hashInput ?? text)`. For an ordinary
+ *     block that is the text itself — unchanged, so every hash this SDK has ever
+ *     written stays valid. For an image block it is a digest of the image BYTES,
+ *     so two copies of the same picture are one block and a 1024×768 red square
+ *     and a 1024×768 blue one are not.
+ *   - TOKENS come from the tokenizer over `text`, unless the adapter already
+ *     computed them — which it does only for images, where the truthful cost is
+ *     the provider's vision formula over the pixel dimensions and NOT the
+ *     tokenization of the `[image …]` descriptor standing in for them.
+ *
+ * Factored out of `Recorder.build` so there is exactly ONE definition of what a
+ * stored block is: the golden harness (`test/helpers/golden.ts`) calls this same
+ * function to materialize its fixtures, which is what lets the committed goldens
+ * be evidence about the real capture path rather than about a parallel
+ * reimplementation of it. Mirrors Python `build_block`.
+ */
+export function buildBlock(rb: RawBlock, provider: string): Block {
+  const [tokenCount, tokenMethod] =
+    rb.tokenCount !== undefined
+      ? ([rb.tokenCount, rb.tokenMethod ?? "estimate"] as [number, string])
+      : countTokens(rb.text, provider);
+  const hashInput = rb.hashInput !== undefined ? rb.hashInput : rb.text;
+  return {
+    contentHash: contentHash(rb.role, rb.kind, hashInput),
+    role: rb.role,
+    kind: rb.kind,
+    text: rb.text,
+    tokenCount,
+    tokenMethod,
+  };
+}
 
 /**
  * One call, fully prepared and detached from the host's objects, ready to be
@@ -124,17 +162,11 @@ export class Recorder {
 
       const callBlocks: CallBlock[] = [];
       raw.forEach((rb, position) => {
-        // Count tokens for this text under the provider, then build the
-        // content-addressed Block.
-        const [tokenCount, tokenMethod] = countTokens(rb.text, provider);
-        let block: Block = {
-          contentHash: contentHash(rb.role, rb.kind, rb.text),
-          role: rb.role,
-          kind: rb.kind,
-          text: rb.text,
-          tokenCount,
-          tokenMethod,
-        };
+        // Count tokens and take the content hash for this block — see
+        // `buildBlock` for the two adapter-supplied overrides (an image hashes
+        // its bytes and carries a pre-computed vision estimate; everything else
+        // hashes and tokenizes its text).
+        let block: Block = buildBlock(rb, provider);
         // Redact AFTER hashing/counting but BEFORE storage: the hash keeps the
         // original text so identity/dedup stays stable even if redaction is
         // nondeterministic; only the stored text changes.

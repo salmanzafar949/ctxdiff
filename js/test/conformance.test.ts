@@ -19,6 +19,7 @@ import { Recorder } from "../src/capture/recorder.js";
 import { AnthropicAdapter } from "../src/capture/anthropic.js";
 import { GeminiAdapter } from "../src/capture/gemini.js";
 import { countTokens } from "../src/tokenize.js";
+import { imageRawBlock } from "../src/images.js";
 import type { Adapter } from "../src/capture/base.js";
 
 // vitest runs with cwd = the js/ package dir; the repo root is one level up.
@@ -418,6 +419,155 @@ for text in json.loads(sys.argv[1]):
       // `js.toEqual(py)` would also be satisfied by both SDKs estimating
       // everything — the vacuous-agreement failure mode.
       expect(js.map(([, method]) => method)).toEqual(probes.map(() => "tiktoken"));
+    },
+  );
+});
+
+
+/**
+ * Cross-language IMAGE conformance — the fourth and newest byte-for-byte
+ * promise, and the one with the most moving parts behind it.
+ *
+ * An image block is not simply hashed and counted like a text block. Four
+ * derived values have to match across the two SDKs, and each is computed by
+ * independent code in each language:
+ *
+ *   1. the DESCRIPTOR text (`[image 1024×768 · ~765 tok]`), including its
+ *      thousands rounding, which uses `floor(n/100 + 0.5)` on both sides
+ *      precisely because Python rounds half-to-even and JS rounds half-up;
+ *   2. the HASH INPUT — a sha256 over the decoded image bytes, which means the
+ *      two base64 decoders must agree on padding, whitespace and the URL-safe
+ *      alphabet before either hash is taken;
+ *   3. the TOKEN ESTIMATE, from three different published provider formulas
+ *      re-implemented in each language with integer-only arithmetic;
+ *   4. the TOKEN METHOD, which must be `estimate` on both sides — the honesty
+ *      claim, and the one a vacuous agreement could hide.
+ *
+ * The battery deliberately spans every provider shape, all four sniffable
+ * formats, both degradations (unknown format, remote URL) and every `detail`
+ * value, so a divergence in any single branch of any of the four surfaces
+ * fails here rather than in a user's trace.
+ */
+describe("cross-language conformance (image blocks agree byte for byte)", () => {
+  const hasVenv = existsSync(venvPython);
+
+  it.skipIf(!hasVenv)(
+    "Python and JS produce identical descriptor, hash input, estimate and method",
+    () => {
+      // The bytes are built ONCE, here, and shipped to Python as base64 inside
+      // the probe payload. Rebuilding them on each side would test two image
+      // generators rather than two image readers.
+      const b64 = (bytes: number[]) => Buffer.from(bytes).toString("base64");
+      const pngBytes = (w: number, h: number) => {
+        // Signature + IHDR only: the sniffer reads nothing past offset 24, and a
+        // header is all that is needed to exercise it.
+        const be32 = (n: number) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+        return [
+          0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+          0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
+          ...be32(w), ...be32(h), 8, 2, 0, 0, 0,
+        ];
+      };
+      const gifBytes = (w: number, h: number) => [
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+        w & 255, (w >>> 8) & 255, h & 255, (h >>> 8) & 255,
+        0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0x3b,
+      ];
+      const png = b64(pngBytes(1024, 768));
+      const wide = b64(pngBytes(2000, 1200));
+      const gif = b64(gifBytes(640, 480));
+      const bmp = b64([0x42, 0x4d, ...new Array(60).fill(0)]);
+      // A structurally valid IHDR declaring 18 exapixels — the truncated /
+      // fuzzed / hostile header both SDKs must refuse to believe, in step.
+      const monster = b64(pngBytes(0xffffffff, 0xffffffff));
+
+      // [provider, part] pairs. Every provider shape, every degradation.
+      const probes: [string, unknown][] = [
+        ["openai", { type: "image_url", image_url: { url: `data:image/png;base64,${png}`, detail: "high" } }],
+        ["openai", { type: "image_url", image_url: { url: `data:image/png;base64,${png}`, detail: "low" } }],
+        ["openai", { type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }],
+        ["openai", { type: "image_url", image_url: { url: `data:image/png;base64,${wide}`, detail: "auto" } }],
+        ["openai", { type: "image_url", image_url: `data:image/png;base64,${png}` }],
+        ["openai", { type: "image_url", image_url: { url: "https://cdn.example.com/a.png" } }],
+        ["openai", { type: "image_url", image_url: { url: "https://cdn.example.com/a.png", detail: "low" } }],
+        ["openai", { type: "input_image", image_url: `data:image/png;base64,${png}`, detail: "high" }],
+        ["openai", { type: "input_image", file_id: "file-3d9a17c04be84e2fb0c5" }],
+        ["openai", { type: "image_url", image_url: { url: `data:image/bmp;base64,${bmp}` } }],
+        ["anthropic", { type: "image", source: { type: "base64", media_type: "image/png", data: png } }],
+        ["anthropic", { type: "image", source: { type: "base64", media_type: "image/png", data: png.replace(/=+$/, "") } }],
+        ["anthropic", { type: "image", source: { type: "url", url: "https://cdn.example.com/a.png" } }],
+        ["anthropic", { type: "image", source: { type: "file", file_id: "file_011CQrsTuVwXyZ" } }],
+        ["gemini", { inline_data: { mime_type: "image/gif", data: gif } }],
+        ["gemini", { inlineData: { mimeType: "image/gif", data: gif } }],
+        ["gemini", { inline_data: { mime_type: "audio/wav", data: gif } }],
+        ["gemini", { file_data: { mime_type: "image/jpeg", file_uri: "https://gen.googleapis.com/v1/files/7k2m" } }],
+        ["bedrock", { image: { format: "png", source: { bytes: png } } }],
+        ["bedrock", { image: { format: "png", source: { s3Location: { uri: "s3://shots/frame-1.png" } } } }],
+        ["some-oss-gateway", { type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }],
+        // The cost-affecting envelope: a cache breakpoint riding as a sibling of
+        // the payload, and an unrecognized sibling key. Both must fold into the
+        // hash input identically in the two languages — the stable-JSON of the
+        // part's remainder is the only place the two serializers could disagree.
+        ["anthropic", { type: "image", source: { type: "base64", media_type: "image/png", data: png }, cache_control: { type: "ephemeral" } }],
+        ["openai", { type: "image_url", image_url: { url: `data:image/png;base64,${png}` }, x_provider_hint: "grounding" }],
+        // An implausible header: both SDKs must clamp it to "unknown" rather than
+        // one of them reporting 8,068,951,256,159,688 tokens.
+        ["gemini", { type: "image_url", image_url: { url: `data:image/png;base64,${monster}` } }],
+      ];
+
+      // The JS half. `null` marks a part this SDK does NOT treat as an image —
+      // that decision is part of the contract too (the audio probe above must be
+      // null on both sides, or one SDK would silently rewrite an audio blob).
+      const js = probes.map(([provider, part]) => {
+        const rb = imageRawBlock("user", part, provider);
+        return rb === null ? null : [rb.text, rb.hashInput, rb.tokenCount, rb.tokenMethod];
+      });
+
+      // The Python half, spawned against the venv SDK. The battery is handed
+      // over as a JSON argument rather than interpolated into source, so nothing
+      // in a probe can change the program being run.
+      const pyScript = `
+import json, sys
+from ctxdiff.images import image_raw_block
+out = []
+for provider, part in json.loads(sys.argv[1]):
+    rb = image_raw_block("user", part, provider)
+    out.append(None if rb is None else [rb.text, rb.hash_input, rb.token_count, rb.token_method])
+print(json.dumps(out))
+`;
+      const proc = spawnSync(venvPython, ["-c", pyScript, JSON.stringify(probes)], {
+        encoding: "utf8",
+        env: { ...process.env, PYTHONPATH: pySrc },
+      });
+      expect(
+        proc.status,
+        `python image extraction failed (status ${proc.status}):\n${proc.stderr}`,
+      ).toBe(0);
+      const py = JSON.parse(proc.stdout) as (unknown[] | null)[];
+
+      // Compared as one array so a failure names every disagreeing probe at once
+      // instead of stopping at the first.
+      expect(js).toEqual(py);
+
+      // ...and the agreement is not vacuous. Every image probe must actually
+      // have produced an image block marked as an estimate, and the ones with
+      // sniffable bytes must carry a real size and a non-zero cost — otherwise
+      // "both SDKs returned null for everything" would pass the check above.
+      const images = js.filter((r): r is unknown[] => r !== null);
+      expect(images).toHaveLength(probes.length - 1); // all but the audio probe
+      expect(images.every((r) => r[3] === "estimate")).toBe(true);
+      expect(images.filter((r) => String(r[0]).includes("×")).length).toBeGreaterThanOrEqual(10);
+      expect(js[0]).toEqual(["[image 1024×768 · ~765 tok]", js[0]![1], 765, "estimate"]);
+
+      // The envelope probes are not vacuous either: the SAME bytes at two detail
+      // levels, with a cache breakpoint, and with an unknown sibling must be
+      // FOUR distinct hash inputs — agreeing across the languages that they
+      // differ is the whole point of shipping them through this battery.
+      const hashOf = (i: number) => String(js[i]![1]);
+      const last = probes.length - 1; // the three envelope probes are last, in order
+      expect(new Set([hashOf(0), hashOf(1), hashOf(last - 2), hashOf(last - 1)]).size).toBe(4);
+      // …while the clamped monster header degrades to a bare, costless image.
+      expect(js[last]).toEqual(["[image]", js[last]![1], 0, "estimate"]);
     },
   );
 });

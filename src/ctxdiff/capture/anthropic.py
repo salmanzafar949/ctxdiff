@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 
+from ctxdiff.images import image_raw_block
 from ctxdiff.models import RawBlock
 
 _CONTENT_KEYS = {"system", "messages", "tools"}
@@ -48,6 +49,15 @@ class AnthropicAdapter:
             content = msg.get("content")
             if isinstance(content, list):
                 for part in content:
+                    # An `{"type": "image", "source": {...}}` part becomes an
+                    # 'image' block whose text is a short descriptor and whose
+                    # identity is the image bytes — never the base64 source.
+                    # Covers all three source shapes (base64, url, file id);
+                    # see ctxdiff.images.
+                    image = image_raw_block(role, part, self.provider)
+                    if image is not None:
+                        blocks.append(image)
+                        continue
                     blocks.append(RawBlock(
                         role=role, kind="content_part",
                         text=part if isinstance(part, str)

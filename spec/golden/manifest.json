@@ -28,7 +28,8 @@
     {"id": "code-and-schemas", "corpus": "corpus/code-and-schemas.json", "ctrace": "code-and-schemas.ctrace"},
     {"id": "multiagent-project", "corpus": "corpus/multiagent-project.json", "ctrace": "multiagent-project.ctrace"},
     {"id": "multipart-content", "corpus": "corpus/multipart-content.json", "ctrace": "multipart-content.ctrace"},
-    {"id": "round-numbers", "corpus": "corpus/round-numbers.json", "ctrace": "round-numbers.ctrace"}
+    {"id": "round-numbers", "corpus": "corpus/round-numbers.json", "ctrace": "round-numbers.ctrace"},
+    {"id": "image-blocks", "corpus": "corpus/image-blocks.json", "ctrace": "image-blocks.ctrace"}
   ],
   "fixtures_order_note": "`special-tokens` is FIRST on purpose. Both harnesses build the fixtures in this order inside ONE process, so every other fixture is tokenized after a block containing a literal `<|endoftext|>`. That makes the 'no silent estimate fallback' assertion (tests/test_golden.py::test_fixtures_really_run_the_exact_tokenizer and its JS twin) a live regression test for the process-wide latch this corpus once had to route around: if a per-text tokenizer refusal ever leaks back into the encoder, every fixture below turns into estimates and the suite fails immediately. Nothing else depends on the order — each fixture is an independent file with its own cases.",
 
@@ -72,6 +73,14 @@
     {"name": "multipart-content.cache", "fixture": "multipart-content", "argv": ["cache", "--project", "{trace}"]},
     {"name": "multipart-content.sessions", "fixture": "multipart-content", "argv": ["sessions", "--project", "{trace}"]},
     {"name": "multipart-content.agents", "fixture": "multipart-content", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens", "fixture": "image-blocks", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens.turn1", "fixture": "image-blocks", "argv": ["tokens", "--turn", "1", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens.agent-reviewer", "fixture": "image-blocks", "argv": ["tokens", "--agent", "reviewer", "--project", "{trace}"]},
+    {"name": "image-blocks.diff.1-2", "fixture": "image-blocks", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "image-blocks.diff.2-3", "fixture": "image-blocks", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "image-blocks.diff.5-6", "fixture": "image-blocks", "argv": ["diff", "--turn", "5", "--turn", "6", "--project", "{trace}"]},
+    {"name": "image-blocks.cache", "fixture": "image-blocks", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "image-blocks.agents", "fixture": "image-blocks", "argv": ["agents", "--project", "{trace}"]},
 
     {"name": "round-numbers.tokens", "fixture": "round-numbers", "argv": ["tokens", "--project", "{trace}"]},
     {"name": "round-numbers.tokens.turn1", "fixture": "round-numbers", "argv": ["tokens", "--turn", "1", "--project", "{trace}"]},
@@ -88,6 +97,7 @@
     {"name": "code-and-schemas", "fixture": "code-and-schemas"},
     {"name": "multiagent-project", "fixture": "multiagent-project"},
     {"name": "multipart-content", "fixture": "multipart-content"},
-    {"name": "round-numbers", "fixture": "round-numbers"}
+    {"name": "round-numbers", "fixture": "round-numbers"},
+    {"name": "image-blocks", "fixture": "image-blocks"}
   ]
 }

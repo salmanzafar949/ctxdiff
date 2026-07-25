@@ -1,13 +1,13 @@
 run total · in 2,640 tok · out 225 tok (2/2 calls reported usage)
 
-turn 1 · 371 tokens [inspector]
-  ████████████████████████████   user              350 tok   94.3%
-  ██                             system             21 tok    5.7%
-  provider reports 1,180 prompt tokens · Δ +809
+turn 1 · 404 tokens (~approx) [inspector]
+  ████████████████████████████   user              383 tok   94.8%
+  ██                             system             21 tok    5.2%
+  provider reports 1,180 prompt tokens · Δ +776
 
-turn 2 · 468 tokens [inspector]
-  ████████████████████████       user              368 tok   78.6%
-  ███                            history            43 tok    9.2%
-  ██                             tool_output        36 tok    7.7%
-  █                              system             21 tok    4.5%
-  provider reports 1,460 prompt tokens · Δ +992
+turn 2 · 503 tokens (~approx) [inspector]
+  ████████████████████████       user              403 tok   80.1%
+  ███                            history            43 tok    8.5%
+  ██                             tool_output        36 tok    7.2%
+  █                              system             21 tok    4.2%
+  provider reports 1,460 prompt tokens · Δ +957

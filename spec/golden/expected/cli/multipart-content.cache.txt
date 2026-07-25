@@ -1,7 +1,1 @@
-⚠ warning: [agent:inspector] [user·modified] breaks the prefix on every turn (1/1 pairs)
-  '{"image_url": {"detail": "high", "url": "data:image/png;base64,iVBORw0KGgoAAAANS…'
-  modified user block — first difference at char 304: 'LCws' → ''
-
-stable prefix (min): 51 tokens
-re-billed: 417 tokens
-417 tokens re-billed across 1 turn that a stable prefix would have served from cache (cached input is typically billed at a fraction of the full input price — check your provider's current rates)
+✓ prefix stable across all 1 turn pairs — minimum stable prefix 404 tokens

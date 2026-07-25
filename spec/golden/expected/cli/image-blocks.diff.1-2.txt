@@ -1,0 +1,7 @@
+── turn 1 → turn 2 · 5 blocks changed · +2125 −85 tokens ──
+~ [user·user] [image{+ 2000×1200 · ~1.1k tok+}]
+~ [user·user] [image[- · ~85 tok-]]
++ [user·user] '[image]'  +0 tok
++ [user·user] '[image 300×200 · ~255 tok]'  +255 tok
++ [user·user] '[image 1024×768 · ~765 tok]'  +765 tok
+= 3 unchanged blocks · 811 tok

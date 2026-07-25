@@ -77,6 +77,36 @@ def load_corpus(manifest: dict, fixture_id: str) -> dict:
 # --- building a fixture -------------------------------------------------------
 
 
+def raw_block(role: str, kind: str, text: object, provider: str):
+    """Turn one corpus block entry into the `RawBlock` an adapter would have
+    produced for it.
+
+    A corpus block is normally the triple `[role, kind, text]` with `text` a
+    literal string, which becomes a plain RawBlock — unchanged from before.
+
+    The one exception is an IMAGE block, written as `[role, "image", {…the
+    provider content part…}]` with an OBJECT in the text slot. A scenario file
+    cannot hard-code an image block's text/hash/token count the way it can for
+    prose: the descriptor, the byte digest and the vision estimate are all
+    DERIVED, and hard-coding them would freeze a copy of the very logic the
+    golden exists to check. So the fixture carries the real provider payload —
+    an OpenAI `image_url`, an Anthropic `source`, a Gemini `inline_data` — and
+    the SDK's own `image_raw_block` derives the block from it, exactly as it
+    does during live capture. The corpus stays language-neutral (it is still
+    just JSON) and the JS harness does the same thing with its own twin."""
+    from ctxdiff.images import image_raw_block
+    from ctxdiff.models import RawBlock
+
+    if kind == "image" and not isinstance(text, str):
+        raw = image_raw_block(role, text, provider)
+        if raw is None:
+            raise ValueError(
+                f"corpus block declared kind 'image' but {text!r} is not a "
+                f"recognized image part for provider {provider!r}")
+        return raw
+    return RawBlock(role=role, kind=kind, text=text)
+
+
 def build_ctrace(manifest: dict, fixture_id: str, out_dir: str) -> str:
     """Materialize one corpus fixture into a real `.ctrace` under `out_dir` and
     return its path.
@@ -94,9 +124,9 @@ def build_ctrace(manifest: dict, fixture_id: str, out_dir: str) -> str:
     # Imported here rather than at module import so this file can be read (and
     # `load_manifest` used) without the ctxdiff package on sys.path — the
     # regeneration script arranges that itself.
-    from ctxdiff.models import basic_label, content_hash
+    from ctxdiff.capture.recorder import build_block
+    from ctxdiff.models import basic_label
     from ctxdiff.store.schema import DDL, SCHEMA_VERSION
-    from ctxdiff.tokenize.counter import count_tokens
 
     entry = next(f for f in manifest["fixtures"] if f["id"] == fixture_id)
     corpus = load_corpus(manifest, fixture_id)
@@ -130,16 +160,19 @@ def build_ctrace(manifest: dict, fixture_id: str, out_dir: str) -> str:
                     tagged = [tuple(t) for t in call.get("tags") or []]
                     provider = call.get("provider") or session["provider"]
                     for position, (role, kind, text) in enumerate(call["blocks"]):
-                        token_count, token_method = count_tokens(text, provider)
-                        chash = content_hash(role, kind, text)
-                        label, label_source = basic_label(role, kind, text, tagged)
+                        raw = raw_block(role, kind, text, provider)
+                        block = build_block(raw, provider)
+                        label, label_source = basic_label(
+                            raw.role, raw.kind, raw.text, tagged)
                         conn.execute(
                             "INSERT OR IGNORE INTO block VALUES (?,?,?,?,?,?)",
-                            (chash, role, kind, text, token_count, token_method),
+                            (block.content_hash, block.role, block.kind, block.text,
+                             block.token_count, block.token_method),
                         )
                         conn.execute(
                             "INSERT INTO call_block VALUES (?,?,?,?,?)",
-                            (call["call_id"], chash, position, label, label_source),
+                            (call["call_id"], block.content_hash, position,
+                             label, label_source),
                         )
     finally:
         conn.close()

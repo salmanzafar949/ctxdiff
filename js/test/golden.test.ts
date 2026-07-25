@@ -95,15 +95,29 @@ describe("golden corpus — the tokenizer pin is what the environment actually h
     // `countTokens` started falling back to the character heuristic for every
     // block, the goldens would still be internally consistent and every
     // comparison would still pass — while measuring nothing about the
-    // tokenizer. Every openai-provider block must be counted by the real one.
+    // tokenizer. Every openai-provider TEXT block must be counted by the real
+    // one.
+    //
+    // Image blocks are the one deliberate exception, checked in the opposite
+    // direction: their cost comes from the provider's published vision formula
+    // applied to the pixel dimensions, never from the tokenizer, so they must
+    // ALWAYS read "estimate". An image block that came back "tiktoken" would
+    // mean the base64 payload had leaked into the block text again — the exact
+    // regression this suite now pins.
     let exact = 0;
+    let images = 0;
     for (const path of Object.values(traces)) {
       const ct = CTrace.open(path);
       try {
         for (const session of ct.listSessions()) {
           for (const call of ct.getCalls(session.id)) {
             for (const cb of ct.getCallBlocks(call.id)) {
-              if ((call.provider ?? session.provider) === "openai") {
+              if ((call.provider ?? session.provider) !== "openai") continue;
+              if (cb.block.kind === "image") {
+                expect(cb.block.tokenMethod).toBe("estimate");
+                expect(cb.block.text.startsWith("[image")).toBe(true);
+                images += 1;
+              } else {
                 expect(cb.block.tokenMethod).toBe("tiktoken");
                 exact += 1;
               }
@@ -115,6 +129,9 @@ describe("golden corpus — the tokenizer pin is what the environment actually h
       }
     }
     expect(exact).toBeGreaterThan(50);
+    // …and the image half of the corpus is genuinely on the compared surface,
+    // so this cannot be satisfied by there being no images at all.
+    expect(images).toBeGreaterThan(5);
   });
 });
 

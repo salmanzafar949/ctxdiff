@@ -571,7 +571,7 @@ tracer.wrap(some_unknown_client)
 
 ### The block model
 
-The smallest independently-diffable unit of context is a **block**: one message, one content part, or one tool schema. Each block's identity is `sha256(role + kind + text)`, so a stable system prompt reused across 40 turns is stored **once** and referenced 40 times. Diffing two turns then reduces to comparing two ordered lists of hashes.
+The smallest independently-diffable unit of context is a **block**: one message, one content part, one tool schema, or one image. Each block's identity is `sha256(role + kind + text)`, so a stable system prompt reused across 40 turns is stored **once** and referenced 40 times. Diffing two turns then reduces to comparing two ordered lists of hashes. (An image block is the one case where the hashed value is not the stored text — see [Images and multimodal content](#images-and-multimodal-content).)
 
 ---
 
@@ -762,12 +762,28 @@ except RateLimitError:
     ...   # you still get YOUR error — and the failed call is recorded with error set
 ```
 
+### Images and multimodal content
+
+An image never reaches the store as its bytes. A vision content part — an OpenAI `image_url` or `input_image`, an Anthropic `{"type": "image", "source": …}`, a Gemini `inline_data`/`file_data`, a Bedrock Converse `image` — becomes a block with `kind="image"` that looks like this:
+
+```
+[image 1024×768 · ~765 tok]
+```
+
+- **The base64 is not stored and not tokenized.** Before this, a `data:image/png;base64,…` part was JSON-serialized into the block text, so a 100 KB screenshot bloated the `.ctrace` *and* was counted by `tiktoken` as prose — tens of thousands of phantom tokens for an image that really costs a few hundred. Token attribution was wrong for exactly the vision and computer-use agents that most need it.
+- **Identity is the pixels, plus what changes their cost.** The block's hash is taken over a sha256 of the image bytes, so the same screenshot re-sent on every turn is **one** block referenced many times — `diff` reports it unchanged, the cache profiler sees a stable prefix, and two *different* images that happen to share a size are still two blocks. The bytes are not the whole request, so the hash also covers OpenAI's `detail` (the same screenshot at `low` and at `high` costs 85 vs 765 tokens, and is two blocks) and anything else the content part carried — notably Anthropic's `cache_control`, so moving a cache breakpoint onto an image is a change the cache profiler reports rather than a silent one.
+- **The count is the provider's own published vision formula** applied to dimensions read from the image header — OpenAI's 512px tiling (85 + 170/tile, or a flat 85 at `detail: "low"`), Anthropic's `w×h/750`, Gemini's 258-per-tile. It is always marked `token_method="estimate"`, so a turn containing an image is reported as approximate. A vision estimate is never presented as an exact tiktoken count.
+- **Nothing is ever fetched.** A remote `https://` image URL or a provider-side file id is recorded as a reference and degrades to `[image]` with no estimate, rather than ctxdiff reaching out to measure it. Same for an unrecognized format. ctxdiff stays local-first, and a trace's numbers never depend on whether the host was online.
+
+Dimensions come from a header sniffer covering PNG, JPEG, GIF and WebP — no image library is a dependency. Non-image multimodal parts (audio, video, PDFs, opaque file ids) are untouched and keep their previous representation. The full contract, including the per-provider shapes and the exact formulas, is in **[spec/ctrace-schema.md](spec/ctrace-schema.md#image-blocks)**.
+
 ### Token counting
 
 Every block records a `token_count` and an honest `token_method`:
 
 - **OpenAI-family** → exact counts via `tiktoken` (`token_method="tiktoken"`).
 - **Anthropic, Gemini, Bedrock** → a documented estimate, since none publishes a local tokenizer (`token_method="estimate"`).
+- **Images** → the provider's published vision-token formula applied to the image's real dimensions, always `token_method="estimate"` (see [Images and multimodal content](#images-and-multimodal-content)).
 
 Estimates are always labeled as such — never presented as exact. If `tiktoken` is unavailable for any reason, counting degrades to an estimate rather than dropping the capture, and never reaches the network at record time.
 
@@ -917,9 +933,10 @@ One run = one SQLite file. The schema is small and stable, versioned by `schema_
 | `block` | one per **distinct** context unit | `content_hash` (PK), `role`, `kind`, `text`, `token_count`, `token_method` |
 | `call_block` | membership of a block in a call | `call_id`, `block_id`, `position`, `label`, `label_source` |
 
+**Block kinds:** `message` · `content_part` · `tool_schema` · `image`
 **Block labels:** `system` · `user` · `history` · `rag` · `tool_schema` · `tool_output`
 **Label source:** `heuristic` (auto) · `tagged` (via `tracer.tag`)
-**Token method:** `tiktoken` (exact) · `estimate`
+**Token method:** `tiktoken` (exact) · `estimate` (heuristic, or a vision estimate for an `image` block)
 
 Because blocks are content-addressed and stored once, a long run with a stable prefix stays compact, and future diffing is a hash comparison.
 

@@ -201,14 +201,17 @@ def test_extract_blocks_responses_input_list_message_item_content_parts():
     kwargs = {"model": "gpt-4o", "input": [
         {"role": "user", "content": [
             {"type": "input_text", "text": "look at this"},
-            {"type": "input_image", "image_url": "http://x"},
+            {"type": "input_file", "file_id": "file-1"},
         ]},
     ]}
     blocks = OpenAIAdapter().extract_blocks(kwargs)
     assert len(blocks) == 2
     assert blocks[0].kind == "content_part" and blocks[0].role == "user"
     assert blocks[0].text == "look at this"
-    assert "input_image" in blocks[1].text
+    # A non-image, non-text part keeps the stable-JSON fallback. `input_image`
+    # is the one part type that leaves this path — it becomes an 'image' block
+    # instead; see tests/test_images.py.
+    assert "input_file" in blocks[1].text
 
 
 def test_extract_blocks_responses_function_call_and_output_items():

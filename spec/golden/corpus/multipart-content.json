@@ -1,7 +1,7 @@
 {
   "id": "multipart-content",
   "title": "Multi-part content: images, audio, tool calls and tool results",
-  "why": "A vision/multimodal request reaches the store as `content_part` blocks whose text is the part's STABLE JSON (sorted keys, `ensure_ascii=False`) — see `OpenAIAdapter._extract_chat_blocks`. That makes a base64 data URI, a long opaque file id and a nested tool-call argument string part of the tokenized surface, and long base64 runs are precisely where a merge-table revision moves counts. The fixture also carries `</script>` and a lone `</` inside block text, which the HTML exporter must escape — so the HTML hash covers the escaping path too.",
+  "why": "A vision/multimodal request reaching the store. The IMAGE part is now an `image` block \u2014 text `[image 64\u00d764 \u00b7 ~255 tok]`, identity the sha256 of the decoded PNG, cost OpenAI's published tiling formula \u2014 so the base64 data URI is neither stored nor tokenized. This fixture previously froze the opposite: the blob was JSON-serialized into the block text and counted as 220 prose tokens by tiktoken. The same bytes are sent on both turns, so the diff must report the image as UNCHANGED \u2014 one block, referenced twice. Everything AROUND it still exercises the stable-JSON `content_part` path that images left: an audio part, a long opaque file id, a nested tool-call argument string and a `function_call_output`. The fixture also carries `</script>` and a lone `</` inside block text, which the HTML exporter must escape \u2014 so the HTML hash covers the escaping path too.",
   "sessions": [
     {
       "run_id": "a1000000000000000000000000000001",
@@ -24,7 +24,7 @@
           "blocks": [
             ["system", "message", "You describe screenshots for accessibility. Report only what is visibly rendered; never guess at markup you cannot see."],
             ["user", "content_part", "{\"text\": \"What does this dashboard screenshot show? Read the <script> tag label literally if one is visible.\", \"type\": \"text\"}"],
-            ["user", "content_part", "{\"image_url\": {\"detail\": \"high\", \"url\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsFCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR\"}, \"type\": \"image_url\"}"],
+            ["user", "image", {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsFCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR", "detail": "high"}}],
             ["user", "content_part", "{\"input_audio\": {\"data\": \"UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=\", \"format\": \"wav\"}, \"type\": \"input_audio\"}"],
             ["user", "content_part", "{\"file\": {\"file_id\": \"file-9f2b7c1d4e8a5063bb127e4f90ac3d5182\"}, \"type\": \"file\"}"]
           ]
@@ -43,7 +43,7 @@
           "blocks": [
             ["system", "message", "You describe screenshots for accessibility. Report only what is visibly rendered; never guess at markup you cannot see."],
             ["user", "content_part", "{\"text\": \"What does this dashboard screenshot show? Read the <script> tag label literally if one is visible.\", \"type\": \"text\"}"],
-            ["user", "content_part", "{\"image_url\": {\"detail\": \"high\", \"url\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsFCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR\"}, \"type\": \"image_url\"}"],
+            ["user", "image", {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsFCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR", "detail": "high"}}],
             ["user", "content_part", "{\"input_audio\": {\"data\": \"UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=\", \"format\": \"wav\"}, \"type\": \"input_audio\"}"],
             ["user", "content_part", "{\"file\": {\"file_id\": \"file-9f2b7c1d4e8a5063bb127e4f90ac3d5182\"}, \"type\": \"file\"}"],
             ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"selector\\\": \\\"</script> </ script>\\\", \\\"strict\\\": true}\", \"name\": \"read_dom\"}, \"id\": \"call_v1\", \"type\": \"function\"}"],

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+from ctxdiff.images import image_raw_block
 from ctxdiff.models import RawBlock
 
 # Request keys that carry block *content* rather than sampling params; excluded
@@ -96,6 +97,16 @@ class GeminiAdapter:
                 role = entry.get("role") if isinstance(entry, dict) else None
                 role = _ROLE_MAP.get(role, role or "user")
                 for part in (entry.get("parts") or []) if isinstance(entry, dict) else []:
+                    # An `inline_data`/`file_data` part carrying an image MIME
+                    # type becomes an 'image' block whose text is a short
+                    # descriptor and whose identity is the image bytes — never
+                    # the base64 payload. Non-image inline data (audio, video,
+                    # PDF) is untouched and still serializes as before; see
+                    # ctxdiff.images.
+                    image = image_raw_block(role, part, self.provider)
+                    if image is not None:
+                        blocks.append(image)
+                        continue
                     if isinstance(part, str):
                         text = part
                     elif isinstance(part, dict) and "text" in part:

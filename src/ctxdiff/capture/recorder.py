@@ -11,11 +11,44 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ctxdiff.capture.base import Adapter
-from ctxdiff.models import Block, CallBlock, basic_label, content_hash
+from ctxdiff.models import Block, CallBlock, RawBlock, basic_label, content_hash
 from ctxdiff.store.base import Store
 from ctxdiff.tokenize.counter import count_tokens
 
 _log = logging.getLogger("ctxdiff")
+
+
+def build_block(raw: RawBlock, provider: str) -> Block:
+    """Turn one adapter-extracted `RawBlock` into the stored, content-addressed
+    `Block`: give it its identity and its token numbers.
+
+    Two overrides, both defaulting to the original behavior (see `RawBlock`):
+
+      * IDENTITY is `content_hash(role, kind, hash_input or text)`. For an
+        ordinary block that is the text itself — unchanged, so every hash this
+        SDK has ever written stays valid. For an image block it is a digest of
+        the image BYTES, so two copies of the same picture are one block and a
+        1024×768 red square and a 1024×768 blue one are not.
+      * TOKENS come from the tokenizer over `text`, unless the adapter already
+        computed them — which it does only for images, where the truthful cost
+        is the provider's vision formula over the pixel dimensions and NOT the
+        tokenization of the `[image …]` descriptor standing in for them.
+
+    Factored out of `Recorder.build` so there is exactly ONE definition of what
+    a stored block is: the golden harness (`spec/golden/harness.py`) calls this
+    same function to materialize its fixtures, which is what lets the committed
+    goldens be evidence about the real capture path rather than about a
+    parallel reimplementation of it."""
+    if raw.token_count is not None:
+        token_count, token_method = raw.token_count, raw.token_method or "estimate"
+    else:
+        token_count, token_method = count_tokens(raw.text, provider)
+    hash_input = raw.hash_input if raw.hash_input is not None else raw.text
+    return Block(
+        content_hash=content_hash(raw.role, raw.kind, hash_input),
+        role=raw.role, kind=raw.kind, text=raw.text,
+        token_count=token_count, token_method=token_method,
+    )
 
 
 @dataclass(frozen=True)
@@ -107,14 +140,11 @@ class Recorder:
 
             call_blocks: list[CallBlock] = []
             for position, rb in enumerate(raw):
-                # Count tokens for this text under the provider, then build the
-                # content-addressed Block.
-                token_count, token_method = count_tokens(rb.text, provider)
-                block = Block(
-                    content_hash=content_hash(rb.role, rb.kind, rb.text),
-                    role=rb.role, kind=rb.kind, text=rb.text,
-                    token_count=token_count, token_method=token_method,
-                )
+                # Count tokens and take the content hash for this block — see
+                # `build_block` for the two adapter-supplied overrides (an
+                # image hashes its bytes and carries a pre-computed vision
+                # estimate; everything else hashes and tokenizes its text).
+                block = build_block(rb, provider)
                 # Redact after hashing/counting but before storage. The hash is
                 # kept from the original text so identity/dedup is stable even if
                 # redaction is nondeterministic; only the stored text changes.

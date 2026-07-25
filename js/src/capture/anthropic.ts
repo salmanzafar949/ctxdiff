@@ -13,6 +13,7 @@
 import type { Adapter } from "./base.js";
 import type { RawBlock } from "../models.js";
 import { stableStringify } from "../models.js";
+import { imageRawBlock } from "../images.js";
 
 // Request keys that carry block *content* rather than sampling params.
 const CONTENT_KEYS = new Set(["system", "messages", "tools"]);
@@ -82,6 +83,15 @@ export class AnthropicAdapter implements Adapter {
         const content = msg["content"];
         if (Array.isArray(content)) {
           for (const part of content) {
+            // An `{type: "image", source: {...}}` part becomes an 'image' block
+            // whose text is a short descriptor and whose identity is the image
+            // bytes — never the base64 source. Covers all three source shapes
+            // (base64, url, file id); see src/images.ts.
+            const image = imageRawBlock(role, part, this.provider);
+            if (image !== null) {
+              blocks.push(image);
+              continue;
+            }
             blocks.push({
               role,
               kind: "content_part",

@@ -120,6 +120,45 @@ def test_evicted_early_block_reports_evicted_kind_no_dynamic_hint(tmp_path):
     assert report.fix_hint is None
 
 
+# --- an image break: digests, not a character offset ----------------------------
+
+
+def _image_cb(digest, position, text="[image 1024×768 · ~765 tok]"):
+    """An image CallBlock whose content_hash is `digest` and whose text is the
+    descriptor — the shape the store really holds: two DIFFERENT screenshots of
+    the same size render the identical text and differ only in their hash."""
+    block = Block(content_hash=digest, role="user", kind="image", text=text,
+                  token_count=765, token_method="estimate")
+    return CallBlock(block=block, position=position, label="user", label_source="heuristic")
+
+
+def test_an_image_break_reports_the_differing_digests_not_a_char_offset(tmp_path):
+    """An image block's text is a DESCRIPTOR, not its content, so two different
+    screenshots of the same size produce an empty inline text diff. Explaining
+    the break by character offset therefore told the user their prefix breaks
+    every turn and then showed them nothing: `first difference at char 7: '' →
+    ''`. For an image the honest explanation is which image it is — the two
+    block digests."""
+    path = str(tmp_path / "run.ctrace")
+    ct = CTrace.create(path, project="demo", provider="openai", model="gpt-4o")
+
+    _record(ct, 1, [SYSTEM, _image_cb("4dc2dfa1" + "0" * 56, 1)])
+    _record(ct, 2, [SYSTEM, _image_cb("5548ab97" + "0" * 56, 1)])
+
+    report = analyze_cache(ct)
+    ct.close()
+
+    assert len(report.breaks) == 1
+    b = report.breaks[0]
+    assert b.divergent_position == 1
+    assert b.culprit_kind == "modified"
+    assert "first difference at char" not in b.detail
+    assert "sha 4dc2df… → 5548ab…" in b.detail
+    # An image swap is never a "dynamic value in a system block" — the
+    # empty-inline-diff shape used to satisfy that heuristic vacuously.
+    assert report.fix_hint is None
+
+
 # --- reordered blocks (the reachable 'changed'-fallback shape) -------------------
 
 

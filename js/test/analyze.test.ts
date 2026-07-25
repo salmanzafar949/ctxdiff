@@ -146,6 +146,63 @@ describe("cache analyzer", () => {
     }
   });
 
+  it("explains an image break with the differing digests, not a char offset", () => {
+    // An image block's text is a DESCRIPTOR, not its content, so two different
+    // screenshots of the same size produce an empty inline text diff. Explaining
+    // the break by character offset therefore told the user their prefix breaks
+    // every turn and then showed them nothing: `first difference at char 7: '' →
+    // ''`. For an image the honest explanation is which image it is.
+    const path = join(dir, "image-break.ctrace");
+    const ct = CTrace.create(path, "demo", "openai", "gpt-4o", "2026-07-04T00:00:00Z");
+    const system = {
+      block: {
+        contentHash: "sys",
+        role: "system",
+        kind: "message",
+        text: "system prompt",
+        tokenCount: 13,
+        tokenMethod: "tiktoken",
+      },
+      position: 0,
+      label: "system",
+      labelSource: "heuristic",
+    };
+    const image = (digest: string) => ({
+      block: {
+        contentHash: digest,
+        role: "user",
+        kind: "image",
+        text: "[image 1024×768 · ~765 tok]",
+        tokenCount: 765,
+        tokenMethod: "estimate",
+      },
+      position: 1,
+      label: "user",
+      labelSource: "heuristic",
+    });
+    [image("4dc2dfa1" + "0".repeat(56)), image("5548ab97" + "0".repeat(56))].forEach((img, i) => {
+      ct.recordCall({
+        seq: i + 1,
+        params: { model: "gpt-4o" },
+        usage: null,
+        latencyMs: 10,
+        error: null,
+        callBlocks: [system, img],
+      });
+    });
+    ct.close();
+
+    const r = analyzeCache(CTrace.open(path));
+    expect(r.breaks).toHaveLength(1);
+    expect(r.breaks[0].divergentPosition).toBe(1);
+    expect(r.breaks[0].culpritKind).toBe("modified");
+    expect(r.breaks[0].detail).not.toMatch(/first difference at char/);
+    expect(r.breaks[0].detail).toContain("sha 4dc2df… → 5548ab…");
+    // An image swap is never a "dynamic value in a system block" — the
+    // empty-inline-diff shape used to satisfy that heuristic vacuously.
+    expect(r.fixHint).toBeNull();
+  });
+
   it("returns an explanatory note for a single-call run (no pairs)", () => {
     const p = join(dir, "single.ctrace");
     const ct = CTrace.create(p, "one", "openai", "", "2026-07-04T00:00:00Z");
