@@ -40,7 +40,6 @@ import logging
 import queue
 import threading
 import time
-import types
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -48,7 +47,7 @@ from ctxdiff.capture.anthropic import AnthropicAdapter
 from ctxdiff.capture.bedrock import BedrockAdapter
 from ctxdiff.capture.gemini import GeminiAdapter
 from ctxdiff.capture.openai import OpenAIAdapter
-from ctxdiff.capture.recorder import Recorder
+from ctxdiff.capture.recorder import Recorder, SyntheticUsageResponse
 from ctxdiff.models import Block
 from ctxdiff.store import config as store_config
 from ctxdiff.store.base import Store, StoreBackend
@@ -661,6 +660,10 @@ class Tracer:
         # for backward compat: tests monkeypatch t._recorder.build to prove the
         # interceptor wiring is fail-open even when recording is broken)
         self._writer: _Writer | None = None     # single writer thread (lazy, per wrap)
+        # Recorders built per PROVIDER for capture paths that only learn the
+        # provider per call (the LangChain handler) — see `_recorder_for`.
+        self._recorders: dict[str, Recorder] = {}
+        self._recorders_lock = threading.Lock()
         # Guards the lazy store/writer creation in `_ensure_store`, so several
         # threads wrapping this tracer at once produce ONE session and ONE
         # writer rather than one of each per thread.
@@ -716,6 +719,80 @@ class Tracer:
         paths = getattr(adapter, "create_paths", None) or (adapter.create_path,)
         return _ClientProxy(client, (), self, paths,
                             recorder, agent, provider, adapter)
+
+    def langchain_handler(self, agent: str | None = None):
+        """Return a LangChain callback handler that records every chat-model
+        call made under it — the IDIOMATIC way to trace LangChain and
+        LangGraph:
+
+            handler = tracer.langchain_handler()
+            llm = ChatOpenAI(model="gpt-4o", callbacks=[handler])
+            # or per-invocation, which is what LangGraph propagates:
+            graph.invoke(state, config={"callbacks": [handler]})
+
+        WHY A HANDLER RATHER THAN `wrap()`. `tracer.wrap()` needs a provider
+        SDK client; a LangChain app hands you a `ChatOpenAI`, not an
+        `OpenAI`. The older answer was to inject a wrapped client into
+        LangChain's internals (`ChatOpenAI(client=wrapped.chat.completions,
+        root_client=wrapped)`) — which still works and is still tested, but
+        depends on LangChain's private structure and covers only the
+        providers whose SDK object you can reach. A callback is LangChain's
+        own extension point: it fires for EVERY integration (ChatOpenAI,
+        ChatAnthropic, ChatVertexAI, ChatBedrockConverse, ...), streaming or
+        not, and LangGraph propagates it through an entire graph, so one
+        handler covers a whole agent.
+
+        The blocks it records are IDENTICAL — same hashes — to what wrapping
+        that provider's SDK directly would have recorded for the same
+        request, because the handler rebuilds the provider's own wire shape
+        and feeds it to the very same adapter (see
+        `ctxdiff.capture.langchain`). So a LangChain trace and a direct trace
+        of the same prompt dedup against each other instead of looking like
+        two unrelated contexts.
+
+        `agent` names the agent these calls belong to, exactly as
+        `wrap(client, agent=...)` does — pass a different handler per agent
+        to attribute a multi-agent graph. Raises ImportError (with the
+        install line) if langchain-core isn't installed, since asking for a
+        LangChain handler without LangChain is a setup mistake worth failing
+        loudly on; everything AFTER construction is fail-open, like the rest
+        of capture."""
+        from ctxdiff.capture.langchain import build_handler
+        return build_handler(self, agent)
+
+    def _recorder_for(self, provider: str) -> Recorder | None:
+        """The Recorder for `provider`, created once per provider and cached
+        — the entry point used by capture paths that discover their provider
+        per CALL rather than per client (today: the LangChain handler, which
+        sees provider-agnostic messages and may serve ChatOpenAI and
+        ChatAnthropic from the same handler).
+
+        `wrap()` can build its recorder eagerly because a client has exactly
+        one provider; a handler cannot, so this does the same three steps
+        lazily: ensure the run's store/writer exist (idempotent — the first
+        provider to arrive still decides the session's `run.provider`, same
+        as the first `wrap()` does), build the provider's adapter, and wrap
+        both in a Recorder. Its own lock, not `_setup_lock`, because
+        `_ensure_store` takes that one.
+
+        Returns None for an unknown provider name rather than raising: this
+        is called from inside a callback on the host's own execution path,
+        where fail-open outranks fail-loud."""
+        adapter_cls = _ADAPTERS.get(provider)
+        if adapter_cls is None:
+            return None
+        with self._recorders_lock:
+            recorder = self._recorders.get(provider)
+            if recorder is not None:
+                return recorder
+            self._ensure_store(provider)
+            recorder = Recorder(self._ct, adapter_cls(), self._redact)
+            self._recorders[provider] = recorder
+            if self._recorder is None:
+                # Keep the first recorder reachable as t._recorder (see
+                # __init__), the same way `wrap()` does.
+                self._recorder = recorder
+            return recorder
 
     def _ensure_store(self, provider: str) -> None:
         """Create this run's store handle and writer thread, exactly ONCE,
@@ -1200,8 +1277,10 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
                                       recorder, agent, provider)
                     raise
                 if kwargs.get("stream") or is_named_stream_method:
-                    return _AsyncStreamProxy(response, kwargs, tracer, recorder,
-                                             agent, provider, adapter, start)
+                    return _wrap_stream_result(
+                        response, adapter,
+                        lambda s: _AsyncStreamProxy(s, kwargs, tracer, recorder,
+                                                    agent, provider, adapter, start))
                 latency_ms = int((time.perf_counter() - start) * 1000)
                 tracer._on_create(kwargs, response, latency_ms, None,
                                   recorder, agent, provider)
@@ -1209,8 +1288,10 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
             return _record_after_await()
 
         if kwargs.get("stream") or is_named_stream_method:
-            return _StreamProxy(result, kwargs, tracer, recorder,
-                                agent, provider, adapter, start)
+            return _wrap_stream_result(
+                result, adapter,
+                lambda s: _StreamProxy(s, kwargs, tracer, recorder,
+                                       agent, provider, adapter, start))
 
         latency_ms = int((time.perf_counter() - start) * 1000)
         tracer._on_create(kwargs, result, latency_ms, None,
@@ -1219,21 +1300,71 @@ def _make_interceptor(real_create: Callable, tracer: "Tracer",
     return interceptor
 
 
+def _wrap_stream_result(result: object, adapter: object,
+                        make_proxy: Callable[[object], object]) -> object:
+    """Return what the host should get back from a streaming call: either the
+    stream proxy itself, or — for a provider whose streaming method returns
+    an ENVELOPE around the stream — that same envelope with only its stream
+    member proxied.
+
+    Every provider but one hands back the iterator directly, so `make_proxy(
+    result)` is the whole story. Bedrock's `converse_stream` does not: it
+    returns a plain response dict `{"ResponseMetadata": {...}, "stream":
+    <EventStream>}` (confirmed against real botocore, Step-0 probe), and
+    wrapping THAT in a stream proxy would proxy a non-iterable — the host's
+    `response["stream"]` would come back unwrapped and nothing would ever be
+    recorded. An adapter declares the member by name via the optional
+    `stream_envelope_key` attribute (see `BedrockAdapter`); when it is
+    present and the result really is a mapping carrying that key, the
+    envelope is SHALLOW-COPIED (never mutated — the host's object is not
+    ours to alter) with the stream member replaced by its proxy, so
+    `ResponseMetadata` and every other member reach the caller untouched.
+
+    Fail-open: anything unexpected here (a non-copyable mapping, an adapter
+    attribute that isn't a string) falls back to returning the host's own
+    result UNWRAPPED — capture is lost for that call, the host's stream is
+    not.
+
+    That fallback is why the two "no proxy from an envelope" conditions below
+    are SEPARATE checks rather than one. No declared key means this provider
+    hands the stream back directly, so the result IS the stream and proxying
+    it is correct. A declared key that the result does not carry means the
+    opposite: an envelope was expected and the stream is not where it should
+    be (an error-shaped response, a botocore that renamed the member), so
+    there is nothing iterable to proxy — and wrapping the envelope anyway
+    handed the host a `_StreamProxy` where its own next line does
+    `response["ResponseMetadata"]`, raising TypeError inside the traced
+    application. Capture is lost there; the host's call is not."""
+    try:
+        key = getattr(adapter, "stream_envelope_key", None)
+        if key is None:
+            return make_proxy(result)
+        if not isinstance(result, dict) or key not in result:
+            return result
+        envelope = dict(result)
+        envelope[key] = make_proxy(result[key])
+        return envelope
+    except Exception:  # noqa: BLE001 — the host's stream must survive regardless
+        _log.warning("ctxdiff: failed to wrap a streamed response; this call "
+                     "will not be recorded", exc_info=True)
+        return result
+
+
 def _accumulate_stream_usage(adapter: object, chunk: object, state: dict) -> None:
     """Fold one streamed chunk's usage into `state` via the adapter's
     OPTIONAL `accumulate_stream_usage` (see `capture/base.py`'s Adapter
-    Protocol). Looked up with `getattr(..., None)` rather than assumed
-    present: Bedrock's adapter doesn't define it (its streaming method —
-    `converse_stream` — is a separate, still out-of-scope create path), so a
-    stream wrapped for that provider simply never accumulates usage; `state`
-    stays empty and the eventual recorded call gets `usage=None`, same as not
-    capturing streaming at all. OpenAI, Anthropic, and Gemini all define it
-    (Gemini's `generate_content_stream` is now covered too — Phase 13). When
-    the method IS present, the call is wrapped in its own try/except — on
-    top of every provider adapter already being defensive internally — so a
-    raise here can NEVER interrupt the caller's own chunk-by-chunk
-    iteration; this is the hardest constraint on the whole streaming feature
-    (see module docstring)."""
+    Protocol). Every shipped adapter — OpenAI, Anthropic, Gemini
+    (`generate_content_stream`) and Bedrock (`converse_stream`) — now
+    defines it, but it is still looked up with `getattr(..., None)` rather
+    than assumed present, so a third-party or future adapter that omits it
+    simply never accumulates usage: `state` stays empty and the eventual
+    recorded call gets `usage=None`, the same as not capturing streaming
+    usage at all, instead of an AttributeError mid-iteration. When the
+    method IS present, the call is wrapped in its own try/except — on top of
+    every provider adapter already being defensive internally — so a raise
+    here can NEVER interrupt the caller's own chunk-by-chunk iteration; this
+    is the hardest constraint on the whole streaming feature (see module
+    docstring)."""
     accumulate = getattr(adapter, "accumulate_stream_usage", None)
     if accumulate is None:
         return
@@ -1242,33 +1373,6 @@ def _accumulate_stream_usage(adapter: object, chunk: object, state: dict) -> Non
     except Exception:  # noqa: BLE001 — fail-open: a chunk must reach the caller regardless
         _log.warning("ctxdiff: accumulate_stream_usage raised; usage for this "
                      "chunk not captured", exc_info=True)
-
-
-class _SyntheticStreamResponse:
-    """Stands in for a completed `response` at RECORD time for a call that
-    was actually a stream — it carries nothing but the usage accumulated
-    across the stream's chunks, exposed as an ATTRIBUTE-based object (not the
-    raw dict) because every adapter's `extract_usage` duck-types
-    `response.<attr>.<field>` via `getattr`. Routing accumulated stream usage
-    through THIS shape, into the SAME `extract_usage` code path a
-    non-streaming call already uses, means there is no second, parallel
-    usage-shaping path to keep in sync — a stream-derived call's stored
-    `usage` dict is byte-for-byte what a non-streaming call's would have
-    been, for the same accumulated numbers.
-
-    Exposed under BOTH `.usage` (OpenAI's/Anthropic's `extract_usage` reads
-    `response.usage`) AND `.usage_metadata` (Gemini's `extract_usage` reads
-    `response.usage_metadata` instead — confirmed the mismatch empirically,
-    Phase 13: without this, a Gemini stream's accumulated usage silently
-    vanished at record time even though accumulation itself worked
-    correctly) — both names point at the SAME namespace object, so whichever
-    attribute a given adapter's `extract_usage` happens to duck-type off of,
-    it finds the right data; neither adapter needs to know the other
-    exists."""
-    def __init__(self, state: dict):
-        ns = types.SimpleNamespace(**state)
-        self.usage = ns
-        self.usage_metadata = ns
 
 
 def _finalize_stream_call(kwargs: dict, state: dict, start: float, tracer: "Tracer",
@@ -1295,14 +1399,17 @@ def _finalize_stream_call(kwargs: dict, state: dict, start: float, tracer: "Trac
     existing fail-open `_on_create`, exactly like the non-streaming path, so
     a broken recorder can't break this either."""
     latency_ms = int((time.perf_counter() - start) * 1000)
-    response = _SyntheticStreamResponse(state) if state else None
+    response = SyntheticUsageResponse(state) if state else None
     tracer._on_create(kwargs, response, latency_ms, error, recorder, agent, provider,
                       quiet=quiet)
 
 
 class _StreamProxy:
-    """Transparent wrapper around a SYNC provider stream (e.g. `openai.
-    Stream`/`anthropic.Stream`): yields every real chunk to the caller
+    """Transparent wrapper around a SYNC provider stream (`openai.Stream`/
+    `anthropic.Stream`, a Gemini `generate_content_stream` generator, or the
+    `botocore.eventstream.EventStream` inside a Bedrock `converse_stream`
+    response — see `_wrap_stream_result` for how that one is reached):
+    yields every real chunk to the caller
     UNCHANGED and IMMEDIATELY — never buffered, dropped, reordered, or
     delayed, the one absolute constraint on this whole feature — while
     folding each chunk's usage (if any) into a running `state` dict via the
@@ -1345,6 +1452,9 @@ class _StreamProxy:
         object.__setattr__(self, "_ctx_start", start)
         object.__setattr__(self, "_ctx_state", {})
         object.__setattr__(self, "_ctx_finalized", False)
+        # The wrapped object's ITERATOR, materialized lazily on the first
+        # `__next__` — see `_iterator()` for why this isn't just the stream.
+        object.__setattr__(self, "_ctx_iter", None)
 
     def __getattr__(self, name: str):
         """Pass through to the wrapped stream. `object.__getattribute__` (not
@@ -1352,6 +1462,29 @@ class _StreamProxy:
         itself somehow isn't set yet — same defensive pattern as
         `_ClientProxy.__getattr__`."""
         return getattr(object.__getattribute__(self, "_ctx_stream"), name)
+
+    def _iterator(self):
+        """The wrapped object's iterator, created ONCE on first use.
+
+        Why not just call `next()` on the stream itself: an ITERABLE is not
+        necessarily an ITERATOR. `openai.Stream`/`anthropic.Stream` and
+        Gemini's generator all define `__next__`, so `next(stream)` worked
+        for them — but botocore's `EventStream` (what Bedrock's
+        `converse_stream` yields) defines only `__iter__`, as a GENERATOR
+        function, and no `__next__` at all; `next()` on it raises TypeError
+        before a single event reaches the caller. `iter()` covers both
+        cases — it returns an iterator's own self unchanged, so nothing
+        changes for the providers that already worked — and it is called
+        exactly once and cached, because for `EventStream` each `__iter__`
+        would otherwise start a SECOND generator over the same underlying
+        HTTP body and interleave two half-streams. Creating it is lazy and
+        does no I/O, so this stays off the call path until the host actually
+        starts consuming."""
+        iterator = object.__getattribute__(self, "_ctx_iter")
+        if iterator is None:
+            iterator = iter(object.__getattribute__(self, "_ctx_stream"))
+            object.__setattr__(self, "_ctx_iter", iterator)
+        return iterator
 
     def _finalize(self, error: str | None = None, quiet: bool = False) -> None:
         """Record the call exactly once, with `error` (a type-name string, or
@@ -1400,7 +1533,7 @@ class _StreamProxy:
         happens only after it's confirmed to have reached the caller, and
         never delays returning it."""
         try:
-            chunk = next(self._ctx_stream)
+            chunk = next(self._iterator())
         except StopIteration:
             self._finalize()
             raise
@@ -1482,9 +1615,40 @@ class _AsyncStreamProxy:
         object.__setattr__(self, "_ctx_start", start)
         object.__setattr__(self, "_ctx_state", {})
         object.__setattr__(self, "_ctx_finalized", False)
+        # The wrapped object's ASYNC ITERATOR, materialized lazily on the
+        # first `__anext__` — see `_aiterator()`, the mirror of the sync
+        # proxy's `_iterator()`.
+        object.__setattr__(self, "_ctx_aiter", None)
 
     def __getattr__(self, name: str):
         return getattr(object.__getattribute__(self, "_ctx_stream"), name)
+
+    def _aiterator(self):
+        """The wrapped object's async iterator, created ONCE on first use —
+        the counterpart of `_StreamProxy._iterator()`, for the same reason.
+
+        An async ITERABLE is not necessarily an async ITERATOR. Every async
+        stream shipped by openai/anthropic/google-genai defines `__anext__`,
+        so awaiting `stream.__anext__()` worked for them — but an object that
+        defines only `__aiter__` (as a method returning a fresh async
+        generator, which is exactly the shape botocore's `EventStream` has on
+        the SYNC side) has no `__anext__` at all, and the direct call raised
+        AttributeError before one chunk reached the caller. `aiter()` covers
+        both cases: on a real async iterator it returns that same object
+        unchanged, so nothing changes for the providers that already worked.
+        It is called exactly once and cached, because a fresh `__aiter__`
+        would start a SECOND generator over the same underlying body and
+        interleave two half-streams. An object with `__anext__` but no
+        `__aiter__` — which `aiter()` would reject — is still used directly,
+        so this can only ever add a shape, never remove one. Creating the
+        iterator is lazy and does no I/O, so it stays off the call path until
+        the host actually starts consuming."""
+        iterator = object.__getattribute__(self, "_ctx_aiter")
+        if iterator is None:
+            stream = object.__getattribute__(self, "_ctx_stream")
+            iterator = aiter(stream) if hasattr(stream, "__aiter__") else stream
+            object.__setattr__(self, "_ctx_aiter", iterator)
+        return iterator
 
     def _finalize(self, error: str | None = None, quiet: bool = False) -> None:
         """See `_StreamProxy._finalize` — identical contract, `error` and
@@ -1507,9 +1671,12 @@ class _AsyncStreamProxy:
 
     async def __anext__(self):
         """Async mirror of `_StreamProxy.__next__` — see its docstring for
-        the full error-vs-exhaustion finalize contract, identical here."""
+        the full error-vs-exhaustion finalize contract, identical here. The
+        iterator comes from `_aiterator()` rather than from the stream
+        directly — see that method for why an async iterable may not be an
+        async iterator."""
         try:
-            chunk = await self._ctx_stream.__anext__()
+            chunk = await self._aiterator().__anext__()
         except StopAsyncIteration:
             self._finalize()
             raise

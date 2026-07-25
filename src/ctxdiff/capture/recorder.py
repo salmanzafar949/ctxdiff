@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+import types
 from dataclasses import dataclass
 from typing import Callable
 
@@ -49,6 +50,36 @@ def build_block(raw: RawBlock, provider: str) -> Block:
         role=raw.role, kind=raw.kind, text=raw.text,
         token_count=token_count, token_method=token_method,
     )
+
+
+class SyntheticUsageResponse:
+    """Stands in for a completed `response` at RECORD time for a call whose
+    usage did NOT arrive on a response object — a stream (usage accumulated
+    across its chunks) or a LangChain callback run (usage handed over in
+    LangChain's own normalized shape). It carries nothing but those counts,
+    exposed as an ATTRIBUTE-based object rather than the raw dict, because
+    every adapter's `extract_usage` duck-types `response.<attr>.<field>` via
+    `getattr`.
+
+    Routing accumulated usage through THIS shape, into the SAME
+    `extract_usage` a non-streaming call already uses, is what keeps a
+    stored `usage` dict byte-for-byte identical no matter which route
+    produced the numbers — there is no second, parallel usage-shaping path to
+    keep in sync.
+
+    Exposed under BOTH `.usage` (OpenAI's/Anthropic's/Bedrock's
+    `extract_usage` reads `response.usage`) AND `.usage_metadata` (Gemini's
+    reads `response.usage_metadata` instead — confirmed the mismatch
+    empirically: without this, a Gemini stream's accumulated usage silently
+    vanished at record time even though accumulation itself worked
+    correctly). Both names point at the SAME namespace object, so whichever
+    attribute a given adapter happens to duck-type off of, it finds the right
+    data; neither adapter needs to know the other exists."""
+
+    def __init__(self, state: dict):
+        ns = types.SimpleNamespace(**state)
+        self.usage = ns
+        self.usage_metadata = ns
 
 
 @dataclass(frozen=True)

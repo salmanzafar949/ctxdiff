@@ -12,7 +12,7 @@
 
 **Pick your language:** [🐍 Python](#install) · [🟨 JavaScript / TypeScript](js/README.md) — same `.ctrace` format, same CLI, cross-compatible.
 
-`ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI, Anthropic, Gemini, or Bedrock client in one line, run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
+`ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI, Anthropic, Gemini (incl. Vertex AI), or Bedrock client in one line — or hand a callback handler to LangChain/LangGraph — run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
 
 > Prompt wording is ~10% of the battle. The other 90% is **context engineering** — what the model sees, in what order, at what cost. When an agent misbehaves at turn 8, `ctxdiff` answers the three questions a raw JSON log can't: *what exactly did the model see, what changed since turn 7, and what did it cost?*
 
@@ -95,7 +95,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 
 - 🔌 **[One-line capture](#quickstart)** — `tracer.wrap(client)` records every LLM call's full context, verbatim, into a single-file SQLite `.ctrace`. [Fail-open by design](#fail-open-guarantee): a ctxdiff error can never break your app.
 - 🧬 **[Content-hashed block storage](#the-block-model)** — every message, content part, and tool schema is a deduplicated block; a stable system prompt across 40 turns is stored once.
-- 🌐 **[Seven provider surfaces](#supported-providers)** — OpenAI, Azure OpenAI, Anthropic, Google Gemini, AWS Bedrock (Converse), any OpenAI-compatible OSS endpoint (Ollama/vLLM/…), and LangChain via client injection.
+- 🌐 **[Eight provider surfaces](#supported-providers)** — OpenAI, Azure OpenAI, Anthropic, Google Gemini (AI Studio **and Vertex AI**), AWS Bedrock (Converse, streaming included), any OpenAI-compatible OSS endpoint (Ollama/vLLM/…), and **[LangChain/LangGraph via a callback handler](#langchain--langgraph)**.
 - 🟩🟥🟨 **[Git-style turn diffing](#ctxdiff-diff---turn-n---turn-m)** — `ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **[Token attribution](#ctxdiff-tokens---turn-n)** — `ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **[Prompt-cache profiling](#ctxdiff-cache)** — `ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
@@ -106,6 +106,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 - 🚦 **[Context budgets in CI](#ctxdiff-check)** — `ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas`: assert the budget, exit non-zero when it regresses. Ships as a [GitHub Action](#github-action) that posts the PASS/FAIL table to the job summary — so context size becomes a tracked metric on every pull request, not something you remember to look at.
 - 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request, **three-level** dashboard — every agent in the project, then that agent's sessions (in your local timezone), then its turn-by-turn scrubber, diff panel, token heatmap, cache findings and block inspector — safe to attach to a bug ticket.
 - 🤖 **[MCP server](#mcp-server)** — `ctxdiff mcp`: the coding agent in Claude Code / Cursor reads your traces itself. Six tools over stdio, `ctxdiff_explain(run, turn)` answering *"why did my agent break at turn 8"* in one call — the same analyzers the CLI uses, returning compact JSON under a hard size cap. Ships with a `--redact` mode, because this is the one ctxdiff feature that hands your prompts to someone else's model.
+- 🦜 **[LangChain & LangGraph, natively](#langchain--langgraph)** — `callbacks=[tracer.langchain_handler()]`, and every chat-model call in a graph is captured, whatever the provider. The blocks it records are **hash-identical** to wrapping that provider's SDK directly, so a LangChain trace and a direct trace of the same prompt dedup against each other instead of looking like two unrelated contexts — images included, and across SDKs except for a tool call's arguments ([why](#langchain--langgraph)).
 - 🏷️ **[Semantic tagging](#semantic-tagging)** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
 - 🤝 **[Multi-agent runs](#multi-agent-runs)** — `tracer.wrap(client, agent="researcher")` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters on `diff`/`tokens`/`cache`/`check`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `ctxdiff.configure(store=PostgresStore(dsn=...))` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, drivers are optional extras, and a dead database degrades capture without ever touching your agent.
@@ -114,10 +115,8 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 
 **What it doesn't do (yet):**
 
-- ⏳ **Bedrock streaming usage** — Bedrock's `converse_stream` is a separate, not-yet-wrapped method; use the non-streaming `converse` if you need usage from Bedrock today. (This is the **only** streaming gap — OpenAI chat+Responses, Anthropic, and Gemini streaming usage are all captured, including the `.stream()` convenience-manager helpers; see [Streaming usage](#streaming-usage).)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
 - ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
-- ⏳ **Native LangChain/LangGraph callbacks** — [LangChain works via client injection](#langchain) today; a first-class callback handler is planned.
 - ⏳ **VS Code extension** — the dashboard will be embeddable in an editor panel.
 
 See [The CLI](#the-cli) below for every subcommand, with real sample output.
@@ -139,7 +138,7 @@ Install from source, or with the real-SDK eval extra:
 
 ```bash
 git clone https://github.com/salmanzafar949/ctxdiff && cd ctxdiff && pip install -e .
-pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, respx — for tests only
+pip install -e ".[eval]"   # openai, anthropic, google-genai, boto3, langchain, langgraph, respx — for tests only
 ```
 
 Storage is a local `.ctrace` file by default, with nothing extra to install. To keep traces in a database you already run, add the matching extra — see [Storage backends](#storage-backends):
@@ -889,9 +888,10 @@ The [fail-open guarantee](#fail-open-guarantee) covers a networked store complet
 | **Azure OpenAI** | `openai.AzureOpenAI(...)` | Same adapter, zero config |
 | **Anthropic / Claude** | `anthropic.Anthropic(...)` | Messages API |
 | **Google Gemini** | `google.genai.Client(...)` | Generate Content API — `models.generate_content` **and** `models.generate_content_stream` (streaming usage captured) |
-| **AWS Bedrock** | `boto3.client("bedrock-runtime")` | Converse API (`client.converse(...)`) |
+| **Google Vertex AI** | `google.genai.Client(vertexai=True, project=…, location=…)` | Same client class, same adapter — sync, async and streaming; see [Vertex AI](#google-vertex-ai) |
+| **AWS Bedrock** | `boto3.client("bedrock-runtime")` | Converse API — `client.converse(...)` **and** `client.converse_stream(...)` (streaming usage captured) |
 | **Open-source models** | `openai.OpenAI(base_url="http://localhost:11434/v1", ...)` | Any OpenAI-compatible endpoint — Ollama, vLLM, LM Studio, Together, Groq, … |
-| **LangChain** | `langchain_openai.ChatOpenAI(...)` | Via client injection — see [LangChain](#langchain) |
+| **LangChain / LangGraph** | *any* chat model — `ChatOpenAI`, `ChatAnthropic`, `ChatVertexAI`, … | `callbacks=[tracer.langchain_handler()]` — see [LangChain & LangGraph](#langchain--langgraph) |
 
 Passing an unrecognized client raises immediately, so misconfiguration fails loudly at setup rather than silently at record time:
 
@@ -980,7 +980,7 @@ Whether usage is actually captured depends on what the provider puts on the wire
 
 - **Anthropic** and **OpenAI Responses** streams report usage unconditionally — no caller action needed.
 - **OpenAI Chat Completions** streams only report usage on a final chunk when the *caller* passes `stream_options={"include_usage": True}`. ctxdiff never injects this for you (it would alter your own request) — without it, the call is still captured but `usage` is honestly `None`.
-- **Bedrock** (`converse_stream`) is a separate, not-yet-wrapped method — use the non-streaming `converse` if you need usage from Bedrock today.
+- **Bedrock** (`converse_stream`) reports usage unconditionally, on a single trailing `metadata` event — no caller action needed. See the Bedrock note below for the one shape difference this method has.
 
 A stream you never fully consume, close, or use as a context manager still gets recorded, best-effort, on garbage collection — with whatever usage was accumulated before you moved on (possibly none).
 
@@ -1005,7 +1005,17 @@ with client.responses.stream(model="gpt-4o", input="...") as stream:
     ...
 ```
 
-`Anthropic.messages.stream`, OpenAI's `chat.completions.stream`, and OpenAI's `responses.stream` all work this way — `with`/`async with client.messages.stream(...) as stream:` — nothing is recorded until you actually enter the block (that's when the provider request fires), and the same usage rules above apply (Anthropic/Responses unconditional, Chat Completions needs your own `stream_options={"include_usage": True}`). Gemini has no equivalent `.stream()` manager — see `generate_content_stream` above. Bedrock's `converse_stream` is still not wrapped, same as the raw `stream=True` path above.
+`Anthropic.messages.stream`, OpenAI's `chat.completions.stream`, and OpenAI's `responses.stream` all work this way — `with`/`async with client.messages.stream(...) as stream:` — nothing is recorded until you actually enter the block (that's when the provider request fires), and the same usage rules above apply (Anthropic/Responses unconditional, Chat Completions needs your own `stream_options={"include_usage": True}`). Gemini has no equivalent `.stream()` manager — see `generate_content_stream` above. Bedrock has no `.stream()` manager either — see `converse_stream` below.
+
+**Bedrock** streams through its own method too, `client.converse_stream(...)`, and is the one provider that does *not* hand back the stream directly: it returns a response **envelope** carrying it, `{"ResponseMetadata": …, "stream": <EventStream>}`. ctxdiff proxies the stream inside that envelope and passes the rest of the dict through untouched, so your code is written exactly as it would be unwrapped:
+
+```python
+response = client.converse_stream(modelId="…", messages=[...])
+for event in response["stream"]:
+    ...  # your code sees every event, unmodified
+```
+
+Usage arrives on the trailing `metadata` event (`inputTokens`/`outputTokens`/`totalTokens` — the same shape a non-streaming `converse` reports), so a streamed Bedrock turn stores the same `usage` dict a non-streamed one would.
 
 ### Semantic tagging
 
@@ -1150,7 +1160,7 @@ Estimates are always labeled as such — never presented as exact. If `tiktoken`
 
 ## Provider recipes
 
-> **Python** below. For **JavaScript/TypeScript** — OpenAI (chat + Responses), Anthropic, and Gemini, including streaming and `.stream()` helpers — see the **[JS SDK README → Provider recipes](js/README.md#provider-recipes)**. (Azure, Bedrock, OSS-endpoint, and LangChain recipes are Python-only for now.)
+> **Python** below. For **JavaScript/TypeScript** — OpenAI (chat + Responses), Anthropic, Gemini, and **LangChain/LangGraph via the same callback handler** — see the **[JS SDK README → Provider recipes](js/README.md#provider-recipes)**. (Bedrock is Python-only: the JS SDK ships no Bedrock adapter.)
 
 ### OpenAI
 
@@ -1222,6 +1232,24 @@ client.models.generate_content(
 )
 ```
 
+### Google Vertex AI
+
+Vertex is the **same client class** as AI Studio — `google.genai.Client` — constructed in Vertex mode, so it is captured by the same adapter with nothing extra to configure. Only the endpoint differs, and ctxdiff never looks at endpoints: detection keys off the `google.genai` module, and the adapter reads your request kwargs.
+
+```python
+from google import genai
+client = tracer.wrap(genai.Client(vertexai=True, project="my-project", location="us-central1"))
+client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents="What's your refund window?",
+    config={"system_instruction": "You are a support agent."},
+)
+```
+
+Sync, `client.aio` async, and `generate_content_stream` all work exactly as they do in AI Studio mode, and a prompt sent through Vertex produces the **same block hashes** as the same prompt sent through the AI Studio endpoint — so moving a project between the two doesn't light up as a whole new context.
+
+> The **legacy** `vertexai.generative_models.GenerativeModel` from `google-cloud-aiplatform` (which Google itself has deprecated in favour of `google-genai`) is **not** supported: it is a model object rather than a client, and it sends proto objects rather than the dicts the adapter reads. `wrap()` on one raises rather than recording a run with zero blocks.
+
 ### AWS Bedrock
 
 The Bedrock adapter handles boto3's `bedrock-runtime` Converse API: `system` (a list of `{"text": ...}` blocks, never a bare string), `messages`, `toolConfig.tools`, and `inferenceConfig`'s sampling fields — detection keys off the client's *class name* (`BedrockRuntime`), since every boto3 service client shares the same `botocore.client` module.
@@ -1236,6 +1264,8 @@ client.converse(
     inferenceConfig={"maxTokens": 256},
 )
 ```
+
+`client.converse_stream(...)` takes the identical request shape and is captured the same way — see [Streaming usage](#streaming-usage) for the one difference (it returns an envelope containing the event stream, not the stream itself).
 
 ### Open-source models
 
@@ -1254,28 +1284,63 @@ The same holds for **aggregators and proxies that speak the OpenAI API** — no 
 
 Because detection keys off the `openai` client module, both are captured by the OpenAI adapter with zero ctxdiff-specific configuration.
 
-### LangChain
+### LangChain & LangGraph
 
-LangChain holds its own SDK client internally, so wrap the underlying OpenAI client and inject the proxy into `ChatOpenAI`:
+LangChain hands you a `ChatOpenAI`, not an `OpenAI`, so there is nothing for `wrap()` to take. Use the **callback handler** instead — LangChain's own extension point:
+
+```python
+from langchain_openai import ChatOpenAI
+
+handler = tracer.langchain_handler()
+
+llm = ChatOpenAI(model="gpt-4o", callbacks=[handler])
+llm.invoke("What's your refund window?")          # captured, with usage
+```
+
+For **LangGraph** — which propagates callbacks through the whole graph — attach it once, at invoke time, and every model call in every node is captured:
+
+```python
+graph.invoke(state, config={"callbacks": [tracer.langchain_handler(agent="researcher")]})
+```
+
+What this gives you that client injection never could:
+
+- **Every provider.** The handler sees provider-agnostic messages plus LangChain's own model description, so `ChatOpenAI`, `ChatAnthropic`, `ChatVertexAI`, `ChatBedrockConverse` and anything else following the interface are all captured — each normalized by its own provider's adapter. One handler can serve several models in one run.
+- **Streaming, for free.** LangChain reports the finished result to the callback either way, so a streamed call records once, *with* usage — including the `stream_options` opt-in that the injection path can't get at.
+- **Tool calls and multi-turn graphs.** Tool schemas, the assistant's tool call, and the tool result all become blocks in the turn that actually sent them.
+- **Errors.** A failed call is recorded as a failed call, with the context that produced it.
+
+**Hash identity is the point.** The handler does not invent a second way to read messages: it rebuilds the request in the provider's own wire shape and hands it to the *same* adapter the direct path uses. So the blocks are identical — same hashes — to what `tracer.wrap()` records for the same request, and a LangChain trace dedups against a direct one instead of looking like an unrelated context. That is checked two ways for every provider branch — against a direct `wrap()` capture, and against the actual JSON body LangChain put on the wire (OpenAI, Anthropic, Gemini and Bedrock Converse each against their real integration, with the HTTP stubbed).
+
+A **multimodal turn keeps every part**: two text parts and an image are three blocks, and the image is hashed over its *bytes*, so the same screenshot is one block however it was wrapped and its vision-token cost lands in `ctxdiff tokens` instead of vanishing.
+
+*Across SDKs*, the [JS handler](js/README.md#langchain--langgraph) normalizes to the same shapes and the two suites pin the same literal hashes — with one documented exception. LangChain re-serializes a **tool call**'s arguments with the host language's own JSON serializer, and `json.dumps` emits `{"city": "Dubai"}` where `JSON.stringify` emits `{"city":"Dubai"}`. Each handler reproduces its own framework's real request byte for byte, so a tool-call block hashes differently in the two SDKs — exactly as two *direct* captures of those same two requests would, with no ctxdiff in the picture. Both hashes are pinned by both test suites so the divergence can never drift silently. Everything else — messages, system prompts, tool *schemas*, images — is cross-SDK identical.
+
+`agent=` attributes the handler's calls exactly as `wrap(client, agent=...)` does, and `tracer.tag()` / `tracer.step()` work unchanged.
+
+<details>
+<summary><b>Legacy: client injection</b> (still supported)</summary>
+
+Before the handler existed, ctxdiff captured LangChain by wrapping the underlying SDK client and injecting the proxy into `ChatOpenAI`:
 
 ```python
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 
-oa = OpenAI()
-wrapped = tracer.wrap(oa)
-
+wrapped = tracer.wrap(OpenAI())
 llm = ChatOpenAI(
     client=wrapped.chat.completions,   # inject the wrapped resource
     root_client=wrapped,
     model="gpt-4o",
 )
-
 llm.invoke("What's your refund window?")   # captured, with usage
 ```
 
-> Wrapping the `ChatOpenAI` object directly raises (it isn't an SDK client) — inject as above.
-> **Streaming caveat:** with `streaming=True`, the call is captured and the stream proxy records once it completes — but LangChain's default `ChatOpenAI` doesn't pass `stream_options={"include_usage": True}` itself, so `usage` still comes back `None` unless you configure LangChain to send it (see [Streaming usage](#streaming-usage) above).
+This still works and is still tested — but it reaches into LangChain's internals, so it only covers integrations whose SDK client you can reach, and a LangChain refactor can break it silently. It also can't see stream usage: with `streaming=True` the call is captured, but LangChain's `ChatOpenAI` doesn't pass `stream_options={"include_usage": True}` on the raw client, so `usage` comes back `None`. Prefer the handler.
+
+> Wrapping a `ChatOpenAI` object directly still raises — it isn't an SDK client.
+
+</details>
 
 ---
 
@@ -1311,7 +1376,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: Bedrock streaming usage (`converse_stream`), live tail, background recording, a native LangChain callback handler, and the VS Code extension — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: live tail, background recording, and the VS Code extension — plus smaller items tracked in the issues (e.g. a Bedrock adapter for the JS SDK, rolling per-call model ids up onto `run.models`).
 
 ---
 
@@ -1325,7 +1390,7 @@ pip install -e ".[eval]"    # + real provider SDKs and respx
 pytest tests/eval           # real-SDK integration tests (HTTP stubbed, no network, no keys)
 ```
 
-The eval suite drives the real `openai`, `anthropic`, `google-genai`, `boto3`, and `langchain` SDKs with their HTTP transport stubbed (`respx` for httpx-based SDKs, `botocore.stub.Stubber` for boto3), so it needs no API keys and makes no network calls. It skips cleanly if the `eval` extra isn't installed.
+The eval suite drives the real `openai`, `anthropic`, `google-genai` (AI Studio **and Vertex**), `boto3`, `langchain` and `langgraph` SDKs with their HTTP transport stubbed (`respx` for httpx-based SDKs; for boto3, `botocore.stub.Stubber` for `converse` and a `before-send` hook returning real event-stream frames for `converse_stream`), so it needs no API keys and makes no network calls. It skips cleanly if the `eval` extra isn't installed.
 
 ### The cross-SDK golden corpus
 

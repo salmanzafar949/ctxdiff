@@ -162,3 +162,66 @@ describe("wrap Gemini: fail-open", () => {
     tracer.close();
   });
 });
+
+describe("wrap Gemini: Vertex AI mode", () => {
+  it("captures a Vertex-mode client through the same adapter, with the same block hashes", async () => {
+    // Vertex is the SAME client class in a different mode — only the endpoint
+    // differs, and detection keys off the client, never the URL. So this must
+    // be captured identically to AI Studio mode, hash for hash: a team moving
+    // a project between the two must not see its whole context light up as new.
+    const path = tmpTrace();
+    const seenUrls: string[] = [];
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+      seenUrls.push(String(url));
+      sentBodies.push(init?.body ? JSON.parse(init.body) : {});
+      return jsonResponse({
+        candidates: [{ content: { role: "model", parts: [{ text: "4" }] }, finishReason: "STOP" }],
+        usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 },
+      });
+    }) as unknown as typeof fetch;
+    sentBodies = [];
+
+    const request = {
+      model: "gemini-2.0-flash",
+      contents: "2+2?",
+      config: { systemInstruction: "be terse" },
+    };
+    const tracer = init("proj", { path });
+    const vertex = tracer.wrap(
+      new GoogleGenAI({
+        vertexai: true,
+        project: "my-project",
+        location: "us-central1",
+        // A stand-in auth client, so the SDK never reaches for Application
+        // Default Credentials (which would look for a metadata server / gcloud
+        // config and make this test depend on the machine it runs on).
+        googleAuthOptions: {
+          authClient: { getRequestHeaders: async () => new Headers() } as never,
+        },
+      }),
+    ) as GoogleGenAI;
+    const studio = tracer.wrap(new GoogleGenAI({ apiKey: "test" })) as GoogleGenAI;
+
+    const res = await vertex.models.generateContent(request);
+    expect(res.candidates?.[0]?.content?.parts?.[0]?.text).toBe("4");
+    await studio.models.generateContent(request);
+    tracer.close();
+
+    // The Vertex call really did go to the Vertex endpoint, not the AI Studio one.
+    expect(seenUrls[0]).toContain("aiplatform.googleapis.com");
+
+    const ct = CTrace.open(path);
+    expect(ct.getRun().provider).toBe("gemini");
+    const calls = ct.getCalls();
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.usage).toEqual({
+      prompt_token_count: 12,
+      candidates_token_count: 4,
+      total_token_count: 16,
+    });
+    expect(ct.getCallBlocks(calls[0]!.id).map((b) => b.block.contentHash)).toEqual(
+      ct.getCallBlocks(calls[1]!.id).map((b) => b.block.contentHash),
+    );
+    ct.close();
+  });
+});

@@ -55,6 +55,16 @@ export { OpenAIAdapter } from "./capture/openai.js";
 export { AnthropicAdapter } from "./capture/anthropic.js";
 export { GeminiAdapter } from "./capture/gemini.js";
 export { Recorder, type RedactHook } from "./capture/recorder.js";
+// The LangChain/LangGraph capture path: `tracer.langchainHandler()` returns
+// this shape. The normalizers are exported alongside it because they are the
+// cross-SDK contract — the same message -> wire-shape rebuilding the Python
+// handler does — and are worth being able to assert against directly.
+export {
+  providerFor as langchainProviderFor,
+  toWire as langchainToWire,
+  usageState as langchainUsageState,
+} from "./capture/langchain.js";
+export type { CtxdiffCallbackHandler } from "./capture/langchain.js";
 
 // --- read-side analyzers (parity with Python's `ctxdiff.analyze`) -----------
 export {

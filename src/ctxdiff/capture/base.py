@@ -52,8 +52,19 @@ class Adapter(Protocol):
         This is genuinely optional: `Adapter` is a structural Protocol with
         no runtime enforcement, and trace.py looks this method up with
         `getattr(adapter, "accumulate_stream_usage", None)` before calling
-        it — an adapter that omits it (Gemini's `generate_content_stream`,
-        Bedrock's `converse_stream` — both separate methods, out of scope
-        for this pass) simply never accumulates stream usage; `state` stays
-        empty and the recorded call's usage is None, same as today."""
+        it. Every shipped adapter now defines it — including the two
+        providers whose streaming call is a separately-NAMED method rather
+        than a `stream=True` kwarg (Gemini's `generate_content_stream`,
+        Bedrock's `converse_stream`) — but an adapter that omits it simply
+        never accumulates stream usage: `state` stays empty and the recorded
+        call's usage is None, rather than an AttributeError mid-iteration."""
         ...
+
+    # Optional, and defined by exactly one adapter today (Bedrock's): the key
+    # under which a streaming method's return value carries the actual
+    # iterator, when that return value is an ENVELOPE rather than the stream
+    # itself. `converse_stream(...)` returns `{"ResponseMetadata": {...},
+    # "stream": <EventStream>}`, so trace.py's `_wrap_stream_result` proxies
+    # only `result["stream"]` and hands the rest of the dict back untouched.
+    # Absent on every other adapter, which return the stream directly.
+    stream_envelope_key: str | None

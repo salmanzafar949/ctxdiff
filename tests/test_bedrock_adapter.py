@@ -151,3 +151,47 @@ def test_extract_usage_object_shaped_response_fallback():
 def test_extract_usage_none_for_object_without_usage():
     """An object response with no usage attribute at all yields None."""
     assert BedrockAdapter().extract_usage(object()) is None
+
+
+def test_create_paths_cover_converse_and_converse_stream():
+    """Both completion methods hang off this one adapter — `converse` and
+    `converse_stream` take the IDENTICAL request shape, so every extractor
+    serves both and the proxy intercepts both off the same tree. The
+    singular `create_path` is kept for backward compat."""
+    adapter = BedrockAdapter()
+    assert adapter.create_paths == (("converse",), ("converse_stream",))
+    assert adapter.create_path == ("converse",)
+
+
+def test_stream_envelope_key_is_declared():
+    """`converse_stream` is the one streaming method that returns an
+    ENVELOPE (`{"ResponseMetadata": ..., "stream": <EventStream>}`) rather
+    than the stream itself; the adapter names that member so trace.py can
+    proxy the inner iterator and pass the rest of the dict through."""
+    assert BedrockAdapter().stream_envelope_key == "stream"
+
+
+def test_accumulate_stream_usage_reads_the_metadata_event():
+    """The trailing `metadata` event carries the whole exchange's counts, as
+    plain DICTS (botocore has no typed event objects), and they land in
+    `state` under the same key names `extract_usage` returns — so a streamed
+    call's stored usage is indistinguishable from a non-streamed one's."""
+    state: dict = {}
+    adapter = BedrockAdapter()
+    adapter.accumulate_stream_usage({"messageStart": {"role": "assistant"}}, state)
+    assert state == {}                      # no usage on a non-metadata event
+    adapter.accumulate_stream_usage(
+        {"metadata": {"usage": {"inputTokens": 12, "outputTokens": 6, "totalTokens": 18},
+                      "metrics": {"latencyMs": 100}}}, state)
+    assert state == {"inputTokens": 12, "outputTokens": 6, "totalTokens": 18}
+
+
+def test_accumulate_stream_usage_ignores_malformed_events():
+    """Fail-open: a non-dict event, a metadata event with no usage, or a
+    usage that isn't a dict must all leave `state` untouched and never raise
+    — an exception here would interrupt the caller's own iteration."""
+    state: dict = {}
+    adapter = BedrockAdapter()
+    for chunk in (object(), None, {"metadata": None}, {"metadata": {"usage": "nope"}}):
+        adapter.accumulate_stream_usage(chunk, state)
+    assert state == {}

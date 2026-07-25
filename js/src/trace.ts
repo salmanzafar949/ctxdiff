@@ -46,6 +46,7 @@ import type { Adapter } from "./capture/base.js";
 import { OpenAIAdapter } from "./capture/openai.js";
 import { AnthropicAdapter } from "./capture/anthropic.js";
 import { GeminiAdapter } from "./capture/gemini.js";
+import { buildHandler, type CtxdiffCallbackHandler } from "./capture/langchain.js";
 import { Recorder, type RedactHook } from "./capture/recorder.js";
 import type {
   Awaitable,
@@ -747,6 +748,9 @@ export class Tracer {
   private deferred: DeferredStore | null = null;
   private writer: AsyncWriter | null = null;
   private firstRecorder: Recorder | null = null;
+  // Recorders built per PROVIDER for capture paths that only learn the provider
+  // per call (the LangChain handler) — see `recorderFor`.
+  private recorders = new Map<string, Recorder>();
   private seq = 0; // monotonically increasing turn index across ALL agents
   // One-time guard for the store-setup fail-open path in wrap(): if the project
   // store can't be created/opened (e.g. a persistent lock under heavy concurrent
@@ -856,6 +860,80 @@ export class Tracer {
     } catch (err) {
       console.warn("ctxdiff: wrap failed; returning unwrapped client", err);
       return client;
+    }
+  }
+
+  /**
+   * Return a LangChain callback handler that records every chat-model call made
+   * under it — the IDIOMATIC way to trace LangChain and LangGraph:
+   *
+   *   const handler = tracer.langchainHandler();
+   *   const llm = new ChatOpenAI({ model: "gpt-4o", callbacks: [handler] });
+   *   // or per-invocation, which is what LangGraph propagates:
+   *   await graph.invoke(state, { callbacks: [handler] });
+   *
+   * WHY A HANDLER RATHER THAN `wrap()`: `tracer.wrap()` needs a provider SDK
+   * client, and a LangChain app hands you a `ChatOpenAI`, not an `OpenAI`.
+   * Reaching inside LangChain for the client it happens to hold is a bet on
+   * someone else's private structure. A callback is LangChain's own extension
+   * point: it fires for EVERY integration (ChatOpenAI, ChatAnthropic,
+   * ChatVertexAI, ...), streaming or not, and LangGraph propagates it through
+   * an entire graph, so one handler covers a whole agent.
+   *
+   * The blocks it records are IDENTICAL — same hashes — to what wrapping that
+   * provider's SDK directly would have recorded for the same request, because
+   * the handler rebuilds the provider's own wire shape and feeds it to the very
+   * same adapter (see `capture/langchain.ts`). That holds ACROSS SDKs too: the
+   * Python handler normalizes to the same shapes, so a `.ctrace` written here
+   * dedups against one written there.
+   *
+   * `opts.agent` names the agent these calls belong to, exactly as
+   * `wrap(client, { agent })` does. The returned object is LangChain's plain
+   * `CallbackHandlerMethods` shape, so no LangChain import (or dependency) is
+   * involved. Fail-open throughout, like the rest of capture.
+   *
+   * LIMITATION, stated rather than hidden: a call to a provider this SDK has no
+   * adapter for (Bedrock — the Python SDK captures it, this one does not) is
+   * skipped with one warning rather than recorded through some other
+   * provider's adapter.
+   */
+  langchainHandler(opts: WrapOptions = {}): CtxdiffCallbackHandler {
+    return buildHandler(this, opts.agent ?? null);
+  }
+
+  /**
+   * The Recorder for `provider`, created once per provider and cached — the
+   * entry point for capture paths that discover their provider per CALL rather
+   * than per client (today: the LangChain handler, which sees
+   * provider-agnostic messages and may serve ChatOpenAI and ChatAnthropic from
+   * the same handler).
+   *
+   * `wrap()` can build its recorder eagerly because a client has exactly one
+   * provider; a handler cannot, so this does the same steps lazily: ensure the
+   * run's store exists (idempotent — the first provider to arrive still decides
+   * the session's `provider`, same as the first `wrap()` does), build that
+   * provider's adapter, wrap both in a Recorder.
+   *
+   * Returns null when this SDK has no adapter for the provider, or when store
+   * setup already failed — never throws: it is called from inside a callback on
+   * the host's own path, where fail-open outranks fail-loud.
+   */
+  recorderFor(provider: string): Recorder | null {
+    try {
+      const cached = this.recorders.get(provider);
+      if (cached !== undefined) return cached;
+      const entry = REGISTRY.find((e) => e.provider === provider);
+      if (entry === undefined) return null;
+      this.ensureStore(provider);
+      const store: Store | null = this.ct ?? this.deferred;
+      if (store === null) return null;
+      const recorder = new Recorder(store, entry.make(), this.redact);
+      this.recorders.set(provider, recorder);
+      if (this.firstRecorder === null) this.firstRecorder = recorder;
+      return recorder;
+    } catch (err) {
+      console.warn("ctxdiff: could not prepare a recorder; call not recorded", err);
+      return null;
     }
   }
 

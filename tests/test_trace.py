@@ -302,6 +302,169 @@ def test_wrap_raises_for_unrecognized_botocore_client():
         t.wrap(_FakeS3())
 
 
+class _FakeLegacyVertexModel:
+    """Duck-typed `vertexai.generative_models.GenerativeModel` — the LEGACY
+    google-cloud-aiplatform SDK, which Google itself has deprecated in favour
+    of google-genai. It is a MODEL object, not a client (the completion
+    method hangs straight off it), and its `contents` are proto objects
+    rather than the dicts `GeminiAdapter` reads, so it is deliberately NOT
+    mapped to the gemini adapter."""
+    __module__ = "vertexai.generative_models"
+
+    def generate_content(self, *args, **kwargs):  # pragma: no cover — never called
+        raise AssertionError("detection must fail before any call is made")
+
+
+class _FakeBedrockStreamRuntime:
+    """Duck-typed bedrock-runtime client whose `converse_stream` returns what
+    the real one does: an ENVELOPE DICT carrying the event stream under
+    "stream" — and, like botocore's own `EventStream`, one that is ITERABLE
+    but NOT an ITERATOR (no `__next__`), which is the shape `_StreamProxy`
+    has to cope with."""
+    __module__ = "botocore.client"
+
+    def __init__(self, events):
+        self.events = events
+        self.kwargs = None
+        self.stream = None      # the real stream object handed back, for assertions
+
+    def converse_stream(self, **kwargs):
+        self.kwargs = kwargs
+        self.stream = _IterableOnly(self.events)
+        return {"ResponseMetadata": {"RequestId": "r-1"}, "stream": self.stream}
+
+
+_FakeBedrockStreamRuntime.__name__ = "BedrockRuntime"
+
+
+class _IterableOnly:
+    """An iterable that is NOT an iterator — `__iter__` only, exactly like
+    `botocore.eventstream.EventStream`. `closed` records whether the proxy's
+    `close()` reached it."""
+
+    def __init__(self, items):
+        self.items = items
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def close(self):
+        self.closed = True
+
+
+def test_wrap_raises_for_the_legacy_vertexai_sdk():
+    """`vertexai.generative_models.GenerativeModel` (the deprecated
+    google-cloud-aiplatform SDK) is NOT supported: it must fail loudly at
+    `wrap()` rather than be swept in with google-genai's Vertex mode, which
+    IS supported and shares nothing with it but a product name. Silently
+    accepting it would record a run with zero blocks — the proto `Content`
+    objects it sends are not the dicts `GeminiAdapter` reads — which is worse
+    than an error, because it looks like capture is working."""
+    t = trace.init("agent", path="unused.ctrace")
+    with pytest.raises(ValueError, match="unrecognized client module"):
+        t.wrap(_FakeLegacyVertexModel())
+
+
+def test_wrap_bedrock_converse_stream_records_usage_and_keeps_the_envelope(tmp_path):
+    """Bedrock's `converse_stream` returns an envelope dict, not a stream.
+    The host must get that SAME envelope back — `ResponseMetadata` intact —
+    with only `["stream"]` proxied, every event passing through untouched,
+    and the call recorded ONCE at completion with the usage carried by the
+    trailing `metadata` event."""
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"text": "hi"}, "contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 7, "outputTokens": 2, "totalTokens": 9}}},
+    ]
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeBedrockStreamRuntime(events)
+    wrapped = t.wrap(client)
+
+    response = wrapped.converse_stream(
+        modelId="anthropic.claude-3-haiku",
+        messages=[{"role": "user", "content": [{"text": "hi"}]}])
+    assert response["ResponseMetadata"] == {"RequestId": "r-1"}   # envelope preserved
+    assert list(response["stream"]) == events                     # events untouched
+    t.close()
+
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"inputTokens": 7, "outputTokens": 2, "totalTokens": 9}
+    assert [b.block.text for b in ct.get_call_blocks(calls[0].id)] == ["hi"]
+    ct.close()
+
+
+def test_wrap_bedrock_converse_stream_close_forwards_and_records(tmp_path):
+    """Closing the proxied stream forwards to the real object's `close()`
+    (releasing the HTTP body) and still records the abandoned call — with
+    only the usage seen so far, which here is none."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeBedrockStreamRuntime([{"messageStart": {"role": "assistant"}}])
+    stream = t.wrap(client).converse_stream(
+        modelId="m", messages=[{"role": "user", "content": [{"text": "hi"}]}])["stream"]
+    stream.close()
+    t.close()
+
+    assert client.stream.closed is True          # close() reached the real object
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage is None
+    ct.close()
+
+
+class _FakeBedrockStreamRuntimeNoStream:
+    """A bedrock-runtime client whose `converse_stream` returns an envelope
+    that does NOT carry the declared `stream` member — an error-shaped
+    response, a future botocore that renames it, a request the service
+    answered without a body. The adapter still DECLARES
+    `stream_envelope_key`, so this is the case where ctxdiff knows an
+    envelope was expected and cannot find the stream inside it."""
+    __module__ = "botocore.client"
+
+    def __init__(self):
+        self.response = {"ResponseMetadata": {"RequestId": "r-1", "HTTPStatusCode": 200}}
+
+    def converse_stream(self, **kwargs):
+        return self.response
+
+
+_FakeBedrockStreamRuntimeNoStream.__name__ = "BedrockRuntime"
+
+
+def test_stream_envelope_without_the_declared_member_reaches_the_host_unwrapped(tmp_path):
+    """FAIL-OPEN, the hard case. When an adapter declares
+    `stream_envelope_key` and the result does NOT carry it, ctxdiff has lost
+    its capture — but the HOST must not lose its response. Wrapping the
+    envelope itself in a stream proxy (which is what happened before) handed
+    the caller an object that is not subscriptable, so the very next line of
+    the host's own code — `response["ResponseMetadata"]` — raised TypeError.
+    A debugger may drop its own data; it may never break the call it is
+    watching."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeBedrockStreamRuntimeNoStream()
+    wrapped = t.wrap(client)
+
+    response = wrapped.converse_stream(
+        modelId="anthropic.claude-3-haiku",
+        messages=[{"role": "user", "content": [{"text": "hi"}]}])
+
+    # The host's OWN object, untouched — not a proxy standing in for it.
+    assert response is client.response
+    assert response["ResponseMetadata"]["RequestId"] == "r-1"
+    assert dict(response) == client.response
+    t.close()
+
+    # ...and capture is silently skipped, rather than recording a call whose
+    # stream was never found.
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    assert ct.get_calls() == []
+    ct.close()
+
+
 class _AnthUsage:
     input_tokens = 5; output_tokens = 2
 class _AnthResp:
@@ -1275,6 +1438,68 @@ def test_async_stream_context_manager_triggers_finalize_on_exit(tmp_path):
     calls = ct.get_calls()
     assert len(calls) == 1
     assert calls[0].usage == {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    ct.close()
+
+
+class _AsyncIterableOnly:
+    """An ASYNC iterable that is NOT an async iterator: `__aiter__` only (a
+    plain method returning a fresh async generator), no `__anext__` — the
+    async mirror of `_IterableOnly`, i.e. of the shape
+    `botocore.eventstream.EventStream` has on the sync side. `aiter_calls`
+    counts how many times the iterator was materialized, so a test can prove
+    it happens exactly ONCE (two would interleave two half-streams over one
+    HTTP body)."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.aiter_calls = 0
+        self.closed = False
+
+    def __aiter__(self):
+        self.aiter_calls += 1
+        chunks = self.chunks
+
+        async def _gen():
+            for chunk in chunks:
+                yield chunk
+
+        return _gen()
+
+    async def close(self):
+        self.closed = True
+
+
+def test_async_stream_that_is_iterable_but_not_an_iterator_is_consumed(tmp_path):
+    """The async counterpart of `_StreamProxy._iterator()`. An async ITERABLE
+    is not necessarily an async ITERATOR: an object may define `__aiter__`
+    (returning a fresh async generator) and no `__anext__` at all — which is
+    exactly the shape botocore's `EventStream` has on the sync side, and the
+    reason the sync proxy materializes `iter(stream)` once. Calling
+    `stream.__anext__()` directly on such an object raises AttributeError
+    before a single chunk reaches the caller, so the async proxy resolves the
+    iterator the same way, once and lazily."""
+    t = trace.init("agent", path=str(tmp_path / "r.ctrace"))
+    client = _FakeAsyncStreamingOpenAI()
+    wrapped = t.wrap(client)
+    chunks = [_StreamChunk("Hi"), _StreamChunk(None, usage=_StreamUsage(4, 2, 6))]
+    stream_obj = _AsyncIterableOnly(chunks)
+    client.chat.completions.next_stream = stream_obj
+
+    async def run():
+        stream = await wrapped.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}],
+            stream=True, stream_options={"include_usage": True})
+        return [c async for c in stream]
+
+    received = asyncio.run(run())
+    assert received == chunks                     # every chunk reached the caller
+    assert stream_obj.aiter_calls == 1            # materialized exactly once
+
+    t.close()
+    ct = CTrace.open(str(tmp_path / "r.ctrace"))
+    calls = ct.get_calls()
+    assert len(calls) == 1
+    assert calls[0].usage == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
     ct.close()
 
 

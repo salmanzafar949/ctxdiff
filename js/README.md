@@ -66,7 +66,7 @@ It's built to sit **alongside** your observability stack, not replace it.
 
 - 🔌 **One-line capture** — `tracer.wrap(client)` records every LLM call's full context, verbatim, into a single-file SQLite `.ctrace`. [Fail-open by design](#fail-open-guarantee): a ctxdiff error can never break your app.
 - 🧬 **Content-hashed block storage** — every message, content part, and tool schema is a deduplicated block; a stable system prompt across 40 turns is stored once.
-- 🌐 **Three provider surfaces** — OpenAI (chat + Responses), Anthropic, and Google Gemini, including streaming and the `.stream()` convenience helpers.
+- 🌐 **Four provider surfaces** — OpenAI (chat + Responses), Anthropic, Google Gemini (AI Studio **and Vertex AI**) — including streaming and the `.stream()` convenience helpers — plus **[LangChain/LangGraph via a callback handler](#langchain--langgraph)**.
 - 🟩🟥🟨 **Git-style turn diffing** — `npx ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **Token attribution** — `npx ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **Prompt-cache profiling** — `npx ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
@@ -76,6 +76,7 @@ It's built to sit **alongside** your observability stack, not replace it.
 
 - 🚦 **Context budgets in CI** — `npx ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas`: assert the budget, exit non-zero when it regresses. Ships as a [GitHub Action](#github-action) that posts the PASS/FAIL table to the job summary — so context size becomes a tracked metric on every pull request, not something you remember to look at.
 - 🖥️ **Self-contained HTML dashboard** — `npx ctxdiff view` / `export`: a one-file, zero-external-request, **three-level** dashboard — every agent in the project, then that agent's sessions (in your local timezone), then its turn-by-turn scrubber, diff panel, token heatmap, cache findings and block inspector — safe to attach to a bug ticket.
+- 🦜 **[LangChain & LangGraph, natively](#langchain--langgraph)** — `callbacks: [tracer.langchainHandler()]`, and every chat-model call in a graph is captured, whatever the provider. The blocks it records are **hash-identical** to wrapping that provider's SDK directly, so traces dedup instead of looking like unrelated contexts. Across SDKs too — except a tool call, whose JSON LangChain itself serializes differently in each language ([note](#what-it-doesnt-do-yet--js-sdk-specifics)).
 - 🏷️ **Semantic tagging** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
 - 🤝 **Multi-agent runs** — `tracer.wrap(client, { agent: "researcher" })` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters `diff`/`tokens`/`cache`/`check` (and names a side of a cross-agent diff), `npx ctxdiff agents` rolls every agent up across a project's sessions, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `configure({ store: new PostgresStore({ dsn }) })` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, the drivers are optional peers, and a dead database degrades capture without ever touching your agent.
@@ -84,10 +85,11 @@ It's built to sit **alongside** your observability stack, not replace it.
 
 **What it doesn't do (yet) — JS SDK specifics:**
 
-- ⏳ **AWS Bedrock** — supported in the Python SDK, not yet ported to JS.
+- ⏳ **AWS Bedrock** — supported in the Python SDK (`converse` **and** `converse_stream`), not yet ported to JS. This SDK ships no Bedrock adapter at all: `wrap()` on a Bedrock client returns it unwrapped with a warning, and a LangChain `ChatBedrock`/`ChatBedrockConverse` call reaching the [callback handler](#langchain--langgraph) is skipped with one warning rather than recorded through some other provider's adapter.
 - ⏳ **Abandoned streams** — a stream you obtain but *never iterate at all* isn't recorded. JS has no deterministic finalizer, and GC-timed `FinalizationRegistry` recording was deliberately avoided; streams that are consumed, broken out of early, errored, or exhausted all record. (In practice you always iterate a stream you asked for.)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent runs.
 - ⏳ **Background recording (local file only)** — writing to the local `.ctrace` is synchronous on the call path (fast, but not zero-cost); a [database backend](#storage-backends) already writes off it, via a serial background writer.
+- ℹ️ **Cross-language LangChain edge: tool calls** — LangChain re-serializes a tool call's arguments with the host language's own JSON serializer, and `JSON.stringify` emits `{"city":"Dubai"}` where Python's `json.dumps` emits `{"city": "Dubai"}`. The handler reproduces its own framework's real request byte for byte (that is the stronger guarantee, and what makes a LangChain trace dedup against a *direct* trace in the same SDK), so a **tool-call block hashes differently in the two SDKs** — as it already would between two direct captures of those same two requests, with no ctxdiff involved. Both hashes are pinned by both suites so the divergence cannot drift. Everything else — messages, system prompts, tool *schemas*, images — is cross-SDK identical.
 - ℹ️ **Cross-language diff edge** — an integer-valued float inside a JSON-Schema numeric keyword (e.g. `default: 3.0`) normalizes as `3` in JS vs `3.0` in Python, so the *same tool schema authored in both SDKs* would hash differently. This affects only a cross-language diff; JS→Python reads are unaffected (readers never re-hash) and single-language dedup is fully consistent. See [`spec/ctrace-schema.md`](../spec/ctrace-schema.md).
 
 ---
@@ -445,7 +447,8 @@ If you *forget* `close()`, your program still **exits normally** — the tracing
 | --- | --- | --- |
 | OpenAI | `openai` | `chat.completions.create` / `.stream()`, `responses.create` / `.stream()`, `stream: true` |
 | Anthropic | `@anthropic-ai/sdk` | `messages.create` (+ `stream: true`), `messages.stream()` |
-| Gemini | `@google/genai` | `models.generateContent`, `models.generateContentStream` |
+| Gemini | `@google/genai` | `models.generateContent`, `models.generateContentStream` (AI Studio and Vertex AI — same client class, same adapter) |
+| LangChain / LangGraph | *any* chat model | via `tracer.langchainHandler()` — see [LangChain & LangGraph](#langchain--langgraph) |
 
 Sync and async clients are both handled. Streaming usage is folded from each provider's own events (OpenAI final-chunk `usage`; Anthropic `message_start` + `message_delta`; Gemini cumulative `usageMetadata`) and recorded once the stream completes. An unrecognized client is returned unwrapped (with a warning), never throwing.
 
@@ -587,6 +590,37 @@ await client.models.generateContent({ model: "gemini-2.0-flash", contents: "hell
   config: { systemInstruction: "be terse" } });
 // streaming: models.generateContentStream({ ... })
 ```
+
+**Vertex AI** is the same client class in Vertex mode, captured by the same adapter with nothing extra to configure — only the endpoint differs, and ctxdiff detects on the client, not the URL:
+
+```ts
+const client = tracer.wrap(new GoogleGenAI({ vertexai: true, project: "my-project", location: "us-central1" }));
+```
+
+### LangChain & LangGraph
+
+LangChain hands you a `ChatOpenAI`, not an `OpenAI`, so there is nothing for `wrap()` to take. Use the **callback handler** instead — LangChain's own extension point:
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+
+const handler = tracer.langchainHandler();
+const llm = new ChatOpenAI({ model: "gpt-4o", callbacks: [handler] });
+await llm.invoke("What's your refund window?");     // captured, with usage
+```
+
+For **LangGraph** — which propagates callbacks through the whole graph — attach it once, at invoke time, and every model call in every node is captured:
+
+```ts
+await graph.invoke(state, { callbacks: [tracer.langchainHandler({ agent: "researcher" })] });
+```
+
+- **Every provider this SDK has an adapter for** — `ChatOpenAI`, `ChatAnthropic`, `ChatVertexAI` and anything else following the interface, each normalized by its own provider's adapter; one handler can serve several models in one run. (A `ChatBedrock*` call is skipped with a warning — no Bedrock adapter here yet.)
+- **Streaming, tool calls, errors** — LangChain reports the finished result either way, so a streamed call records once *with* usage; tool schemas, the assistant's tool call and the tool result all become blocks in the turn that sent them; a failed call is recorded as a failed call.
+- **Multimodal turns keep every part.** A message carrying two text parts and an image is three blocks, with the image hashed over its *bytes* — so the same screenshot is one block whether it arrived through LangChain or through a direct capture, and its vision-token cost shows up in `ctxdiff tokens`. Verified against the real request bodies `@langchain/openai` and `@langchain/google-genai` put on the wire.
+- **Hash identity is the point.** The handler rebuilds the request in the provider's own wire shape and hands it to the *same* adapter the direct path uses, so its blocks are hash-identical to what `tracer.wrap()` records for the same request — checked end to end and against the actual JSON body LangChain sent. Across SDKs, the same prompt through the [Python handler](../README.md#langchain--langgraph) produces the same hashes too, pinned as shared literals by both suites — with one documented exception: a **tool call** (see the cross-language note below).
+
+No LangChain dependency is added: the handler is returned as a plain `CallbackHandlerMethods` object, which `callbacks: [...]` accepts directly.
 
 ---
 
