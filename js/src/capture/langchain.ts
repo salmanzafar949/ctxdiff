@@ -25,7 +25,8 @@
  * `toWire()` rebuilds the request object LangChain itself is about to send
  * (verified against real request bodies — see `test/langchain.test.ts`), and
  * that object goes to the very same `OpenAIAdapter`/`AnthropicAdapter`/
- * `GeminiAdapter` the direct path uses. That includes multimodal content: a
+ * `GeminiAdapter`/`BedrockAdapter` the direct path uses. That includes
+ * multimodal content: a
  * message's parts are rebuilt ONE PER ENTRY (see `wireParts`), so an image
  * reaches the adapter as an image and is hashed over its bytes exactly as a
  * direct capture's would be.
@@ -410,6 +411,62 @@ function geminiWire(messages: unknown[]): Dict {
 }
 
 /**
+ * LangChain messages -> Bedrock Converse `system` + `messages`.
+ *
+ * Converse takes system prompts as a list of `{text}` blocks and every
+ * message's content as a list of typed blocks, with tool calls as `toolUse`
+ * and results as `toolResult` inside a USER-role message (the Converse API has
+ * no tool role) — the shapes `BedrockAdapter` reads.
+ *
+ * Message content becomes one block per content entry (`wireParts`) — the real
+ * wire carries `[{text: "a"}, {text: "b"}, {image: {...}}]` for a
+ * two-text-plus-image turn, so the recorded blocks must too. Mirrors Python
+ * `_bedrock_wire`.
+ */
+function bedrockWire(messages: unknown[]): Dict {
+  const system: Dict[] = [];
+  const out: Dict[] = [];
+  for (const message of messages) {
+    const m = message as { content?: unknown; tool_calls?: unknown; tool_call_id?: unknown };
+    const role = roleOf(message);
+    if (role === "system") {
+      system.push({ text: textOf(m?.content) });
+      continue;
+    }
+    if (role === "tool") {
+      out.push({
+        role: "user",
+        content: [
+          {
+            toolResult: {
+              toolUseId: m?.tool_call_id ?? null,
+              content: [{ text: textOf(m?.content) }],
+            },
+          },
+        ],
+      });
+      continue;
+    }
+    const blocks: unknown[] = wireParts(m?.content);
+    if (role === "assistant" && Array.isArray(m?.tool_calls)) {
+      for (const call of m.tool_calls as Dict[]) {
+        blocks.push({
+          toolUse: {
+            toolUseId: call["id"],
+            name: call["name"],
+            input: call["args"] ?? {},
+          },
+        });
+      }
+    }
+    out.push({ role, content: blocks });
+  }
+  const wire: Dict = { messages: out };
+  if (system.length > 0) wire["system"] = system;
+  return wire;
+}
+
+/**
  * Rebuild the request object LangChain is about to send, in `provider`'s own
  * wire shape — the single function the whole hash-identity promise rests on.
  *
@@ -446,6 +503,9 @@ export function toWire(
       config["tools"] = tools;
       wire["config"] = config;
     }
+  } else if (provider === "bedrock") {
+    wire = bedrockWire(messages);
+    if (tools) wire["toolConfig"] = { tools };
   } else {
     wire = { messages: openaiMessages(messages) };
     if (tools) wire["tools"] = tools;
@@ -626,10 +686,11 @@ export function buildHandler(
     const provider = providerFor(serialized, metadata);
     const recorder = tracer.recorderFor(provider);
     if (recorder == null) {
-      // A provider this SDK has no adapter for (today: Bedrock, which the
-      // Python SDK captures and this one does not). Recording it through some
-      // other provider's adapter would store blocks that never went on the
-      // wire, so the call is skipped — once, loudly, then silently.
+      // A provider this SDK has no adapter for. All four `LS_PROVIDERS` map to
+      // one now (openai / anthropic / gemini / bedrock), so in practice this is
+      // reached only when the run's STORE could not be opened. Recording
+      // through some other provider's adapter would store blocks that never
+      // went on the wire, so the call is skipped — once, loudly, then silently.
       if (!warnedNoAdapter) {
         warnedNoAdapter = true;
         console.warn(

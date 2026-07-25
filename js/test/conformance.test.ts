@@ -12,7 +12,9 @@ import { rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import OpenAI from "openai";
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { init } from "../src/trace.js";
 import { CTrace } from "../src/store/ctrace.js";
 import { Recorder } from "../src/capture/recorder.js";
@@ -568,6 +570,204 @@ print(json.dumps(out))
       expect(new Set([hashOf(0), hashOf(1), hashOf(last - 2), hashOf(last - 1)]).size).toBe(4);
       // …while the clamped monster header degrades to a bare, costless image.
       expect(js[last]).toEqual(["[image]", js[last]![1], 0, "estimate"]);
+    },
+  );
+});
+
+
+/**
+ * Cross-SDK BEDROCK conformance — the acceptance criterion for the JS Bedrock
+ * adapter, and the reason it is a PORT of the Python one rather than a
+ * re-derivation.
+ *
+ * The two SDKs get to Bedrock by completely different routes: boto3 exposes
+ * `client.converse(...)` as a method and hands the adapter a plain dict of
+ * kwargs; the AWS SDK v3 exposes one `client.send(command)` and hides the same
+ * payload on `command.input`. The Converse WIRE SHAPE underneath is identical,
+ * so the blocks — and therefore the hashes — must be too. If they are not, a
+ * team running a Python service and a Node service against the same model sees
+ * every shared system prompt as two different blocks, and `ctxdiff diff` stops
+ * meaning anything across the pair.
+ *
+ * So this drives the REAL `@aws-sdk/client-bedrock-runtime` client through the
+ * real interceptor into a real `.ctrace`, then asks the REAL Python adapter for
+ * the same request's blocks and compares the stored hashes. It covers the three
+ * shapes most likely to drift: a system block, a tool schema (stable JSON, two
+ * different serializers), and an IMAGE (hashed over decoded bytes that arrive
+ * as a `Uint8Array` here and as `bytes` there).
+ */
+describe("cross-language conformance (a Bedrock Converse request hashes identically)", () => {
+  const hasVenv = existsSync(venvPython);
+
+  it.skipIf(!hasVenv)(
+    "the JS SDK's captured blocks equal the Python adapter's, hash for hash",
+    async () => {
+      // A 4×4 PNG, base64 — the same picture both sides will hash, shipped as
+      // base64 so it survives the JSON hop and is turned back into each
+      // language's own byte type before either adapter sees it.
+      const PNG_4x4_B64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAC0lEQVR4nGNgYAAAAAMAAbitOmMAAAAASUVORK5CYII=";
+
+      // ONE logical Converse request, in the shape BOTH SDKs put on the wire.
+      const request = {
+        modelId: "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        system: [{ text: "You are a terse assistant." }, { cachePoint: { type: "default" } }],
+        toolConfig: {
+          tools: [
+            {
+              toolSpec: {
+                name: "get_weather",
+                description: "Look up the weather for a city.",
+                inputSchema: {
+                  json: {
+                    type: "object",
+                    properties: { city: { type: "string" }, unit: { type: "string" } },
+                    required: ["city"],
+                  },
+                },
+              },
+            },
+          ],
+        },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { text: "What is in this picture, and what is the weather there?" },
+              { image: { format: "png", source: { bytes: PNG_4x4_B64 } } },
+            ],
+          },
+          {
+            role: "assistant",
+            content: [
+              { toolUse: { toolUseId: "tooluse_1", name: "get_weather", input: { city: "Dubai" } } },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { toolResult: { toolUseId: "tooluse_1", content: [{ text: "42°C" }] } },
+            ],
+          },
+        ],
+        inferenceConfig: { maxTokens: 512, temperature: 0.2 },
+      };
+
+      const path = join(tmpdir(), `ctxdiff-bedrock-${randomUUID()}.ctrace`);
+      try {
+        // --- the JS half: the REAL AWS SDK client, the REAL interceptor ------
+        // The image arrives as the Uint8Array the AWS SDK actually carries.
+        const jsRequest = structuredClone(request);
+        jsRequest.messages[0]!.content[1]!.image!.source.bytes = new Uint8Array(
+          Buffer.from(PNG_4x4_B64, "base64"),
+        ) as never;
+
+        const client = new BedrockRuntimeClient({
+          region: "us-east-1",
+          credentials: { accessKeyId: "x", secretAccessKey: "y" },
+          requestHandler: {
+            handle: async () => ({
+              response: {
+                statusCode: 200,
+                reason: "OK",
+                headers: { "content-type": "application/json" },
+                body: Readable.from([
+                  Buffer.from(
+                    JSON.stringify({
+                      output: { message: { role: "assistant", content: [{ text: "hot" }] } },
+                      stopReason: "end_turn",
+                      usage: { inputTokens: 40, outputTokens: 3, totalTokens: 43 },
+                    }),
+                  ),
+                ]),
+              },
+            }),
+            updateHttpClientConfig(): void {},
+            httpHandlerConfigs: () => ({}),
+          } as never,
+        });
+        const tracer = init("bedrock-conformance", { path });
+        const wrapped = tracer.wrap(client) as BedrockRuntimeClient;
+        await wrapped.send(new ConverseCommand(jsRequest as never));
+        await tracer.close();
+
+        const ct = CTrace.open(path);
+        const calls = ct.getCalls();
+        expect(calls).toHaveLength(1);
+        const js = ct
+          .getCallBlocks(calls[0]!.id)
+          .map((cb) => [cb.block.role, cb.block.kind, cb.block.text, cb.block.contentHash]);
+        const jsParams = calls[0]!.params;
+        const jsUsage = calls[0]!.usage;
+        ct.close();
+
+        // --- the Python half: the REAL BedrockAdapter -------------------------
+        // The payload travels as a JSON argument (never interpolated into
+        // source, so nothing in it can change the program being run) and the
+        // image is turned back into the `bytes` boto3 would have handed over.
+        const pyScript = `
+import base64, json, sys
+from ctxdiff.capture.bedrock import BedrockAdapter
+from ctxdiff.models import content_hash
+
+kwargs = json.loads(sys.argv[1])
+for message in kwargs.get("messages", []):
+    for part in message.get("content", []):
+        source = (part.get("image") or {}).get("source") if isinstance(part, dict) else None
+        if isinstance(source, dict) and isinstance(source.get("bytes"), str):
+            source["bytes"] = base64.b64decode(source["bytes"])
+
+adapter = BedrockAdapter()
+blocks = [
+    [b.role, b.kind, b.text,
+     content_hash(b.role, b.kind, b.hash_input if b.hash_input is not None else b.text)]
+    for b in adapter.extract_blocks(kwargs)
+]
+response = {"usage": {"inputTokens": 40, "outputTokens": 3, "totalTokens": 43}}
+print(json.dumps({"blocks": blocks,
+                  "params": adapter.extract_params(kwargs),
+                  "usage": adapter.extract_usage(response)}))
+`;
+        const proc = spawnSync(venvPython, ["-c", pyScript, JSON.stringify(request)], {
+          encoding: "utf8",
+          env: { ...process.env, PYTHONPATH: pySrc },
+        });
+        expect(
+          proc.status,
+          `python bedrock extraction failed (status ${proc.status}):\n${proc.stderr}`,
+        ).toBe(0);
+        const py = JSON.parse(proc.stdout) as {
+          blocks: unknown[][];
+          params: Record<string, unknown>;
+          usage: Record<string, unknown>;
+        };
+
+        // THE ASSERTION. Same roles, same kinds, same stored text, same hashes —
+        // compared as one array so a failure names every divergence at once.
+        expect(js).toEqual(py.blocks);
+        // ...and the params/usage a `.ctrace` carries alongside them.
+        expect(jsParams).toEqual(py.params);
+        expect(jsUsage).toEqual(py.usage);
+
+        // The agreement is not vacuous: all five block shapes really are there,
+        // in send order, and the image really was hashed over its BYTES rather
+        // than serialized (its stored text is a descriptor, and no two blocks
+        // collide).
+        expect(js.map((b) => `${b[0]}/${b[1]}`)).toEqual([
+          "system/message",
+          "system/message",
+          "system/tool_schema",
+          "user/content_part",
+          "user/image",
+          "assistant/content_part",
+          "user/content_part",
+        ]);
+        expect(js[4]![2]).toBe("[image 4×4 · ~1 tok]");
+        expect(String(js[4]![3])).not.toBe(String(js[3]![3]));
+        expect(new Set(js.map((b) => b[3])).size).toBe(js.length);
+      } finally {
+        rmSync(path, { force: true });
+      }
     },
   );
 });

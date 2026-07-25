@@ -66,7 +66,7 @@ It's built to sit **alongside** your observability stack, not replace it.
 
 - 🔌 **One-line capture** — `tracer.wrap(client)` records every LLM call's full context, verbatim, into a single-file SQLite `.ctrace`. [Fail-open by design](#fail-open-guarantee): a ctxdiff error can never break your app.
 - 🧬 **Content-hashed block storage** — every message, content part, and tool schema is a deduplicated block; a stable system prompt across 40 turns is stored once.
-- 🌐 **Four provider surfaces** — OpenAI (chat + Responses), Anthropic, Google Gemini (AI Studio **and Vertex AI**) — including streaming and the `.stream()` convenience helpers — plus **[LangChain/LangGraph via a callback handler](#langchain--langgraph)**.
+- 🌐 **Five provider surfaces** — OpenAI (chat + Responses), Anthropic, Google Gemini (AI Studio **and Vertex AI**), AWS Bedrock (Converse, streaming included) — including streaming and the `.stream()` convenience helpers — plus **[LangChain/LangGraph via a callback handler](#langchain--langgraph)**. Same coverage as the Python SDK, and the same request hashes identically in either.
 - 🟩🟥🟨 **Git-style turn diffing** — `npx ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **Token attribution** — `npx ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **Prompt-cache profiling** — `npx ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
@@ -85,7 +85,6 @@ It's built to sit **alongside** your observability stack, not replace it.
 
 **What it doesn't do (yet) — JS SDK specifics:**
 
-- ⏳ **AWS Bedrock** — supported in the Python SDK (`converse` **and** `converse_stream`), not yet ported to JS. This SDK ships no Bedrock adapter at all: `wrap()` on a Bedrock client returns it unwrapped with a warning, and a LangChain `ChatBedrock`/`ChatBedrockConverse` call reaching the [callback handler](#langchain--langgraph) is skipped with one warning rather than recorded through some other provider's adapter.
 - ⏳ **Abandoned streams** — a stream you obtain but *never iterate at all* isn't recorded. JS has no deterministic finalizer, and GC-timed `FinalizationRegistry` recording was deliberately avoided; streams that are consumed, broken out of early, errored, or exhausted all record. (In practice you always iterate a stream you asked for.)
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent runs.
 - ⏳ **Background recording (local file only)** — writing to the local `.ctrace` is synchronous on the call path (fast, but not zero-cost); a [database backend](#storage-backends) already writes off it, via a serial background writer.
@@ -448,9 +447,12 @@ If you *forget* `close()`, your program still **exits normally** — the tracing
 | OpenAI | `openai` | `chat.completions.create` / `.stream()`, `responses.create` / `.stream()`, `stream: true` |
 | Anthropic | `@anthropic-ai/sdk` | `messages.create` (+ `stream: true`), `messages.stream()` |
 | Gemini | `@google/genai` | `models.generateContent`, `models.generateContentStream` (AI Studio and Vertex AI — same client class, same adapter) |
+| AWS Bedrock | `@aws-sdk/client-bedrock-runtime` | `send(new ConverseCommand(...))` and `send(new ConverseStreamCommand(...))` — see [AWS Bedrock](#aws-bedrock) |
 | LangChain / LangGraph | *any* chat model | via `tracer.langchainHandler()` — see [LangChain & LangGraph](#langchain--langgraph) |
 
-Sync and async clients are both handled. Streaming usage is folded from each provider's own events (OpenAI final-chunk `usage`; Anthropic `message_start` + `message_delta`; Gemini cumulative `usageMetadata`) and recorded once the stream completes. An unrecognized client is returned unwrapped (with a warning), never throwing.
+Sync and async clients are both handled. Streaming usage is folded from each provider's own events (OpenAI final-chunk `usage`; Anthropic `message_start` + `message_delta`; Gemini cumulative `usageMetadata`; Bedrock's single trailing `metadata` event) and recorded once the stream completes. An unrecognized client is returned unwrapped (with a warning), never throwing.
+
+None of these SDKs is a dependency of `ctxdiff` — they are **optional peers**, detected by duck-typing whatever you pass. `npm i ctxdiff` still installs exactly one runtime dependency (`gpt-tokenizer`).
 
 ---
 
@@ -597,6 +599,35 @@ await client.models.generateContent({ model: "gemini-2.0-flash", contents: "hell
 const client = tracer.wrap(new GoogleGenAI({ vertexai: true, project: "my-project", location: "us-central1" }));
 ```
 
+### AWS Bedrock
+
+```ts
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+
+const client = tracer.wrap(new BedrockRuntimeClient({ region: "us-east-1" }));
+await client.send(new ConverseCommand({
+  modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+  system: [{ text: "You are a support agent." }],
+  messages: [{ role: "user", content: [{ text: "What's your refund window?" }] }],
+  inferenceConfig: { maxTokens: 256 },
+}));
+```
+
+`ConverseStreamCommand` takes the identical request shape and is captured the same way — including usage, which Bedrock reports once, on the single trailing `metadata` event:
+
+```ts
+const { stream } = await client.send(new ConverseStreamCommand({ modelId, messages }));
+for await (const event of stream) { /* every event, unchanged, in order */ }
+```
+
+Three things worth knowing:
+
+- **The AWS SDK v3 has one method, not one per operation.** Everything goes through `client.send(command)`, so ctxdiff hooks `send` and dispatches on the *command*: `ConverseCommand` and `ConverseStreamCommand` are recorded from `command.input`, and **every other command passes straight through, unrecorded and silently** — `InvokeModelCommand` carries a raw provider-specific `body` string rather than the Converse shape, and embeddings/guardrail calls aren't context at all. One client can serve Converse and embeddings side by side without a line of log noise.
+- **The streaming call returns an envelope**, `{ $metadata, stream }`, not the stream itself. ctxdiff proxies only the `stream` member and hands the rest of the object back untouched, so `response.$metadata` still works exactly as it would unwrapped. If the envelope has no `stream` at all, you get your own object back, unwrapped — capture is lost there, your call is not.
+- **The same request hashes identically in Python.** The Converse wire shape is the same in both SDKs, so a `.ctrace` written here dedups against one written by `boto3` — pinned by a conformance test that runs the *real* Python adapter over the same payload (system blocks, tool schemas and an image included) and compares hashes.
+
+Detection keys off the client (its class name, or the resolved config's `serviceId`), never the URL — and deliberately narrowly: other AWS SDK v3 clients share the same `{send, config}` shape and are left completely alone.
+
 ### LangChain & LangGraph
 
 LangChain hands you a `ChatOpenAI`, not an `OpenAI`, so there is nothing for `wrap()` to take. Use the **callback handler** instead — LangChain's own extension point:
@@ -615,9 +646,9 @@ For **LangGraph** — which propagates callbacks through the whole graph — att
 await graph.invoke(state, { callbacks: [tracer.langchainHandler({ agent: "researcher" })] });
 ```
 
-- **Every provider this SDK has an adapter for** — `ChatOpenAI`, `ChatAnthropic`, `ChatVertexAI` and anything else following the interface, each normalized by its own provider's adapter; one handler can serve several models in one run. (A `ChatBedrock*` call is skipped with a warning — no Bedrock adapter here yet.)
+- **Every provider** — `ChatOpenAI`, `ChatAnthropic`, `ChatVertexAI`, `ChatBedrockConverse` and anything else following the interface, each normalized by its own provider's adapter; one handler can serve several models in one run. All four branches are live and each is verified against the real integration's request body, so the JS handler now covers exactly what the Python one does.
 - **Streaming, tool calls, errors** — LangChain reports the finished result either way, so a streamed call records once *with* usage; tool schemas, the assistant's tool call and the tool result all become blocks in the turn that sent them; a failed call is recorded as a failed call.
-- **Multimodal turns keep every part.** A message carrying two text parts and an image is three blocks, with the image hashed over its *bytes* — so the same screenshot is one block whether it arrived through LangChain or through a direct capture, and its vision-token cost shows up in `ctxdiff tokens`. Verified against the real request bodies `@langchain/openai` and `@langchain/google-genai` put on the wire.
+- **Multimodal turns keep every part.** A message carrying two text parts and an image is three blocks, with the image hashed over its *bytes* — so the same screenshot is one block whether it arrived through LangChain or through a direct capture, and its vision-token cost shows up in `ctxdiff tokens`. Verified against the real request bodies `@langchain/openai`, `@langchain/google-genai` and `@langchain/aws` put on the wire.
 - **Hash identity is the point.** The handler rebuilds the request in the provider's own wire shape and hands it to the *same* adapter the direct path uses, so its blocks are hash-identical to what `tracer.wrap()` records for the same request — checked end to end and against the actual JSON body LangChain sent. Across SDKs, the same prompt through the [Python handler](../README.md#langchain--langgraph) produces the same hashes too, pinned as shared literals by both suites — with one documented exception: a **tool call** (see the cross-language note below).
 
 No LangChain dependency is added: the handler is returned as a plain `CallbackHandlerMethods` object, which `callbacks: [...]` accepts directly.

@@ -42,10 +42,11 @@
  * here changes.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Adapter } from "./capture/base.js";
+import type { Adapter, CallShape } from "./capture/base.js";
 import { OpenAIAdapter } from "./capture/openai.js";
 import { AnthropicAdapter } from "./capture/anthropic.js";
 import { GeminiAdapter } from "./capture/gemini.js";
+import { BedrockAdapter } from "./capture/bedrock.js";
 import { buildHandler, type CtxdiffCallbackHandler } from "./capture/langchain.js";
 import { Recorder, type RedactHook } from "./capture/recorder.js";
 import type {
@@ -143,12 +144,33 @@ function detectGemini(client: unknown): boolean {
   return typeof c.models?.generateContent === "function";
 }
 
+/**
+ * Recognize an `@aws-sdk/client-bedrock-runtime` client: by class name, or by
+ * the resolved config's `serviceId` — which the SDK's own runtime config sets
+ * to `"Bedrock Runtime"` and which therefore survives a bundler mangling the
+ * class name.
+ *
+ * DELIBERATELY NARROW, unlike the other three detectors. Every AWS SDK v3
+ * client is `{ send(command), config, middlewareStack }`, so duck-typing `send`
+ * would claim S3, DynamoDB and SQS clients too — wrapping them would add a
+ * proxy and a per-call `interpretCall` to code paths that can never produce a
+ * context block. `serviceId` is the narrowest signal the SDK publishes, and a
+ * non-Bedrock client simply falls through to unrecognized (returned unwrapped).
+ */
+function detectBedrock(client: unknown): boolean {
+  if (client == null || typeof client !== "object") return false;
+  if (ctorName(client) === "BedrockRuntimeClient") return true;
+  const c = client as { send?: unknown; config?: { serviceId?: unknown } };
+  return typeof c.send === "function" && c.config?.serviceId === "Bedrock Runtime";
+}
+
 // The single extension point. Order matters only to disambiguate overlapping
-// duck-types; these three are mutually exclusive (distinct resource shapes).
+// duck-types; these four are mutually exclusive (distinct resource shapes).
 const REGISTRY: ProviderEntry[] = [
   { provider: "openai", detect: detectOpenAI, make: () => new OpenAIAdapter() },
   { provider: "anthropic", detect: detectAnthropic, make: () => new AnthropicAdapter() },
   { provider: "gemini", detect: detectGemini, make: () => new GeminiAdapter() },
+  { provider: "bedrock", detect: detectBedrock, make: () => new BedrockAdapter() },
 ];
 
 /** Options for `init`. */
@@ -892,10 +914,11 @@ export class Tracer {
    * `CallbackHandlerMethods` shape, so no LangChain import (or dependency) is
    * involved. Fail-open throughout, like the rest of capture.
    *
-   * LIMITATION, stated rather than hidden: a call to a provider this SDK has no
-   * adapter for (Bedrock — the Python SDK captures it, this one does not) is
-   * skipped with one warning rather than recorded through some other
-   * provider's adapter.
+   * All four provider branches are live — ChatOpenAI, ChatAnthropic,
+   * ChatGoogleGenerativeAI/ChatVertexAI and ChatBedrockConverse — so one
+   * handler covers a multi-provider graph. A call whose provider this SDK
+   * genuinely has no adapter for is skipped with one warning rather than
+   * recorded through some other provider's adapter.
    */
   langchainHandler(opts: WrapOptions = {}): CtxdiffCallbackHandler {
     return buildHandler(this, opts.agent ?? null);
@@ -1317,10 +1340,39 @@ function makeInterceptor(
     last !== "stream" && last.toLowerCase().endsWith("stream");
 
   return function interceptor(...args: unknown[]): unknown {
-    const kwargs =
+    // WHAT IS THIS CALL? Two answers, and the adapter gets first refusal.
+    //
+    // The default (OpenAI/Anthropic/Gemini): the method PATH already named the
+    // operation, so the first argument is the request payload and streaming is
+    // read off the path plus a `stream: true` kwarg.
+    //
+    // The adapter override (`interpretCall`, today only Bedrock): the AWS SDK
+    // v3 routes every operation through one `client.send(command)`, so both the
+    // operation and the payload live on the argument. The adapter answers "is
+    // this recordable, what is its payload, does it stream" — and a NULL answer
+    // (an `InvokeModelCommand`, an embeddings call) makes this a transparent
+    // pass-through: the real method runs with the host's own arguments, its
+    // result and any rejection reach the host exactly as they would have, and
+    // nothing at all is recorded.
+    //
+    // Fail-open: an `interpretCall` that THROWS is treated as that same
+    // pass-through. A broken adapter costs capture for the call, never the call.
+    let kwargs =
       args[0] && typeof args[0] === "object"
         ? (args[0] as Record<string, unknown>)
         : {};
+    let interpretedStreaming: boolean | null = null;
+    if (ctx.adapter.interpretCall !== undefined) {
+      let shape: CallShape | null = null;
+      try {
+        shape = ctx.adapter.interpretCall(args, path);
+      } catch {
+        shape = null;
+      }
+      if (shape === null) return realFn(...args);
+      kwargs = shape.kwargs;
+      interpretedStreaming = shape.streaming;
+    }
     const start = performance.now();
 
     // Snapshot this call's attribution SYNCHRONOUSLY, on the calling side, before
@@ -1330,10 +1382,12 @@ function makeInterceptor(
     // never re-read after an await. Drains the one-shot pending tags.
     const { tags, step } = ctx.tracer.consumeContext();
 
-    // Streaming if: a `.stream()` helper, a named streaming method (Gemini), or
-    // the caller's own `stream:true` kwarg. Any of these routes to the stream
+    // Streaming if the adapter said so (Bedrock's `ConverseStreamCommand`), or
+    // else: a `.stream()` helper, a named streaming method (Gemini), or the
+    // caller's own `stream:true` kwarg. Any of these routes to the stream
     // proxy, whose record is DEFERRED until the stream finishes iterating.
-    const streaming = isStreamHelper || isNamedStreamMethod || !!kwargs["stream"];
+    const streaming =
+      interpretedStreaming ?? (isStreamHelper || isNamedStreamMethod || !!kwargs["stream"]);
 
     // Snapshot the request NOW for the deferred streaming record, on the SAME
     // tick as consumeContext() — before the stream is handed back. The proxy
@@ -1379,7 +1433,7 @@ function makeInterceptor(
       // but with the tags/step SNAPSHOTTED above (not re-read post-await).
       return result.then(
         (resolved: unknown) => {
-          if (streaming) return wrapStream(resolved, streamKwargs, ctx, start, tags, step);
+          if (streaming) return wrapStreamResult(resolved, streamKwargs, ctx, start, tags, step);
           const latencyMs = Math.round(performance.now() - start);
           ctx.tracer.onCreate({
             kwargs,
@@ -1411,7 +1465,7 @@ function makeInterceptor(
     }
 
     // Synchronous return — the `.stream()` helper hands back its stream directly.
-    if (streaming) return wrapStream(result, streamKwargs, ctx, start, tags, step);
+    if (streaming) return wrapStreamResult(result, streamKwargs, ctx, start, tags, step);
 
     // Non-streaming sync return (unusual for openai) — record now.
     const latencyMs = Math.round(performance.now() - start);
@@ -1427,6 +1481,63 @@ function makeInterceptor(
     });
     return result;
   };
+}
+
+/**
+ * Return what the host should get back from a streaming call: either the stream
+ * proxy itself, or — for a provider whose streaming call resolves to an
+ * ENVELOPE around the stream — that same envelope with only its stream member
+ * proxied.
+ *
+ * Every provider but one hands back the iterator directly, so `wrapStream` is
+ * the whole story. Bedrock's `ConverseStreamCommand` does not: it resolves to
+ * `{ $metadata: {...}, stream: AsyncIterable }`, and proxying THAT would wrap a
+ * non-iterable — the host's `response.stream` would come back unwrapped and
+ * nothing would ever be recorded. An adapter declares the member by name via
+ * the optional `streamEnvelopeKey` (see `BedrockAdapter`); when it is present
+ * and the result really carries that key, the envelope is SHALLOW-COPIED (never
+ * mutated — the host's object is not ours to alter) with the stream member
+ * replaced by its proxy, so `$metadata` and every other member reach the caller
+ * untouched.
+ *
+ * Fail-open: anything unexpected here falls back to returning the host's own
+ * result UNWRAPPED. Capture is lost for that call; the host's stream is not.
+ *
+ * That fallback is why the two "no proxy from an envelope" conditions are
+ * SEPARATE checks rather than one. No declared key means this provider hands
+ * the stream back directly, so the result IS the stream and proxying it is
+ * correct. A declared key the result does NOT carry means the opposite: an
+ * envelope was expected and the stream is not where it should be (an
+ * error-shaped response, an SDK that renamed the member), so there is nothing
+ * iterable to proxy — and wrapping the envelope anyway would hand the host a
+ * stream proxy where its own next line reads `response.$metadata`. Mirrors
+ * Python's `_wrap_stream_result`, including that distinction, which is the
+ * fail-open fix that shipped with the Python envelope support.
+ */
+function wrapStreamResult(
+  result: unknown,
+  kwargs: Record<string, unknown>,
+  ctx: WrapContext,
+  start: number,
+  tags: [string, string][],
+  step: string | null,
+): unknown {
+  const key = ctx.adapter.streamEnvelopeKey;
+  if (key === undefined) return wrapStream(result, kwargs, ctx, start, tags, step);
+  try {
+    if (result == null || typeof result !== "object" || !(key in result)) return result;
+    const envelope = result as Record<string, unknown>;
+    return {
+      ...envelope,
+      [key]: wrapStream(envelope[key], kwargs, ctx, start, tags, step),
+    };
+  } catch (err) {
+    console.warn(
+      "ctxdiff: failed to wrap a streamed response; this call will not be recorded",
+      err,
+    );
+    return result;
+  }
 }
 
 /**

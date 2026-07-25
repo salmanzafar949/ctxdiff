@@ -119,7 +119,6 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 **What it doesn't do (yet):**
 
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
-- ⏳ **A JS Bedrock adapter** — Bedrock (`converse` and `converse_stream`) is Python-only; the JS SDK returns a Bedrock client unwrapped, with a warning, rather than guessing.
 
 See [The CLI](#the-cli) below for every subcommand, with real sample output.
 
@@ -1162,7 +1161,7 @@ Estimates are always labeled as such — never presented as exact. If `tiktoken`
 
 ## Provider recipes
 
-> **Python** below. For **JavaScript/TypeScript** — OpenAI (chat + Responses), Anthropic, Gemini, and **LangChain/LangGraph via the same callback handler** — see the **[JS SDK README → Provider recipes](js/README.md#provider-recipes)**. (Bedrock is Python-only: the JS SDK ships no Bedrock adapter.)
+> **Python** below. For **JavaScript/TypeScript** — OpenAI (chat + Responses), Anthropic, Gemini, AWS Bedrock (Converse, streaming included), and **LangChain/LangGraph via the same callback handler** — see the **[JS SDK README → Provider recipes](js/README.md#provider-recipes)**. Every provider is now captured by both SDKs, and the same request hashes identically in either.
 
 ### OpenAI
 
@@ -1268,6 +1267,8 @@ client.converse(
 ```
 
 `client.converse_stream(...)` takes the identical request shape and is captured the same way — see [Streaming usage](#streaming-usage) for the one difference (it returns an envelope containing the event stream, not the stream itself).
+
+> **In JavaScript**, the same Converse request is captured through `@aws-sdk/client-bedrock-runtime` — see the **[JS SDK README → AWS Bedrock](js/README.md#aws-bedrock)**. The AWS SDK v3 has one method (`client.send(new ConverseCommand(...))`) instead of one per operation, so the JS SDK hooks `send` and dispatches on the command; the request shape underneath is the same, so **the same logical call hashes identically in both SDKs** (pinned by a cross-SDK conformance test that runs the real Python adapter against the JS capture).
 
 ### Open-source models
 
@@ -1378,7 +1379,7 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: **live tail** (a dashboard that updates while the agent is still running) and a **Bedrock adapter for the JS SDK** — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`, and an opt-in exact pre-flight token count via Anthropic's and Gemini's `count_tokens` endpoints).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: **live tail** (a dashboard that updates while the agent is still running) — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`, and an opt-in exact pre-flight token count via Anthropic's and Gemini's `count_tokens` endpoints).
 
 Anything else you need is worth [opening an issue](https://github.com/salmanzafar949/ctxdiff/issues) for — the roadmap is short on purpose, and what real users hit beats what the maintainer guessed.
 

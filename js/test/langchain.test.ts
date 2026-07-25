@@ -26,8 +26,11 @@ import { rmSync } from "node:fs";
 import OpenAI from "openai";
 import { ChatOpenAI } from "@langchain/openai";
 import { tool } from "@langchain/core/tools";
-import { AIMessage, HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatBedrockConverse } from "@langchain/aws";
+import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
+import { Readable } from "node:stream";
 import { END, START, StateGraph } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { z } from "zod";
@@ -36,6 +39,7 @@ import { CTrace } from "../src/store/ctrace.js";
 import { buildBlock } from "../src/capture/recorder.js";
 import { OpenAIAdapter } from "../src/capture/openai.js";
 import { GeminiAdapter } from "../src/capture/gemini.js";
+import { BedrockAdapter } from "../src/capture/bedrock.js";
 import { providerFor, toWire, usageState } from "../src/capture/langchain.js";
 
 /** A 4×4 PNG, base64 — byte-identical to the one the Python suite's
@@ -161,6 +165,52 @@ function geminiHashes(body: Record<string, unknown>): string[] {
   return new GeminiAdapter()
     .extractBlocks(kwargs)
     .map((rb) => buildBlock(rb, "gemini").contentHash);
+}
+
+/** The hashes a direct capture of a Bedrock Converse request body would store.
+ * The wire body IS the adapter's input for Converse (unlike Gemini, which needs
+ * a REST-body translation), so no massaging is involved: what @langchain/aws
+ * sent is handed straight to the same adapter `tracer.wrap(client)` uses. */
+function bedrockHashes(body: Record<string, unknown>): string[] {
+  return new BedrockAdapter()
+    .extractBlocks(body)
+    .map((rb) => buildBlock(rb, "bedrock").contentHash);
+}
+
+/**
+ * A real `BedrockRuntimeClient` whose transport is stubbed, for injecting into
+ * `ChatBedrockConverse({ client })` — the integration's own supported seam
+ * (@langchain/aws takes no custom fetch, and the AWS SDK does not use fetch on
+ * Node anyway). Every request body it sees is pushed into `sent`.
+ */
+function bedrockStubClient(sent: Record<string, unknown>[]): BedrockRuntimeClient {
+  return new BedrockRuntimeClient({
+    region: "us-east-1",
+    credentials: { accessKeyId: "x", secretAccessKey: "y" },
+    requestHandler: {
+      handle: async (request: { body?: unknown }) => {
+        sent.push(JSON.parse(String(request.body ?? "{}")));
+        return {
+          response: {
+            statusCode: 200,
+            reason: "OK",
+            headers: { "content-type": "application/json" },
+            body: Readable.from([
+              Buffer.from(
+                JSON.stringify({
+                  output: { message: { role: "assistant", content: [{ text: "42°C" }] } },
+                  stopReason: "end_turn",
+                  usage: { inputTokens: 12, outputTokens: 6, totalTokens: 18 },
+                }),
+              ),
+            ]),
+          },
+        };
+      },
+      updateHttpClientConfig(): void {},
+      httpHandlerConfigs: () => ({}),
+    } as never,
+  });
 }
 
 /** A canned Gemini `generateContent` response body, the same shape the Python
@@ -402,6 +452,70 @@ describe("langchain callback handler", () => {
     expect(blocks.map((b) => b.block.contentHash)).toEqual(
       geminiHashes(sent[0] as Record<string, unknown>),
     );
+    ct.close();
+  });
+
+  it("records a ChatBedrockConverse turn matching the wire body LangChain sent", async () => {
+    // The Bedrock branch, end to end against real @langchain/aws with the AWS
+    // SDK's transport stubbed — a tool-using exchange, because that is where
+    // the Converse shape is least like everyone else's: system prompts are a
+    // list of `{text}` blocks, tool schemas ride under `toolConfig`, and a tool
+    // RESULT lives inside a user-role message (Converse has no tool role).
+    const path = tmpTrace();
+    const sent: Record<string, unknown>[] = [];
+    const tracer = init("p", { path });
+    const getWeather = tool(async () => "42°C", {
+      name: "get_weather",
+      description: "Look up the weather for a city.",
+      schema: z.object({ city: z.string() }),
+    });
+    const llm = new ChatBedrockConverse({
+      model: "anthropic.claude-3-haiku-20240307-v1:0",
+      region: "us-east-1",
+      credentials: { accessKeyId: "x", secretAccessKey: "y" },
+      temperature: 0.2,
+      maxTokens: 256,
+      callbacks: [tracer.langchainHandler()],
+      client: bedrockStubClient(sent),
+    }).bindTools([getWeather]);
+
+    await llm.invoke([
+      new SystemMessage("Be terse."),
+      new HumanMessage("weather in Dubai?"),
+      new AIMessage({
+        content: "",
+        tool_calls: [{ id: "tooluse_1", name: "get_weather", args: { city: "Dubai" } }],
+      }),
+      new ToolMessage({ tool_call_id: "tooluse_1", content: "42°C" }),
+    ]);
+    await tracer.close();
+
+    const ct = CTrace.open(path);
+    const calls = ct.getCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.provider).toBe("bedrock");
+    // Usage mapped back onto Bedrock's own key names, and the sampling params
+    // lifted out of `inferenceConfig` exactly as a direct capture's would be.
+    expect(calls[0]!.usage).toEqual({ inputTokens: 12, outputTokens: 6, totalTokens: 18 });
+    expect(calls[0]!.params).toEqual({
+      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      maxTokens: 256,
+      temperature: 0.2,
+    });
+
+    const blocks = ct.getCallBlocks(calls[0]!.id);
+    expect(blocks.map((b) => [b.block.role, b.block.kind])).toEqual([
+      ["system", "message"],
+      ["system", "tool_schema"],
+      ["user", "content_part"],
+      ["assistant", "content_part"],
+      ["user", "content_part"],
+    ]);
+    expect(blocks[0]!.block.text).toBe("Be terse.");
+    expect(blocks[2]!.block.text).toBe("weather in Dubai?");
+    // THE LOAD-BEARING ASSERTION: hash for hash with a direct capture of the
+    // JSON @langchain/aws actually put on the wire.
+    expect(blocks.map((b) => b.block.contentHash)).toEqual(bedrockHashes(sent[0]!));
     ct.close();
   });
 
@@ -688,6 +802,97 @@ describe("langchain normalization", () => {
       ],
     };
     const adapter = new GeminiAdapter();
+    expect(adapter.extractBlocks(viaHandler).map((b) => b.hashInput)).toEqual(
+      adapter.extractBlocks(direct).map((b) => b.hashInput),
+    );
+  });
+
+  it("uses Bedrock's Converse shape: system blocks, typed content, toolUse/toolResult", () => {
+    // Converse is the odd one out three times over: `system` is a LIST of
+    // {text} blocks (never a bare string, unlike Anthropic), content is a list
+    // of typed blocks, and there is no tool role — a tool result rides inside a
+    // USER message. Mirrors Python `test_bedrock_wire_*`.
+    const wire = toWire(
+      "bedrock",
+      [
+        msg("system", "sys"),
+        msg("human", "weather?"),
+        msg("ai", "", { tool_calls: [{ id: "t1", name: "get_weather", args: { city: "Dubai" } }] }),
+        msg("tool", "42°C", { tool_call_id: "t1" }),
+      ],
+      { toolConfig: { tools: [{ toolSpec: { name: "get_weather" } }] } },
+      "anthropic.claude-3-haiku",
+    );
+    expect(wire["system"]).toEqual([{ text: "sys" }]);
+    expect(wire["messages"]).toEqual([
+      { role: "user", content: [{ text: "weather?" }] },
+      {
+        role: "assistant",
+        content: [{ toolUse: { toolUseId: "t1", name: "get_weather", input: { city: "Dubai" } } }],
+      },
+      {
+        role: "user",
+        content: [{ toolResult: { toolUseId: "t1", content: [{ text: "42°C" }] } }],
+      },
+    ]);
+    // The model id goes under Bedrock's own key, so the session's model roll-up
+    // still works.
+    expect(wire["modelId"]).toBe("anthropic.claude-3-haiku");
+    // Tool schemas ride under `toolConfig`, whichever way the integration
+    // reported them — verbatim, so they are byte-identical to a direct capture.
+    expect(wire["toolConfig"]).toEqual({ tools: [{ toolSpec: { name: "get_weather" } }] });
+    const viaTools = toWire("bedrock", [], { tools: [{ toolSpec: { name: "a" } }] });
+    expect(viaTools["toolConfig"]).toEqual({ tools: [{ toolSpec: { name: "a" } }] });
+  });
+
+  it("emits one Bedrock content block per content entry, images included", () => {
+    // The same part-per-entry rule as Gemini, for the same reason: flattening a
+    // vision turn to one string would drop the image and its whole token cost.
+    const imagePart = { type: "image_url", image_url: { url: PNG_4x4_URI } };
+    const wire = toWire(
+      "bedrock",
+      [msg("human", [{ type: "text", text: "a" }, { type: "text", text: "b" }, imagePart])],
+      {},
+    );
+    expect(wire["messages"]).toEqual([
+      { role: "user", content: [{ text: "a" }, { text: "b" }, imagePart] },
+    ]);
+    expect(new BedrockAdapter().extractBlocks(wire).map((b) => [b.role, b.kind, b.text])).toEqual([
+      ["user", "content_part", "a"],
+      ["user", "content_part", "b"],
+      // Bedrock shares Anthropic's w×h/750 vision formula, so the SAME picture
+      // costs 1 token here and 258 on Gemini — each provider's own published
+      // formula, never a shared guess.
+      ["user", "image", "[image 4×4 · ~1 tok]"],
+    ]);
+  });
+
+  it("hashes a Bedrock vision turn exactly like a direct capture", () => {
+    // The picture as an OpenAI-style data URI (what LangChain hands the
+    // handler) and as Converse `image.source.bytes` (what goes on the wire) is
+    // ONE block — image identity is the pixels, not the wrapper.
+    const viaHandler = toWire(
+      "bedrock",
+      [
+        msg("human", [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: PNG_4x4_URI } },
+        ]),
+      ],
+      {},
+    );
+    const direct = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { text: "what is this?" },
+            { image: { format: "png", source: { bytes: PNG_4x4_B64 } } },
+          ],
+        },
+      ],
+    };
+    const adapter = new BedrockAdapter();
     expect(adapter.extractBlocks(viaHandler).map((b) => b.hashInput)).toEqual(
       adapter.extractBlocks(direct).map((b) => b.hashInput),
     );

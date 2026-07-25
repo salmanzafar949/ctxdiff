@@ -1,7 +1,7 @@
 {
   "name": "ctxdiff",
   "version": "0.1.0",
-  "description": "git diff for your agent's context window — a local-first context-window debugger for LLM agents. Wrap your OpenAI/Anthropic/Gemini client in one line and record every call's context into a shareable .ctrace, then diff turns, profile prompt-cache breaks, and open a self-contained HTML dashboard. Cross-compatible with the Python ctxdiff SDK.",
+  "description": "git diff for your agent's context window — a local-first context-window debugger for LLM agents. Wrap your OpenAI/Anthropic/Gemini/Bedrock client in one line and record every call's context into a shareable .ctrace, then diff turns, profile prompt-cache breaks, and open a self-contained HTML dashboard. Cross-compatible with the Python ctxdiff SDK.",
   "type": "module",
   "license": "Apache-2.0",
   "author": "Salman Zafar (https://salmanzafar.dev)",
@@ -20,6 +20,8 @@
     "anthropic",
     "claude",
     "gemini",
+    "bedrock",
+    "aws",
     "context",
     "context-engineering",
     "debugger",
@@ -70,6 +72,7 @@
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.30",
+    "@aws-sdk/client-bedrock-runtime": ">=3",
     "@google/genai": ">=0.3",
     "mysql2": ">=3",
     "openai": ">=4",
@@ -77,6 +80,9 @@
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "@aws-sdk/client-bedrock-runtime": {
       "optional": true
     },
     "@google/genai": {
@@ -94,7 +100,9 @@
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.114.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1095.0",
     "@google/genai": "^2.13.0",
+    "@langchain/aws": "^1.4.3",
     "@langchain/core": "^1.2.3",
     "@langchain/google-genai": "^2.2.0",
     "@langchain/langgraph": "^1.4.8",

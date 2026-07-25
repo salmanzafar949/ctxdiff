@@ -50,10 +50,11 @@ export {
 } from "./models.js";
 export type { Block, RawBlock, CallBlock, Run, Call, Session } from "./models.js";
 export { countTokens } from "./tokenize.js";
-export type { Adapter } from "./capture/base.js";
+export type { Adapter, CallShape } from "./capture/base.js";
 export { OpenAIAdapter } from "./capture/openai.js";
 export { AnthropicAdapter } from "./capture/anthropic.js";
 export { GeminiAdapter } from "./capture/gemini.js";
+export { BedrockAdapter } from "./capture/bedrock.js";
 export { Recorder, type RedactHook } from "./capture/recorder.js";
 // The LangChain/LangGraph capture path: `tracer.langchainHandler()` returns
 // this shape. The normalizers are exported alongside it because they are the
