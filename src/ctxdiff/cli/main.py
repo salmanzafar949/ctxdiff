@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 import logging
 import os
 import re
@@ -58,6 +59,9 @@ from ctxdiff.cli.select import (
     short_id,
 )
 from ctxdiff.demo import build_demo_trace
+# The install hint only — `ctxdiff.mcp` imports no SDK, so this costs nothing on
+# a plain install; the server itself is imported lazily inside `_cmd_mcp`.
+from ctxdiff.mcp import MISSING_EXTRA_HINT
 from ctxdiff.store import config as store_config
 from ctxdiff.store.base import Call, EmptyStoreError, Session, Store
 from ctxdiff.store.ctrace import CTrace
@@ -660,6 +664,31 @@ def _add_demo_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_demo)
 
 
+def _add_mcp_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff mcp`: expose the analyzers to a coding agent over the
+    Model Context Protocol, on stdio.
+
+    Two flags and no more, both of them the OPERATOR's decisions rather than the
+    connected model's (see `mcp/server.py`): `--runs-dir`, because an MCP
+    server's working directory is whatever the editor launched it from and the
+    newest-.ctrace-in-cwd default every other command uses is meaningless there;
+    and `--redact`, the never-return-raw-text mode for anyone who does not want
+    recorded prompt content reaching a cloud model."""
+    p = subparsers.add_parser(
+        "mcp", help="serve ctxdiff to a coding agent over MCP (stdio)")
+    p.add_argument("--runs-dir", dest="runs_dir", default=None, metavar="DIR",
+                   help="directory of .ctrace files to serve (default: the "
+                        "store configured via CTXDIFF_STORE, else the current "
+                        "directory — which for a client-launched server is "
+                        "rarely where your traces are, so set this)")
+    p.add_argument("--redact", action="store_true",
+                   help="never return captured text — labels, content hashes, "
+                        "token counts and structure only, including from "
+                        "ctxdiff_block. Use when the MCP client's model is "
+                        "remote and your traces hold sensitive prompts")
+    p.set_defaults(func=_cmd_mcp)
+
+
 def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register `ctxdiff view [--no-open]`: export the project's dashboard to a
     temp file and open it in the default browser. `--no-open` skips the browser
@@ -683,13 +712,13 @@ def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
 _SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_cache_parser,
                 _add_check_parser, _add_sessions_parser, _add_agents_parser,
                 _add_runs_parser, _add_export_parser, _add_view_parser,
-                _add_demo_parser]
+                _add_demo_parser, _add_mcp_parser]
 
 # The commands help ADVERTISES, in listing order. `runs` is deliberately absent:
 # it still dispatches (see `_add_runs_parser`), it just isn't offered to anyone
 # reading the help for the first time.
 _VISIBLE_COMMANDS = ["diff", "tokens", "cache", "check", "sessions", "agents",
-                     "export", "view", "demo"]
+                     "export", "view", "demo", "mcp"]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1515,6 +1544,45 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     print('Trace your own agent next: tracer = trace.init("my-agent"); '
           "client = tracer.wrap(OpenAI())")
     return 0
+
+
+# --- mcp --------------------------------------------------------------------------
+
+
+def _mcp_sdk_installed() -> bool:
+    """Whether the optional `mcp` SDK (the `ctxdiff[mcp]` extra) is importable.
+
+    `find_spec` rather than a try/except around the import, because it answers
+    the question without EXECUTING anything: the two failures are not the same,
+    and a try/except would quietly translate an ImportError raised from inside
+    ctxdiff's own server module — a bug — into "go install something", which is
+    the one message guaranteed not to fix it.
+
+    A named function, not an inline call, so a test can simulate an install
+    WITHOUT the extra on a machine that has it."""
+    return importlib.util.find_spec("mcp") is not None
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff mcp`: run the MCP server on stdio until the client
+    disconnects.
+
+    The one thing this function does beyond delegating is refuse to crash when
+    the optional extra is absent. `ctxdiff[mcp]` pulls in the official `mcp`
+    Python SDK, which the core deliberately does not depend on (runtime deps
+    stay tiktoken-only), so a user who types `ctxdiff mcp` on a plain install
+    must get one line telling them what to install — not a traceback ending in
+    `ModuleNotFoundError: No module named 'mcp'`, which reads like ctxdiff is
+    broken rather than like a feature is opt-in. See `_mcp_sdk_installed` for
+    why the check is a spec lookup rather than a caught import.
+
+    stdout belongs to the JSON-RPC protocol here, so the hint — like every
+    other error in this CLI — goes to stderr."""
+    if not _mcp_sdk_installed():
+        print(MISSING_EXTRA_HINT, file=sys.stderr)
+        return 1
+    from ctxdiff.mcp.server import serve_stdio
+    return serve_stdio(runs_dir=args.runs_dir, redact=args.redact)
 
 
 # --- entry point ---------------------------------------------------------------

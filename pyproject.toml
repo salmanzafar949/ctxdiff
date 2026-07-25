@@ -43,7 +43,13 @@ dependencies = ["tiktoken==0.13.0"]
 # rejects — which is the exact failure a smoke test for an Action must catch,
 # since a syntax error there only surfaces when someone else's workflow run
 # fails. Runtime deps stay tiktoken-only; nothing under src/ imports yaml.
-dev = ["pytest>=8", "PyYAML>=6"]
+#
+# `ctxdiff[mcp]` is pulled in here because `tests/test_mcp.py` SPAWNS the real
+# server over stdio and drives real MCP requests through the official client —
+# the only way to prove the tool list, the result cap and `--redact` hold end to
+# end. The tests skip cleanly when it is absent, so `pip install -e .` still has
+# a green suite; CI installs `.[dev,eval]` and therefore runs them.
+dev = ["pytest>=8", "PyYAML>=6", "ctxdiff[mcp]"]
 # Storage backends. The core stays dependency-light (tiktoken only) and both
 # drivers are imported LAZILY, at connect time, so these extras are optional in
 # the real sense: without them ctxdiff still runs, and a store configured for a
@@ -53,6 +59,15 @@ postgres = ["psycopg[binary]>=3.1"]
 # install time) and the same `%s` paramstyle as psycopg 3, which is what lets
 # both adapters share one set of parameterized statements.
 mysql = ["PyMySQL>=1.1"]
+# The MCP server (`ctxdiff mcp`), on the official Model Context Protocol Python
+# SDK. Optional for the same reason the database drivers are: the core stays
+# tiktoken-only, `ctxdiff.mcp` itself imports no SDK (only
+# `ctxdiff/mcp/server.py` does, lazily, from `_cmd_mcp`), and `ctxdiff mcp` on
+# an install without the extra prints a one-line install hint instead of an
+# ImportError traceback. Floor rather than pin: unlike the tokenizer, nothing
+# about the SDK's version can change a NUMBER ctxdiff reports — it only carries
+# JSON that the analyzers produced.
+mcp = ["mcp>=1.2"]
 eval = ["openai>=1.0", "anthropic>=0.30", "langchain-openai", "langchain-core", "respx>=0.21", "httpx", "google-genai>=1.0", "boto3>=1.34"]
 
 [project.scripts]
