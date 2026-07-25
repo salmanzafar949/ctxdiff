@@ -99,7 +99,7 @@ class CacheReport:
 # --- snippet formatting -------------------------------------------------------
 
 
-def _flatten_snippet(text: str, limit: int = 80) -> str:
+def flatten_snippet(text: str, limit: int = 80) -> str:
     """Collapse a block's text to a single flattened, truncated line for
     display (newlines/repeated whitespace -> single spaces, then hard-cut at
     `limit` chars with an ellipsis marker). Kept plain (no quoting/repr) —
@@ -115,7 +115,7 @@ def _truncate(text: str, limit: int = 40) -> str:
     enough of the change to recognize it (e.g. a timestamp), not the whole
     block.
 
-    Flattened first, exactly like `_flatten_snippet`: this substring is
+    Flattened first, exactly like `flatten_snippet`: this substring is
     CAPTURED TEXT, and `detail` is a single line of a report that ends up
     inside a markdown fence in the GitHub Action's job summary. A prompt (or a
     tool schema, or a diff hunk) carrying a newline followed by a run of
@@ -234,13 +234,13 @@ def _attribute_break(
             # the dynamic-field heuristic vacuously — a swapped screenshot is
             # never "a volatile substring in otherwise-stable text").
             detail = _image_change_detail(modified.label, modified.old_block, modified.block)
-            return ("modified", modified.label, _flatten_snippet(modified.block.text),
+            return ("modified", modified.label, flatten_snippet(modified.block.text),
                     detail, False)
         offset, old_part, new_part = _first_diff_segment(modified.inline_diff or [])
         detail = (f"modified {modified.label} block — first difference at "
                   f"char {offset}: '{_truncate(old_part)}' → '{_truncate(new_part)}'")
         is_dynamic = _is_dynamic_change(modified.inline_diff or [])
-        return ("modified", modified.label, _flatten_snippet(modified.block.text),
+        return ("modified", modified.label, flatten_snippet(modified.block.text),
                 detail, is_dynamic)
 
     added = next(
@@ -250,7 +250,7 @@ def _attribute_break(
     if added is not None:
         detail = (f"block inserted at position {position} — {added.label}/"
                   f"{added.block.role} block not present in the previous turn")
-        return ("added", added.label, _flatten_snippet(added.block.text), detail, False)
+        return ("added", added.label, flatten_snippet(added.block.text), detail, False)
 
     evicted = next(
         (e for e in turn_diff.entries if e.kind == "evicted" and e.position_old == position),
@@ -259,7 +259,7 @@ def _attribute_break(
     if evicted is not None:
         detail = (f"block evicted at position {position} — {evicted.label}/"
                   f"{evicted.block.role} block from the previous turn is missing here")
-        return ("evicted", evicted.label, _flatten_snippet(evicted.block.text), detail, False)
+        return ("evicted", evicted.label, flatten_snippet(evicted.block.text), detail, False)
 
     # A pure position swap: the differ's move-reconciliation folds both sides
     # of the swap into 'unchanged' entries (same content_hash, just a
@@ -278,7 +278,7 @@ def _attribute_break(
         detail = (f"block reordered — {reordered.label}/{reordered.block.role} moved "
                   f"from position {reordered.position_old} to {reordered.position_new}, "
                   f"breaking the byte-for-byte prefix match at position {position}")
-        return ("reordered", reordered.label, _flatten_snippet(reordered.block.text),
+        return ("reordered", reordered.label, flatten_snippet(reordered.block.text),
                 detail, False)
 
     # Final fallback: some other structural shape neither classified above
@@ -291,7 +291,7 @@ def _attribute_break(
     text = side.block.text if side else ""
     label = side.label if side else "unknown"
     detail = f"context diverges at position {position} (not a simple modify/insert/evict/reorder)"
-    return ("changed", label, _flatten_snippet(text), detail, False)
+    return ("changed", label, flatten_snippet(text), detail, False)
 
 
 # --- waste note + fix hint ------------------------------------------------------

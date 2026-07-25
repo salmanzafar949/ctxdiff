@@ -13,13 +13,21 @@ import type {
   UsageTotals,
 } from "./analyze/tokens.js";
 import { groupBreaks, pairsDenominator, type CacheReport } from "./analyze/cache.js";
+import type { EvictionReport } from "./analyze/evictions.js";
+import { formatWindowShare } from "./analyze/window.js";
 import {
   checkPassed,
   failedAssertions,
   NAME_WIDTH,
   type CheckReport,
 } from "./analyze/check.js";
-import { pyComma as comma, pyRoundHalfEven } from "./analyze/pyround.js";
+import { pyComma as comma, pyRepr, pyRoundHalfEven } from "./analyze/pyround.js";
+
+// Re-exported from its new home so `store/sqlite.ts`, `index.ts` and every
+// existing import of `render.pyRepr` keeps working unchanged. It lives in
+// `analyze/pyround.ts` now because `analyze/window.ts` needs it too, and an
+// analyzer importing the renderer would be a cycle.
+export { pyRepr };
 
 // Bare ANSI SGR constants — no color library, matching Python's render.py.
 const RESET = "\x1b[0m";
@@ -42,49 +50,6 @@ function colorEnabled(): boolean {
 /** Wrap `text` in `color`'s SGR codes, or return it bare when disabled. */
 function paint(text: string, color: string, enabled: boolean): string {
   return enabled ? `${color}${text}${RESET}` : text;
-}
-
-// A code point is non-printable (in Python's `str.isprintable` sense) when its
-// Unicode category is "Other" (C*: control, format, surrogate, private-use,
-// unassigned) or "Separator" (Z*: line/paragraph/space) — EXCEPT the ASCII
-// space U+0020, which is printable. This covers C0/C1 controls, DEL, NBSP,
-// soft-hyphen, the bidi/zero-width format marks (U+200B–200F, U+202A–202E,
-// U+2060, U+FEFF) and the line/paragraph separators, exactly as CPython does.
-const NON_PRINTABLE = /[\p{C}\p{Z}]/u;
-function isNonPrintable(ch: string): boolean {
-  return ch !== " " && NON_PRINTABLE.test(ch);
-}
-
-/**
- * Python `repr(str)`: choose single quotes unless the string contains a single
- * quote and no double quote (then double); escape the quote and backslash, use
- * the `\n`/`\r`/`\t` shorthands, escape any non-printable code point (see
- * `isNonPrintable`) using Python's width-appropriate form — `\xNN` below 0x100,
- * `\uNNNN` in the BMP, `\UNNNNNNNN` for astral — and pass every printable
- * character (including café/emoji) through. Iterates code points (`for..of`)
- * like Python, so astral characters are handled as single units.
- *
- * Exported because diff snippets are not the only place Python's repr quoting
- * has to be reproduced: `SQLiteStore.openReader` interpolates a path with `!r`
- * on the Python side, and `JSON.stringify` there would print double quotes
- * where Python prints single ones.
- */
-export function pyRepr(s: string): string {
-  const quote = s.includes("'") && !s.includes('"') ? '"' : "'";
-  let out = quote;
-  for (const ch of s) {
-    const o = ch.codePointAt(0)!;
-    if (ch === quote || ch === "\\") out += "\\" + ch;
-    else if (ch === "\n") out += "\\n";
-    else if (ch === "\r") out += "\\r";
-    else if (ch === "\t") out += "\\t";
-    else if (isNonPrintable(ch)) {
-      if (o < 0x100) out += "\\x" + o.toString(16).padStart(2, "0");
-      else if (o < 0x10000) out += "\\u" + o.toString(16).padStart(4, "0");
-      else out += "\\U" + o.toString(16).padStart(8, "0");
-    } else out += ch;
-  }
-  return out + quote;
 }
 
 /** First ~70 chars of `text` for a diff line: whitespace flattened to single
@@ -193,14 +158,30 @@ function rjust(s: string, w: number): string {
   return s.length >= w ? s : " ".repeat(w - s.length) + s;
 }
 
-/** Render one call's token attribution. Mirrors Python `render_call_tokens`. */
-export function renderCallTokens(ct: CallTokens): string {
+/**
+ * Render one call's token attribution. Mirrors Python `render_call_tokens`.
+ *
+ * `contextWindow`, when the user has stated one (`--context-window` or
+ * `CTXDIFF_CONTEXT_WINDOW`), turns the bare total into a SHARE — `18,400 /
+ * 200,000 tok · 9.2%`, warning-marked past `CONTEXT_WINDOW_ALARM_PCT`. With no
+ * window the header is byte-for-byte what it always was: ctxdiff ships no
+ * model→window table, so it renders no percentage it cannot back up.
+ *
+ * The `(~approx)` marker stays immediately after the numbers it qualifies, so it
+ * keeps qualifying the percentage too: a share computed from a partly-estimated
+ * total is exactly as approximate as the total.
+ */
+export function renderCallTokens(ct: CallTokens, contextWindow: number | null = null): string {
   const enabled = colorEnabled();
   const lines: string[] = [];
 
   const approxMarker = ct.approximate ? " (~approx)" : "";
   const agentStep = agentStepTag(ct.agent, ct.step);
-  lines.push(`turn ${ct.seq} · ${comma(ct.totalTokens)} tokens${approxMarker}${agentStep}`);
+  const total =
+    contextWindow === null
+      ? `${comma(ct.totalTokens)} tokens`
+      : formatWindowShare(ct.totalTokens, contextWindow);
+  lines.push(`turn ${ct.seq} · ${total}${approxMarker}${agentStep}`);
 
   for (const s of ct.slices) {
     const barStr = ljust(bar(s.pct), BAR_WIDTH);
@@ -245,6 +226,46 @@ export function renderBloat(bloat: BloatReport, totalTools: number | null): stri
   return paint(line, YELLOW, enabled);
 }
 
+/**
+ * Render the tagged-eviction warning block for `ctxdiff tokens`, or null when
+ * there is nothing to warn about (the overwhelmingly common case, and the reason
+ * this returns null rather than a reassuring line: a report that says "no
+ * evictions" on every run trains people to stop reading it). Mirrors Python
+ * `render_evictions`.
+ *
+ * One three-line stanza per eviction, in the analyzer's timeline order: a yellow
+ * headline in the words the bug is usually described in — with `taggedSeq`, the
+ * turn the TAG was applied, because that is what the sentence claims happened
+ * there — the block's snippet repr-quoted like every other snippet the CLI
+ * prints, and a facts line carrying the cost, the turn the CONTENT entered
+ * (`enteredSeq`, not always the turn it was tagged on), the last turn that still
+ * had it, and the standing reminder that this report only ever names blocks that
+ * never came back.
+ *
+ * Only TAGGED blocks appear here. Every agent loop evicts heuristically labeled
+ * history by design, so including those would bury this line in the ordinary
+ * behaviour of every framework there is.
+ */
+export function renderEvictions(report: EvictionReport): string | null {
+  if (!report.evictions.length) return null;
+  const enabled = colorEnabled();
+  const lines: string[] = [];
+  for (const e of report.evictions) {
+    const chip = e.agent !== null ? `[agent:${e.agent}] ` : "";
+    const headline =
+      `⚠ ${chip}the block you tagged '${e.label}' at turn ` +
+      `${e.taggedSeq} was evicted at turn ${e.evictedSeq}`;
+    lines.push(paint(headline, YELLOW, enabled));
+    lines.push(`  ${pyRepr(e.snippet)}`);
+    lines.push(
+      `  [${e.label}·${e.role}] ${comma(e.tokens)} tok · entered at ` +
+        `turn ${e.enteredSeq} · last present at turn ` +
+        `${e.lastSeenSeq} · never returned`,
+    );
+  }
+  return lines.join("\n");
+}
+
 /** Render the provider-usage rollup for `ctxdiff tokens`. Mirrors Python
  * `render_usage_summary`. */
 export function renderUsageSummary(usage: UsageTotals, agent: string | null = null): string {
@@ -282,19 +303,33 @@ export function renderAgentSummary(runTokens: RunTokens): string | null {
   return "agents: " + parts.join("   ");
 }
 
-/** Render `ctxdiff tokens`' full output. Mirrors Python `render_run_tokens`. */
+/**
+ * Render `ctxdiff tokens`' full output. Mirrors Python `render_run_tokens`.
+ *
+ * `contextWindow` is threaded down to every turn header; null means no window
+ * was stated and every header renders exactly as it did before percentages
+ * existed. Evictions print BEFORE bloat because they are the more expensive
+ * fact: dead schemas cost tokens, an evicted tagged block cost the agent
+ * something it was told to remember. Both are omitted entirely when empty.
+ */
 export function renderRunTokens(
   calls: CallTokens[],
   bloat: BloatReport | null,
   totalTools: number | null,
   agentSummary: string | null = null,
   usageSummary: string | null = null,
+  contextWindow: number | null = null,
+  evictions: EvictionReport | null = null,
 ): string {
   if (calls.length === 0) return "no calls in this run";
   const sections: string[] = [];
   if (usageSummary) sections.push(usageSummary);
   if (agentSummary) sections.push(agentSummary);
-  for (const c of calls) sections.push(renderCallTokens(c));
+  for (const c of calls) sections.push(renderCallTokens(c, contextWindow));
+  if (evictions !== null) {
+    const evictionBlock = renderEvictions(evictions);
+    if (evictionBlock) sections.push(evictionBlock);
+  }
   if (bloat !== null && bloat.unusedTools.length) sections.push(renderBloat(bloat, totalTools));
   return sections.join("\n\n");
 }

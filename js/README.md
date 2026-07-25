@@ -70,6 +70,10 @@ It's built to sit **alongside** your observability stack, not replace it.
 - 🟩🟥🟨 **Git-style turn diffing** — `npx ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **Token attribution** — `npx ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **Prompt-cache profiling** — `npx ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
+- 📐 **Percent of the context window** — `npx ctxdiff tokens --context-window 200000`: `18,400 / 200,000 tok · 9.2%`, with a `⚠` past 80%. Proximity to the limit is what causes the silent truncation you are debugging; the window is yours to state, because ctxdiff ships no model→window table it could get wrong.
+
+- 🧠 **Evicted tagged blocks** — *"the block you tagged `rag` at turn 3 was evicted at turn 6"*. The single most common root cause of "the agent forgot the thing I told it", named outright.
+
 - 🚦 **Context budgets in CI** — `npx ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas`: assert the budget, exit non-zero when it regresses. Ships as a [GitHub Action](#github-action) that posts the PASS/FAIL table to the job summary — so context size becomes a tracked metric on every pull request, not something you remember to look at.
 - 🖥️ **Self-contained HTML dashboard** — `npx ctxdiff view` / `export`: a one-file, zero-external-request, **three-level** dashboard — every agent in the project, then that agent's sessions (in your local timezone), then its turn-by-turn scrubber, diff panel, token heatmap, cache findings and block inspector — safe to attach to a bug ticket.
 - 🏷️ **Semantic tagging** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
@@ -148,7 +152,7 @@ ct.close();
 | Command | What it does |
 |---|---|
 | `diff --turn N --turn M` | git-style block diff between two turns (char-level inline diffs) |
-| `tokens [--turn N]` | per-label token heatmap, provider reconciliation, schema-bloat report |
+| `tokens [--turn N] [--context-window N]` | per-label token heatmap, share of the context window, tagged-eviction warnings, provider reconciliation, schema-bloat report |
 | `cache` | prompt-cache prefix-break profiler + price-free wasted-spend estimate |
 | `check [assertions]` | assert context budgets and **exit non-zero** when they regress (the CI gate) |
 | `sessions` | list every session ctxdiff can see — id, **local** start time, turns, agents |
@@ -188,6 +192,51 @@ npx ctxdiff diff --session 4f3a2b1c9d8e --agent researcher:1 --agent writer:2
 
 Both print a scope header naming the two sides (an ordinary same-session diff is unchanged). Timestamps are stored UTC and displayed in **your local timezone** with the offset shown — identical to the Python CLI for the same stored value.
 
+### Percent of the context window
+
+`18,400 tok` means nothing on its own. `18,400 / 200,000 — 9%` means you have room; `156,000 / 200,000 — 78%` means the next tool result is going to push something out of the window. State the window and every turn header becomes a share of it:
+
+```
+$ npx ctxdiff tokens --context-window 200000
+turn 12 · 18,400 / 200,000 tok · 9.2%
+  ...
+turn 31 · 164,000 / 200,000 tok · ⚠ 82.0%
+```
+
+The `⚠` appears at **80%** and above — not because 80% is a failure (the provider would error if you exceeded the window, and you would know) but because that is where the *silent* failures start: sliding-window trimmers, a `max_tokens` reservation for the response, one large tool result arriving next turn. Past 80% the headroom is smaller than a typical tool output. The marker is compared against the percentage as printed, so `80.0%` is always marked and `79.9%` never is.
+
+**Why you state the window.** ctxdiff ships **no model→context-window table**, deliberately — the same reason it ships no price table. Those numbers differ per model, per provider and per deployment and change under you; a stale one does not degrade, it lies. So it comes from you:
+
+```bash
+npx ctxdiff tokens --context-window 200000     # this invocation
+export CTXDIFF_CONTEXT_WINDOW=200000           # every invocation, including the dashboard
+```
+
+The flag wins when both are set. `tokens`, `check`, `view` and `export` resolve the window through the same path, so a CI gate and the report you read beside it can never be scored against two different windows — and all four refuse a window of zero or less (`ctxdiff: --context-window must be greater than 0`, exit 2) rather than render a percentage of something that is not a window. With neither set, nothing changes — every command prints exactly the bytes it printed before percentages existed. `(~approx)` still applies: a share computed from a partly-estimated total is exactly as approximate as the total.
+
+### Evicted tagged blocks
+
+"The agent forgot the thing I told it" almost always has one mechanical cause: a block that *was* in the context is not in it any more. ctxdiff already classifies that as an eviction, and [`tracer.tag()`](#semantic-tagging) already records which blocks you considered load-bearing — so `npx ctxdiff tokens` names the join outright:
+
+```
+⚠ the block you tagged 'rag' at turn 3 was evicted at turn 6
+  'Context: Refund policy: 30 days from delivery, unworn items only. Also…'
+  [rag·user] 1,240 tok · entered at turn 3 · last present at turn 5 · never returned
+```
+
+**You tag it once.** [`tracer.tag()`](#semantic-tagging) applies to the *next* recorded call only, so a block tagged on turn 3 is stored `tagged` on turn 3 and heuristically labeled on every later turn carrying the same text. The report follows the **content**, not the call: if you ever vouched for that text anywhere in an agent's timeline, it stays vouched-for until it leaves. The headline quotes the turn the *tag* was applied; the facts line quotes the turn the *content* entered.
+
+Four things it will **not** say, each on purpose:
+
+| Not reported | Why |
+|---|---|
+| heuristically-labeled blocks | Only `tracer.tag()`ed blocks count. Every multi-turn agent evicts ordinary history — that *is* what a context window is — so including it would bury the one line worth reading. |
+| a hand-off between agents | Pairing is per agent, the same rule the cache profiler uses. The researcher's block is "missing" from the writer's next call because it was never in the writer's context. |
+| a block that comes back | Absent for one turn and back the next was crowded out, not forgotten. A block that leaves twice is reported once, for the departure it did not return from. |
+| a block whose text was *edited* | A same-slot content change is `modified`, not `evicted` — whatever `ctxdiff diff` calls it, this report calls it. |
+
+Also available as a CI assertion (`--no-tagged-eviction`, below) and as a dashboard panel.
+
 ### `ctxdiff check` — the CI gate
 
 Everything above is something you *run and read*. `check` is the same analysis with a **threshold** attached and a **non-zero exit** when it's crossed, so a context regression fails the build instead of waiting to be noticed.
@@ -215,11 +264,14 @@ Every assertion is **opt-in**, and `check` with none is a usage error (exit 2) r
 | `--max-context-pct P` + `--context-window N` | any turn exceeds **P%** of a context window **you state** |
 | `--require-stable-prefix` | the prompt-cache prefix breaks anywhere in the run |
 | `--no-dead-schemas` | a tool schema is registered but never invoked |
+| `--no-tagged-eviction` | a block you [tagged](#semantic-tagging) entered an agent's context and later left it for good |
 | `--max-growth N` / `--max-growth-pct P` | the context grows more than that between two consecutive turns of the same agent |
 
 Plus the same `--project` / `--session` / `--agent` selectors, so one workflow can hold each agent to its own budget. **Exit codes**: `0` all-pass · `1` violated (or no trace to read) · `2` usage error.
 
-ctxdiff ships **no model→window table** by design — windows differ per model and per provider and change under you — so `--max-context-pct` requires `--context-window N` and reports both the percentage and the token budget it works out to.
+ctxdiff ships **no model→window table** by design — windows differ per model and per provider and change under you — so `--max-context-pct` needs a window from you, as `--context-window N` or as `CTXDIFF_CONTEXT_WINDOW` in the job's environment ([the same resolution path](#percent-of-the-context-window) `tokens` and the dashboard use), and reports both the percentage and the token budget it works out to. A `--context-window` you *typed* and nothing reads is still a usage error; an inherited environment variable is not.
+
+`--no-tagged-eviction` is the [eviction report](#evicted-tagged-blocks) with a threshold of zero — same analyzer, same sentence, same per-agent scoping. It reports three different PASSes, because "PASS" here has three meanings and only one is reassuring: `no tagged blocks in this run — nothing to lose`, `fewer than 2 turns — no pairs to check`, and `all 3 tagged blocks survived 4 turn pairs`.
 
 `check` is a threshold layer over the analyzers you already read (it calls the same `tokens` and `cache` code paths), so a red build and a hand-run report can never tell two different stories.
 
@@ -254,6 +306,7 @@ jobs:
           max-context: 8000
           require-stable-prefix: true
           no-dead-schemas: true
+          no-tagged-eviction: true
 ```
 
 The action installs ctxdiff, runs `check`, writes the PASS/FAIL table to the **job summary** (`$GITHUB_STEP_SUMMARY` — free, tokenless, and works on pull requests from forks, where a PR comment's `pull-requests: write` is read-only no matter what the repo settings say), and exits with the check's own status. Full input reference and the PR-comment escape hatch: [the Python README's GitHub Action section](../README.md#github-action).

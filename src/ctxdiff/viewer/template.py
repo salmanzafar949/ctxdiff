@@ -168,6 +168,12 @@ main > *{min-width:0}
 .bar.err{
   background:linear-gradient(180deg,var(--evicted),color-mix(in srgb,var(--evicted) 45%, transparent));
 }
+/* A turn at or past the context-window alarm threshold. Only ever applied when
+   a window was supplied at export time \u2014 with no window there is no
+   percentage and no bar is hot. */
+.bar.hot{
+  background:linear-gradient(180deg,var(--warn),color-mix(in srgb,var(--warn) 45%, transparent));
+}
 /* Agent-colored underline strip on each turn bar, so an unscoped multi-agent
    timeline still reads as one agent handing off to another. */
 .bar-underline{position:absolute; left:2px; right:2px; bottom:0; height:3px;
@@ -244,6 +250,14 @@ details.diff-item>summary::-webkit-details-marker{display:none}
   background:color-mix(in srgb,var(--warn) 14%, transparent);
   border:1px solid color-mix(in srgb,var(--warn) 40%, transparent);
   color:var(--warn); font-size:12.5px}
+/* --- tagged evictions --- */
+.evict{margin-top:14px; padding:10px 13px; border-radius:9px;
+  background:color-mix(in srgb,var(--evicted) 12%, transparent);
+  border:1px solid color-mix(in srgb,var(--evicted) 35%, transparent)}
+.evict-head{font-family:var(--mono); font-size:12.5px; color:var(--evicted)}
+.evict-snip{font-family:var(--mono); font-size:12px; color:var(--ink);
+  margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.evict-detail{font-size:12px; color:var(--secondary); margin-top:4px}
 
 /* --- cache --- */
 .cache-ok{color:var(--good); font-family:var(--mono); font-size:13px;
@@ -388,12 +402,17 @@ const DATA = JSON.parse(document.getElementById("ctxdiff-data").textContent);
 // --- the three levels --------------------------------------------------------
 // L1 ALL AGENTS -> L2 that agent's SESSIONS -> L3 one session's turn-by-turn
 // detail. The focus session's detail is the payload's TOP LEVEL (run/calls/
-// diffs/tokens/cache/stats); every other embedded session's detail lives under
-// project.details, keyed by session id. A payload with no `project` key at all
+// diffs/tokens/cache/evictions/stats) and is REBUILT here key by key rather than
+// aliased, since the top level also carries `project` — which every other
+// session's detail must not appear to contain. Every key the exporter adds to a
+// session detail has to be listed below or the focus session silently renders
+// without it while the embedded ones render with it; `project.details` entries
+// are whole payloads and need no such list. A payload with no `project` key at all
 // is a plain single-session export, which is simply L3 with nothing above it.
 const PROJECT = DATA.project || null;
 const FOCUS_DETAIL = {run: DATA.run, calls: DATA.calls, diffs: DATA.diffs,
-                      tokens: DATA.tokens, cache: DATA.cache, stats: DATA.stats};
+                      tokens: DATA.tokens, cache: DATA.cache,
+                      evictions: DATA.evictions, stats: DATA.stats};
 const P_AGENTS = PROJECT ? (PROJECT.agents || []) : [];
 const P_SESSIONS = PROJECT ? (PROJECT.sessions || []) : [];
 // Whether there is anything ABOVE the detail view to navigate to. A project with
@@ -500,6 +519,32 @@ const KNOWN_LABELS = {system:1, tool_schema:1, rag:1, history:1, user:1, tool_ou
 function labelColor(label){
   const known = Object.prototype.hasOwnProperty.call(KNOWN_LABELS, label);
   return "var(--c-" + (known ? label : "unknown") + ")";
+}
+// --- context window ----------------------------------------------------------
+// The window and every turn's percentage are computed by the EXPORTER (see
+// viewer/export.py `_serialize_tokens`) and read here as data. Nothing is
+// recomputed in the browser: the two SDKs round percentages with one shared
+// rule, and a `toFixed` here would be a third rule in the path.
+function ctxWindow(){ return (D.tokens || {}).context_window || null; }
+function alarmPct(){
+  const v = (D.tokens || {}).window_alarm_pct;
+  return typeof v === "number" ? v : 80;
+}
+// True when a turn has reached the alarm threshold. Compared against the SAME
+// rounded percentage the page displays, so the styling can never contradict the
+// number beside it.
+function isHot(t){
+  return t && t.pct_of_window != null && t.pct_of_window >= alarmPct();
+}
+// "18,400 / 200,000 tok \u00b7 9.2%", warning-marked past the threshold \u2014 the
+// exact wording `ctxdiff tokens` prints, so a screenshot of the dashboard and a
+// paste of the CLI read as the same tool. Returns the bare token count when no
+// window was supplied.
+function windowShare(t){
+  const w = ctxWindow();
+  if(!w || t.pct_of_window == null) return fmt(t.total) + " tokens";
+  return fmt(t.total) + " / " + fmt(w) + " tok \u00b7 " +
+         (isHot(t) ? "\u26a0 " : "") + t.pct_of_window.toFixed(1) + "%";
 }
 function head(title, meta){
   const h = el("div", "panel-head");
@@ -758,6 +803,17 @@ function projectMeta(){
           P_AGENTS.length + (P_AGENTS.length === 1 ? " agent" : " agents"),
           fmt(turns) + " turns"];
 }
+// The turn with the largest total, or null when no window was supplied (there
+// would be nothing to express it as a share of). Ties go to the EARLIEST turn,
+// matching `check`'s `_peak`, so the header names a stable turn.
+function peakWindowTurn(){
+  if(!ctxWindow()) return null;
+  let best = null;
+  (D.tokens.calls || []).forEach(t => {
+    if(!best || t.total > best.total) best = t;
+  });
+  return best;
+}
 function sessionMeta(){
   const r = D.run || {};
   const total = (D.stats.context_growth || []).reduce((a,b)=>a+b, 0);
@@ -783,6 +839,12 @@ function sessionMeta(){
     items.push("in " + fmt(u.input) + " \\u00b7 out " + fmt(u.output) +
                " (" + cov[0] + "/" + cov[1] + " reported)");
   }
+  // With a context window supplied, the header carries the run's PEAK turn as a
+  // share of it. The peak and not the sum: a session's total tokens across ten
+  // turns is not a quantity any window ever had to hold, while the biggest
+  // single turn is exactly the one that gets truncated.
+  const peak = peakWindowTurn();
+  if(peak) items.push("peak " + windowShare(peak));
   items.push(dedup);
   return items;
 }
@@ -813,13 +875,23 @@ function renderScrubber(){
   VIEW.forEach(i => {
     const c = CALLS[i];
     const tok = growth[i] || 0;
+    // A turn's own token entry, used only for the window percentage; index-
+    // aligned with CALLS exactly as `context_growth` is.
+    const tt = (D.tokens.calls || [])[i];
+    const hot = isHot(tt);
     const b = document.createElement("button");
-    b.className = "bar" + (i === sel ? " sel" : "") + (c.error ? " err" : "");
+    b.className = "bar" + (i === sel ? " sel" : "") + (c.error ? " err" : "") +
+                  (hot && !c.error ? " hot" : "");
     b.style.height = (12 + (tok / max) * 104).toFixed(1) + "px";
     b.setAttribute("role", "tab");
     b.setAttribute("aria-selected", i === sel ? "true" : "false");
-    b.setAttribute("aria-label", "turn " + c.seq + " \\u2014 " + fmt(tok) +
-                   " tokens" + (c.error ? " (error)" : ""));
+    // The percentage goes in the ACCESSIBLE label too, not just the color: a
+    // hot bar that only differs by hue tells a screen-reader user nothing.
+    b.setAttribute("aria-label", "turn " + c.seq + " \\u2014 " +
+                   (tt && tt.pct_of_window != null
+                      ? windowShare(tt)
+                      : fmt(tok) + " tokens") +
+                   (c.error ? " (error)" : ""));
     b.addEventListener("click", () => { sel = i; render(); });
     if(multi){
       const u = el("span", "bar-underline"); u.style.background = agentColor(agentKey(c));
@@ -901,7 +973,7 @@ function renderTokens(){
   const host = document.getElementById("alloc");
   host.innerHTML = "";
   const t = D.tokens.calls[sel];
-  const h = head("Token allocation", fmt(t.total) + " tokens" + agentStep(CALLS[sel]));
+  const h = head("Token allocation", windowShare(t) + agentStep(CALLS[sel]));
   if(t.approximate){ const b = el("span", "badge", "~approx"); h.querySelector("h2").appendChild(b); }
   host.appendChild(h);
 
@@ -933,6 +1005,25 @@ function renderTokens(){
   if(t.reconciliation_delta != null)
     parts.push("\\u0394 vs measured " + (t.reconciliation_delta >= 0 ? "+" : "") + t.reconciliation_delta);
   if(parts.length) host.appendChild(el("p", "dim", "provider usage: " + parts.join("  \\u00b7  ")));
+
+  // Tagged evictions come BEFORE the bloat line, for the same reason the CLI
+  // orders them that way: dead schemas cost tokens, a lost tagged block cost
+  // the agent something it was told to remember. Only tagged blocks are ever in
+  // here (see analyze/evictions.py), so every entry is worth a warning.
+  ((D.evictions || {}).evictions || []).forEach(e => {
+    const box = el("div", "evict");
+    const chip = e.agent ? "[agent:" + e.agent + "] " : "";
+    box.appendChild(el("div", "evict-head",
+      "\\u26a0 " + chip + "the block you tagged '" + e.label + "' at turn " +
+      e.tagged_seq + " was evicted at turn " + e.evicted_seq));
+    box.appendChild(el("div", "evict-snip", e.snippet));
+    box.appendChild(el("div", "evict-detail",
+      "[" + e.label + "\\u00b7" + e.role + "] " + fmt(e.tokens) +
+      " tok \\u00b7 entered at turn " + e.entered_seq +
+      " \\u00b7 last present at turn " + e.last_seen_seq +
+      " \\u00b7 never returned"));
+    host.appendChild(box);
+  });
 
   const bloat = D.tokens.bloat;
   if(bloat && bloat.unused_tools && bloat.unused_tools.length){

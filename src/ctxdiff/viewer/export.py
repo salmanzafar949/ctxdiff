@@ -54,7 +54,9 @@ import os
 
 from ctxdiff.analyze.cache import CacheReport, analyze_cache
 from ctxdiff.analyze.differ import TurnDiff, diff_turns, distinct_agents
+from ctxdiff.analyze.evictions import EvictionReport, analyze_evictions
 from ctxdiff.analyze.tokens import RunTokens, analyze_run, usage_totals
+from ctxdiff.analyze.window import CONTEXT_WINDOW_ALARM_PCT, window_pct
 from ctxdiff.store.ctrace import CTrace
 from ctxdiff.store.base import Call, Session, Store
 from ctxdiff.viewer.template import render_page
@@ -159,16 +161,33 @@ def _serialize_diff(td: TurnDiff) -> dict:
     }
 
 
-def _serialize_tokens(rt: RunTokens) -> dict:
+def _serialize_tokens(rt: RunTokens, context_window: int | None) -> dict:
     """A RunTokens -> a JSON dict: per-call label slices (with pct and the
     approximate flag) plus the run-level bloat report (null when the run has no
-    tool schemas to critique)."""
+    tool schemas to critique).
+
+    `context_window` and each call's `pct_of_window` carry the share-of-window
+    story into the page. The percentage is computed HERE rather than in the
+    template's JavaScript on purpose: `window_pct` rounds the way CPython's
+    `round` does, and the JS SDK's exporter rounds through its `pyRound1` twin,
+    so the two SDKs emit the same digits into the same file. A `toFixed` in the
+    browser would put a third rounding rule in the path and make the exported
+    HTML's hash depend on which SDK produced it. Both fields are null when no
+    window was supplied, and the page then renders exactly as it always has —
+    no percentages ctxdiff cannot back up.
+
+    `window_alarm_pct` travels with them so the page's warning styling and the
+    CLI's `⚠` marker trip at the same number, from one constant."""
     return {
+        "context_window": context_window,
+        "window_alarm_pct": CONTEXT_WINDOW_ALARM_PCT,
         "calls": [
             {
                 "seq": c.seq,
                 "total": c.total_tokens,
                 "approximate": c.approximate,
+                "pct_of_window": (None if context_window is None
+                                  else window_pct(c.total_tokens, context_window)),
                 "slices": [
                     {"label": s.label, "tokens": s.tokens, "pct": s.pct}
                     for s in c.slices
@@ -217,10 +236,42 @@ def _serialize_cache(cr: CacheReport) -> dict:
     }
 
 
+def _serialize_evictions(er: EvictionReport) -> dict:
+    """An EvictionReport -> a JSON dict: each tagged block that entered an
+    agent's context and left it for good, with the turn it was tagged on, the
+    turn its content entered, the turn it disappeared and enough of the block to
+    recognize it. `tagged_seq` and `entered_seq` are two different facts and both
+    travel, so the page can name the tag against the turn that carried it.
+
+    Only TAGGED blocks are ever in here (see `analyze.evictions`), so the
+    dashboard can render every entry as a warning without a threshold of its
+    own. `pairs_analyzed`/`tagged_blocks` travel along so the panel can tell
+    "nothing was tagged" apart from "nothing was lost" — two very different
+    reassurances."""
+    return {
+        "evictions": [
+            {
+                "label": e.label,
+                "agent": e.agent,
+                "tagged_seq": e.tagged_seq,
+                "entered_seq": e.entered_seq,
+                "last_seen_seq": e.last_seen_seq,
+                "evicted_seq": e.evicted_seq,
+                "tokens": e.tokens,
+                "role": e.role,
+                "snippet": e.snippet,
+            }
+            for e in er.evictions
+        ],
+        "pairs_analyzed": er.pairs_analyzed,
+        "tagged_blocks": er.tagged_blocks,
+    }
+
+
 # --- payload assembly ----------------------------------------------------------
 
 
-def build_payload(ct: Store) -> dict:
+def build_payload(ct: Store, context_window: int | None = None) -> dict:
     """Assemble every fact the dashboard renders into one JSON-serializable
     dict (spec §7.2, amended). Pure: it reads from `ct` and the three analyzers
     and returns a dict — no filesystem, no template, no HTML.
@@ -262,8 +313,11 @@ def build_payload(ct: Store) -> dict:
     # agent=None auto-groups per agent, so cross-agent hand-offs are never
     # miscounted as cache breaks.
     run_tokens = analyze_run(ct)
-    tokens_out = _serialize_tokens(run_tokens)
+    tokens_out = _serialize_tokens(run_tokens, context_window)
     cache_out = _serialize_cache(analyze_cache(ct))
+    # analyze_evictions groups per agent for the same reason analyze_cache does,
+    # so a hand-off is never embedded in the page as a lost block.
+    evictions_out = _serialize_evictions(analyze_evictions(ct))
 
     # stats: dedup ratio + context growth
     distinct: set[str] = set()
@@ -314,6 +368,7 @@ def build_payload(ct: Store) -> dict:
         "diffs": diffs_out,
         "tokens": tokens_out,
         "cache": cache_out,
+        "evictions": evictions_out,
         "stats": {
             "distinct_blocks": len(distinct),
             "total_block_refs": total_refs,
@@ -513,7 +568,8 @@ def _start_level(agent: str | None, session_selected: bool,
 
 def build_project_payload(reader, *, agent: str | None = None,
                           session_selected: bool = False,
-                          focus_session_id: str | None = None) -> dict:
+                          focus_session_id: str | None = None,
+                          context_window: int | None = None) -> dict:
     """Assemble the THREE-LEVEL dashboard payload: the focus session's detail at
     the top level (exactly the dict `build_payload` returns), plus one `project`
     key carrying the level-1 agent index, the level-2 session index, and the
@@ -554,10 +610,15 @@ def build_project_payload(reader, *, agent: str | None = None,
 
     # Non-focus details, newest first — the focus session's own detail is the
     # payload's top level and is never duplicated here.
-    details = {s["id"]: build_payload(_PinnedReader(reader, s["id"]))
+    # The window is threaded into EVERY embedded session, not just the focus
+    # one: the dashboard's level-3 view is reachable for each of them, and a page
+    # where three sessions show percentages and the fourth silently does not
+    # would read as a bug in the data rather than as one export flag.
+    details = {s["id"]: build_payload(_PinnedReader(reader, s["id"]),
+                                      context_window)
                for s in session_rows if s["detail"] and s["id"] != focus_id}
 
-    payload = build_payload(_PinnedReader(reader, focus_id))
+    payload = build_payload(_PinnedReader(reader, focus_id), context_window)
     payload["project"] = {
         "name": focus_run.project,
         "sessions_total": len(sessions),
@@ -611,7 +672,8 @@ def _embed_json(payload: dict) -> str:
 
 
 def export_html(ctrace_path: str, out_path: str | None = None, *,
-                agent: str | None = None, session_selected: bool = False) -> str:
+                agent: str | None = None, session_selected: bool = False,
+                context_window: int | None = None) -> str:
     """Export the trace at `ctrace_path` to a self-contained HTML dashboard and
     return the written path. `out_path` overrides the destination; by default
     the file is written as `<trace-stem>.html` right next to the trace. Opens
@@ -633,13 +695,15 @@ def export_html(ctrace_path: str, out_path: str | None = None, *,
             out_path = os.path.join(
                 os.path.dirname(os.path.abspath(ctrace_path)), f"{stem}.html")
         return export_store(ct, out_path, agent=agent,
-                            session_selected=session_selected)
+                            session_selected=session_selected,
+                            context_window=context_window)
     finally:
         ct.close()
 
 
 def export_store(ct: Store, out_path: str | None = None, *,
-                 agent: str | None = None, session_selected: bool = False) -> str:
+                 agent: str | None = None, session_selected: bool = False,
+                 context_window: int | None = None) -> str:
     """Export an ALREADY-OPEN store handle to a self-contained HTML dashboard
     and return the written path — the backend-agnostic export path, used when
     the trace lives in Postgres/MySQL and there is no file to name.
@@ -654,7 +718,8 @@ def export_store(ct: Store, out_path: str | None = None, *,
     `out_path`, the dashboard is written as `./<project>.html`, the only
     sensible default when the source has no filename to borrow one from."""
     payload = build_project_payload(ct, agent=agent,
-                                    session_selected=session_selected)
+                                    session_selected=session_selected,
+                                    context_window=context_window)
     project = payload["run"]["project"]
     document = render_page(project_title=html.escape(f"ctxdiff — {project}"),
                            data_json=_embed_json(payload))

@@ -1,0 +1,45 @@
+run total · in 408 tok · out 56 tok (5/5 calls reported usage)
+
+turn 1 · 57 / 120 tok · 47.5% [solo·answer]
+  ██████████                     rag                19 tok   33.3%
+  ██████                         notes              12 tok   21.1%
+  ██████                         system             11 tok   19.3%
+  █████                          brief               9 tok   15.8%
+  ███                            user                6 tok   10.5%
+  provider reports 60 prompt tokens · Δ +3
+
+turn 2 · 70 / 120 tok · 58.3% [solo·answer]
+  ████████                       rag                19 tok   27.1%
+  █████                          notes              12 tok   17.1%
+  █████                          system             11 tok   15.7%
+  █████                          user               11 tok   15.7%
+  ████                           brief               9 tok   12.9%
+  ███                            history             8 tok   11.4%
+  provider reports 90 prompt tokens · Δ +20
+
+turn 3 · 51 / 120 tok · 42.5% [solo·answer]
+  ███████                        notes              12 tok   23.5%
+  ██████                         system             11 tok   21.6%
+  ██████                         user               11 tok   21.6%
+  █████                          brief               9 tok   17.6%
+  █████                          history             8 tok   15.7%
+  provider reports 84 prompt tokens · Δ +33
+
+turn 4 · 48 / 120 tok · 40.0% [solo·answer]
+  ███████████                    history            17 tok   35.4%
+  ███████                        system             11 tok   22.9%
+  ███████                        user               11 tok   22.9%
+  ██████                         brief               9 tok   18.8%
+  provider reports 78 prompt tokens · Δ +30
+
+turn 5 · 61 / 120 tok · 50.8% [solo·answer]
+  ████████                       history            17 tok   27.9%
+  ██████                         notes              12 tok   19.7%
+  ██████                         user               12 tok   19.7%
+  █████                          system             11 tok   18.0%
+  ████                           brief               9 tok   14.8%
+  provider reports 96 prompt tokens · Δ +35
+
+⚠ [agent:solo] the block you tagged 'rag' at turn 1 was evicted at turn 3
+  'Enterprise pricing FAQ: the 2026 volume discount is 22 percent above 500 seats.'
+  [rag·user] 19 tok · entered at turn 1 · last present at turn 2 · never returned

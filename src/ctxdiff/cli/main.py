@@ -20,12 +20,19 @@ import re
 import sys
 import tempfile
 import webbrowser
+from dataclasses import replace
 from typing import NamedTuple
 
 from ctxdiff.analyze.cache import analyze_cache
 from ctxdiff.analyze.check import Thresholds, analyze_check
 from ctxdiff.analyze.differ import diff_calls, diff_turns
+from ctxdiff.analyze.evictions import analyze_evictions
 from ctxdiff.analyze.tokens import analyze_run, registered_tool_names, usage_totals
+from ctxdiff.analyze.window import (
+    CONTEXT_WINDOW_ENV,
+    ContextWindowError,
+    resolve_context_window,
+)
 from ctxdiff.cli.render import (
     render_agent_summary,
     render_agents_list,
@@ -446,6 +453,41 @@ def _pct_float(value: str) -> float:
     return float(value)
 
 
+# The `--context-window` help, stated ONCE and shared by `tokens`, `view` and
+# `export` (`check` keeps its own wording, because there the window is not a
+# display denominator but the thing `--max-context-pct` is asserted against).
+_CONTEXT_WINDOW_HELP = (
+    "the model's context window, in tokens — the denominator every percentage "
+    f"is taken against (default: ${CONTEXT_WINDOW_ENV}, if set). Yours to "
+    "supply: ctxdiff ships no model→window table by design, so with no window "
+    "no percentage is shown")
+
+
+def _add_context_window_flag(p: argparse.ArgumentParser) -> None:
+    """Register `--context-window N` on a command that DISPLAYS percentages.
+
+    Kept as one function so `tokens`, `view` and `export` cannot drift apart in
+    spelling, type or help text, and so every one of them feeds the same
+    `_resolve_window` — the flag and the environment variable are resolved in
+    exactly one place for the whole CLI (see `analyze.window`)."""
+    p.add_argument("--context-window", type=_turn_int, default=None, metavar="N",
+                   help=_CONTEXT_WINDOW_HELP)
+
+
+def _resolve_window(args: argparse.Namespace) -> int | None:
+    """The context window this invocation should render percentages against:
+    `--context-window` if typed, else `CTXDIFF_CONTEXT_WINDOW`, else None.
+
+    An unusable environment value is re-raised as a `SelectionError` so it
+    reports as the usage error it is (exit 2, message printed verbatim) rather
+    than as a failure to read a trace — the variable is part of how the command
+    was invoked, not part of what it was pointed at."""
+    try:
+        return resolve_context_window(args.context_window)
+    except ContextWindowError as exc:
+        raise SelectionError(str(exc)) from exc
+
+
 def _add_project_flags(p: argparse.ArgumentParser) -> None:
     """Register `--project` plus its hidden `--run` alias. Both write the same
     `project` dest, so every existing `--run PATH` invocation and script keeps
@@ -494,6 +536,7 @@ def _add_tokens_parser(subparsers: argparse._SubParsersAction) -> None:
         "tokens", help="token heatmap + schema-bloat report")
     p.add_argument("--turn", type=_turn_int, default=None,
                     help="limit output to one turn (call seq) number")
+    _add_context_window_flag(p)
     _add_selector_flags(p)
     p.set_defaults(func=_cmd_tokens)
 
@@ -531,6 +574,9 @@ def _add_check_parser(subparsers: argparse._SubParsersAction) -> None:
                    help="fail if the prompt-cache prefix breaks anywhere in the run")
     p.add_argument("--no-dead-schemas", action="store_true",
                    help="fail if a tool schema is registered but never invoked")
+    p.add_argument("--no-tagged-eviction", action="store_true",
+                   help="fail if a block you tagged with tracer.tag() entered "
+                        "an agent's context and later left it for good")
     p.add_argument("--max-growth", type=_turn_int, default=None, metavar="N",
                    help="fail if the context grows by more than N tokens between "
                         "two consecutive turns of the same agent")
@@ -586,6 +632,7 @@ def _add_export_parser(subparsers: argparse._SubParsersAction) -> None:
     _add_project_flags(p)
     p.add_argument("--session", default=None, help=_DASHBOARD_SESSION_HELP)
     p.add_argument("--agent", default=None, help=_DASHBOARD_AGENT_HELP)
+    _add_context_window_flag(p)
     p.add_argument("--out", default=None,
                     help="output .html path (default: <trace-stem>.html next to the trace)")
     p.set_defaults(func=_cmd_export)
@@ -623,6 +670,7 @@ def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
     _add_project_flags(p)
     p.add_argument("--session", default=None, help=_DASHBOARD_SESSION_HELP)
     p.add_argument("--agent", default=None, help=_DASHBOARD_AGENT_HELP)
+    _add_context_window_flag(p)
     p.add_argument("--no-open", action="store_true", dest="no_open",
                     help="write and print the HTML path but do not open a browser")
     p.set_defaults(func=_cmd_view)
@@ -914,7 +962,19 @@ def _cmd_tokens(args: argparse.Namespace) -> int:
     mirroring `diff`'s behavior). When there IS unused-schema bloat to report, a
     second pass over the session's blocks derives "M" (how many tools are
     registered in total) for the "N of M" bloat message — cheap relative to the
-    session size, and only paid when there's something to report."""
+    session size, and only paid when there's something to report.
+
+    Two things beyond the attribution itself: the context window is resolved
+    FIRST (before any store is opened, so a bad `CTXDIFF_CONTEXT_WINDOW` fails
+    the same way with or without a trace present), and the tagged-eviction
+    detector runs over the same session so a block the developer marked as
+    load-bearing that silently left the context is named right under the turn
+    that lost it."""
+    try:
+        context_window = _resolve_window(args)
+    except SelectionError as exc:
+        return _report_selection_error(exc)
+
     try:
         ct, _, discovered = _open_session(args.project, args.session)
     except SelectionError as exc:
@@ -951,8 +1011,19 @@ def _cmd_tokens(args: argparse.Namespace) -> int:
         # block-token summary is only non-None for an unfiltered multi-agent run.
         usage_summary = render_usage_summary(run_tokens.usage, args.agent)
         agent_summary = render_agent_summary(run_tokens)
+        # The detector always runs over the whole session — an eviction is a fact
+        # about a PAIR of turns, so it cannot be computed from one turn's blocks
+        # — but under `--turn N` the report shown beside it covers exactly that
+        # turn, and a stanza saying "…was evicted at turn 3" under a turn-1
+        # report names something the reader did not ask about and cannot see
+        # above it. So the events are filtered to the turn that LOST the block.
+        evictions = analyze_evictions(ct, agent=args.agent)
+        if args.turn is not None:
+            evictions = replace(evictions, evictions=[
+                e for e in evictions.evictions if e.evicted_seq == args.turn])
         print(render_run_tokens(selected, run_tokens.bloat, total_tools,
-                                agent_summary, usage_summary))
+                                agent_summary, usage_summary,
+                                context_window, evictions))
     finally:
         ct.close()
     return 0
@@ -990,7 +1061,8 @@ def _cmd_cache(args: argparse.Namespace) -> int:
 # them — the same order the report prints its rows in, so the message reads as
 # a menu of what the command can do rather than an arbitrary list.
 _ASSERTION_FLAGS = ("--max-context", "--max-context-pct", "--require-stable-prefix",
-                    "--no-dead-schemas", "--max-growth", "--max-growth-pct")
+                    "--no-dead-schemas", "--no-tagged-eviction", "--max-growth",
+                    "--max-growth-pct")
 
 
 def _check_thresholds(args: argparse.Namespace) -> Thresholds:
@@ -1004,29 +1076,47 @@ def _check_thresholds(args: argparse.Namespace) -> Thresholds:
        otherwise exit 0 having verified nothing — a green tick in CI that means
        "nobody asked a question", which is the exact failure this command
        exists to prevent.
-    2. `--max-context-pct` without `--context-window` is refused, because the
+    2. `--max-context-pct` with NO window at all is refused, because the
        percentage has no denominator. ctxdiff deliberately ships no
        model→window table (windows differ per model and per provider and change
        under you; a stale table would silently move everyone's threshold), so
-       the window is the user's to supply.
-    3. `--context-window` without `--max-context-pct` is refused too — nothing
-       would consume it, and silently ignoring a flag someone typed is how a CI
-       gate ends up asserting less than its author believes.
+       the window is the user's to supply — as `--context-window N` or as
+       `CTXDIFF_CONTEXT_WINDOW`, resolved by the ONE `_resolve_window` path
+       `ctxdiff tokens` and the dashboard use, so a gate and the report beside
+       it can never be scored against two different windows.
+    3. The `--context-window` FLAG without `--max-context-pct` is refused too —
+       nothing would consume it, and silently ignoring a flag someone typed is
+       how a CI gate ends up asserting less than its author believes. Only the
+       flag: an inherited `CTXDIFF_CONTEXT_WINDOW` is ambient configuration for
+       the whole shell, and failing a `--max-context` check because the
+       environment happens to know the window would be absurd.
     4. A limit outside its legal range is refused: the two absolute budgets and
        the percentage must be POSITIVE (a zero context window is a division by
        zero, and a zero-token budget is not an assertion anyone means), while
        the two growth limits may legitimately be zero — "this context must not
        grow at all" is a real thing to assert."""
+    # Rule 4 for the WINDOW FLAG is stated here, before the shared resolver gets
+    # a chance to state it in its own words. `resolve_context_window` refuses a
+    # non-positive flag too (so `tokens`/`view`/`export` inherit the rule), but
+    # its message is the generic `ctxdiff:` one; every usage error `check` emits
+    # is prefixed `ctxdiff check:`, which is what tells a CI log which step
+    # spoke. Only the flag needs the early guard: an environment-supplied window
+    # is already positive by the time `parse_context_window` returns it.
+    if args.context_window is not None and args.context_window <= 0:
+        raise SelectionError("ctxdiff check: --context-window must be greater "
+                             f"than 0 (got {args.context_window})")
+    context_window = _resolve_window(args)
     # Built first so "was anything asked for?" is answered by the value object's
     # own `any_requested` — the single definition of that question, shared with
     # the analyzer instead of restated as a second `any([...])` that could fall
     # out of step with it the next time a flag is added.
     thresholds = Thresholds(
         max_context=args.max_context,
-        context_window=args.context_window,
+        context_window=context_window,
         max_context_pct=args.max_context_pct,
         require_stable_prefix=args.require_stable_prefix,
         no_dead_schemas=args.no_dead_schemas,
+        no_tagged_eviction=args.no_tagged_eviction,
         max_growth=args.max_growth,
         max_growth_pct=args.max_growth_pct,
     )
@@ -1034,7 +1124,7 @@ def _check_thresholds(args: argparse.Namespace) -> Thresholds:
         raise SelectionError(
             "ctxdiff check: nothing to assert — pass at least one of "
             + ", ".join(_ASSERTION_FLAGS))
-    if args.max_context_pct is not None and args.context_window is None:
+    if args.max_context_pct is not None and context_window is None:
         raise SelectionError(
             "ctxdiff check: --max-context-pct needs a denominator — pass "
             "--context-window N (ctxdiff ships no model→window table by design, "
@@ -1048,11 +1138,9 @@ def _check_thresholds(args: argparse.Namespace) -> Thresholds:
     # the same way every percentage in the report itself is written — so the
     # error echoes what the user typed without either CLI having to reproduce
     # the other's general-purpose float formatting.
-    for flag, value in (("--max-context", args.max_context),
-                        ("--context-window", args.context_window)):
-        if value is not None and value <= 0:
-            raise SelectionError(
-                f"ctxdiff check: {flag} must be greater than 0 (got {value})")
+    if args.max_context is not None and args.max_context <= 0:
+        raise SelectionError("ctxdiff check: --max-context must be greater "
+                             f"than 0 (got {args.max_context})")
     if args.max_context_pct is not None and args.max_context_pct <= 0:
         raise SelectionError("ctxdiff check: --max-context-pct must be greater "
                              f"than 0 (got {args.max_context_pct:.1f})")
@@ -1301,7 +1389,16 @@ def _cmd_export(args: argparse.Namespace) -> int:
     -> exit 1 with a message), and prints the written path on success. With no
     `--out`, a file-backed trace writes `<stem>.html` beside itself and a
     database-backed one has no filename to borrow, so `--out` is required
-    there."""
+    there.
+
+    The context window is resolved before the project is opened (same order
+    `tokens` uses, so a bad `CTXDIFF_CONTEXT_WINDOW` fails identically with or
+    without a trace present) and embedded in the page, which is what lets a
+    dashboard someone else opens show percentages with no flag of their own."""
+    try:
+        context_window = _resolve_window(args)
+    except SelectionError as exc:
+        return _report_selection_error(exc)
     try:
         ct, default_out, selected = _open_dashboard(args.project, args.session,
                                                     args.agent)
@@ -1311,7 +1408,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
         return _report_open_failure(exc)
     try:
         out = export_store(ct, args.out or default_out, agent=args.agent,
-                           session_selected=selected)
+                           session_selected=selected,
+                           context_window=context_window)
     except Exception as exc:  # noqa: BLE001 — any export failure is reported, not crashed
         print(f"ctxdiff: {exc}", file=sys.stderr)
         return 1
@@ -1328,7 +1426,14 @@ def _cmd_view(args: argparse.Namespace) -> int:
     in the default browser via a `file://` URL unless `--no-open` is set. The
     browser launch is wrapped so a failing/absent browser NEVER crashes the
     command — the path is already printed, so the user can always open the file
-    themselves."""
+    themselves. `--context-window` (or `CTXDIFF_CONTEXT_WINDOW`) is resolved
+    through the same `_resolve_window` every other command uses and embedded in
+    the page, so the dashboard's percentages and `ctxdiff tokens`' percentages
+    are always the same number."""
+    try:
+        context_window = _resolve_window(args)
+    except SelectionError as exc:
+        return _report_selection_error(exc)
     try:
         ct, _, selected = _open_dashboard(args.project, args.session, args.agent)
     except SelectionError as exc:
@@ -1341,7 +1446,8 @@ def _cmd_view(args: argparse.Namespace) -> int:
     fd, tmp = tempfile.mkstemp(suffix=".html")
     os.close(fd)
     try:
-        out = export_store(ct, tmp, agent=args.agent, session_selected=selected)
+        out = export_store(ct, tmp, agent=args.agent, session_selected=selected,
+                           context_window=context_window)
     except Exception as exc:  # noqa: BLE001 — any export failure is reported, not crashed
         print(f"ctxdiff: {exc}", file=sys.stderr)
         return 1

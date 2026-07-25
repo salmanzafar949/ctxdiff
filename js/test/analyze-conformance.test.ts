@@ -191,6 +191,44 @@ beforeAll(() => {
     // in the same words — "fewer than 2 turns" over four turns is the wording
     // that hides a no-op assertion.
     { name: "check fan-out (4 agents, 1 turn each) — no pairs", argv: ["check", "--run", fx.fanout, "--require-stable-prefix", "--max-growth", "0", "--max-growth-pct", "0"] },
+
+    // --- share of the context window -----------------------------------------
+    // The denominator is the user's to supply, so the flag is the only thing
+    // that turns a bare token count into `X / W tok · P%`. Both sides of the
+    // alarm threshold are compared, because a marker that appeared in one SDK
+    // and not the other would be a difference nobody could explain.
+    { name: "tokens --context-window (share + percentage)", argv: ["tokens", "--run", fx.multiturn, "--context-window", "1000"] },
+    { name: "tokens --context-window below the alarm", argv: ["tokens", "--run", fx.multiturn, "--context-window", "120"] },
+    { name: "tokens --context-window past the alarm", argv: ["tokens", "--run", fx.multiturn, "--context-window", "60"] },
+    { name: "tokens --context-window multiagent", argv: ["tokens", "--run", fx.multiagent, "--context-window", "100"] },
+    // A run whose totals are FLOORS: `(~approx)` must survive the header being
+    // rewritten into a share, and must sit after the percentage in both.
+    { name: "tokens --context-window with unmeasured turns", argv: ["tokens", "--run", fx.unmeasured, "--context-window", "1000"] },
+    { name: "tokens --context-window --turn", argv: ["tokens", "--run", fx.multiturn, "--turn", "2", "--context-window", "1000"] },
+
+    // --- tagged evictions ------------------------------------------------------
+    // The interleaved fixture is the point: the hand-off at turn 2 must produce
+    // NO line in either SDK, and the researcher's real loss at turn 5 must
+    // produce the same one, with the same agent chip and the same snippet
+    // quoting.
+    { name: "tokens tagged evictions (hand-off is not a loss)", argv: ["tokens", "--run", fx.tagged] },
+    { name: "tokens tagged evictions --agent researcher", argv: ["tokens", "--run", fx.tagged, "--agent", "researcher"] },
+    { name: "tokens tagged evictions --agent writer (nothing tagged)", argv: ["tokens", "--run", fx.tagged, "--agent", "writer"] },
+    // `--turn N` selects one turn, and the stanza obeys the same selector in
+    // both SDKs: silent under the turn that still HAD the block, printed under
+    // the turn that lost it.
+    { name: "tokens tagged evictions --turn 1 (before the loss)", argv: ["tokens", "--run", fx.tagged, "--turn", "1"] },
+    { name: "tokens tagged evictions --turn 5 (the losing turn)", argv: ["tokens", "--run", fx.tagged, "--turn", "5"] },
+    { name: "check --no-tagged-eviction violation", code: 1, argv: ["check", "--run", fx.tagged, "--no-tagged-eviction"] },
+    { name: "check --no-tagged-eviction scoped to the losing agent", code: 1, argv: ["check", "--run", fx.tagged, "--agent", "researcher", "--no-tagged-eviction"] },
+    // Three different PASSes that must not read alike: nothing tagged, nothing
+    // paired, and a genuine all-clear.
+    { name: "check --no-tagged-eviction (nothing tagged)", argv: ["check", "--run", fx.multiturn, "--no-tagged-eviction"] },
+    { name: "check --no-tagged-eviction (nothing to pair)", argv: ["check", "--run", fx.fanout, "--no-tagged-eviction"] },
+    { name: "check --no-tagged-eviction --agent writer (vacuous pass)", argv: ["check", "--run", fx.tagged, "--agent", "writer", "--no-tagged-eviction"] },
+    // Every assertion at once, so the fixed report ORDER with the new row in it
+    // is compared rather than assumed.
+    { name: "check every assertion including tagged eviction", code: 1, argv: ["check", "--run", fx.tagged, "--max-context", "1", "--context-window", "100", "--max-context-pct", "10", "--require-stable-prefix", "--no-dead-schemas", "--no-tagged-eviction", "--max-growth", "0", "--max-growth-pct", "0"] },
   );
 });
 
@@ -391,6 +429,42 @@ beforeAll(() => {
       core: "--max-context must be greater than 0 (got 0)",
       exactStderr: true,
     },
+    // A window of zero is a division by zero and a negative one is not a window,
+    // whichever command was asked. The rule lives in the ONE resolver so all
+    // four inherit it — and it used to be enforced ONLY by `check`, which is why
+    // `tokens --context-window 0` was a ZeroDivisionError traceback in Python and
+    // an `⚠ Infinity%` report (exit 0!) in JS. `check` keeps its own `ctxdiff
+    // check:` prefix, so both spellings are pinned here.
+    {
+      name: "tokens --context-window 0 → exit 2, not a division by zero",
+      argv: ["tokens", "--run", fx.multiturn, "--context-window", "0"],
+      core: "ctxdiff: --context-window must be greater than 0 (got 0)",
+      exactStderr: true,
+    },
+    {
+      name: "tokens --context-window -5 → exit 2, not a -260.0% header",
+      argv: ["tokens", "--run", fx.multiturn, "--context-window", "-5"],
+      core: "ctxdiff: --context-window must be greater than 0 (got -5)",
+      exactStderr: true,
+    },
+    {
+      name: "export --context-window 0 → exit 2, not a dashboard of Infinity%",
+      argv: ["export", "--run", fx.multiturn, "--context-window", "0", "--out", join(dir, "zero-window.html")],
+      core: "ctxdiff: --context-window must be greater than 0 (got 0)",
+      exactStderr: true,
+    },
+    {
+      name: "export --context-window -5 → exit 2 (a value, not an option)",
+      argv: ["export", "--run", fx.multiturn, "--context-window", "-5", "--out", join(dir, "neg-window.html")],
+      core: "ctxdiff: --context-window must be greater than 0 (got -5)",
+      exactStderr: true,
+    },
+    {
+      name: "check --context-window 0 → exit 2, in check's own words",
+      argv: ["check", "--run", fx.multiturn, "--max-context-pct", "50", "--context-window", "0"],
+      core: "ctxdiff check: --context-window must be greater than 0 (got 0)",
+      exactStderr: true,
+    },
     {
       name: "check --max-context-pct 0 → exit 2, one-decimal echo",
       argv: ["check", "--run", fx.multiturn, "--max-context-pct", "0", "--context-window", "10"],
@@ -462,6 +536,46 @@ describe.skipIf(!hasVenv)("cross-language analyzer conformance (JS output === Py
       expect(py.code, `python exited ${py.code} for ${c.name}\n${py.err}`).toBe(expected);
       expect(js.code, `js exited ${js.code} for ${c.name}\n${js.err}`).toBe(expected);
       expect(js.out, `mismatch for: ${c.name}`).toBe(py.out);
+    }
+  });
+
+  it("resolves CTXDIFF_CONTEXT_WINDOW identically in both SDKs", async () => {
+    // The environment path cannot be expressed as argv, so it gets its own case.
+    // `runPy` forwards `process.env` to the child and `runJs` runs in-process,
+    // so setting the variable here exercises BOTH resolvers with one value.
+    //
+    // Four things are compared: that the variable alone produces percentages;
+    // that a flag beats it; that `check`'s `--max-context-pct` accepts it as its
+    // denominator with no flag typed; and that an unusable value is the same
+    // exit code and the same message on both sides — a CI job that inherits a
+    // typo'd variable must fail the same way whichever SDK the workflow picked.
+    const saved = process.env.CTXDIFF_CONTEXT_WINDOW;
+    try {
+      const compare = async (argv: string[], expected: number) => {
+        const js = await runJs(argv);
+        const py = runPy(argv);
+        expect(py.code, `python exited ${py.code}\n${py.err}`).toBe(expected);
+        expect(js.code).toBe(py.code);
+        expect(js.out).toBe(py.out);
+        expect(js.err).toBe(py.err);
+      };
+
+      process.env.CTXDIFF_CONTEXT_WINDOW = "1000";
+      await compare(["tokens", "--run", fx.multiturn], 0);
+      await compare(["tokens", "--run", fx.multiturn, "--context-window", "80"], 0);
+      await compare(["check", "--run", fx.multiturn, "--max-context-pct", "1"], 1);
+      // An ambient window must never trip check's "you typed a flag nothing
+      // reads" rule — only a typed flag can.
+      await compare(["check", "--run", fx.multiturn, "--max-context", "1000000"], 0);
+
+      process.env.CTXDIFF_CONTEXT_WINDOW = "not-a-number";
+      await compare(["tokens", "--run", fx.multiturn], 2);
+
+      process.env.CTXDIFF_CONTEXT_WINDOW = "   ";
+      await compare(["tokens", "--run", fx.multiturn], 0);
+    } finally {
+      if (saved === undefined) delete process.env.CTXDIFF_CONTEXT_WINDOW;
+      else process.env.CTXDIFF_CONTEXT_WINDOW = saved;
     }
   });
 

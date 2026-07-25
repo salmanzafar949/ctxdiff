@@ -7,9 +7,12 @@ and a hand-read `ctxdiff tokens`/`ctxdiff cache` can never tell two different
 stories. So every number this module compares against a threshold is one the
 other commands already print: turn totals and schema bloat come from
 `tokens.analyze_run`, prefix breaks (including the digest-based attribution for
-same-slot image swaps) come from `cache.analyze_cache`, and the "N of M
-registered tools" denominator comes from `tokens.registered_tool_names` — the
-very call `ctxdiff tokens` makes for its own bloat line. What is genuinely new
+same-slot image swaps) come from `cache.analyze_cache`, evicted tagged blocks
+come from `evictions.analyze_evictions` (the differ's own `evicted`
+classification, scoped per agent, narrowed to `label_source == 'tagged'`), and
+the "N of M registered tools" denominator comes from
+`tokens.registered_tool_names` — the very call `ctxdiff tokens` makes for its
+own bloat line. What is genuinely new
 here is only: comparison against a user-supplied limit, the selection of which
 turn/agent/block to blame, and the wording of the violation.
 
@@ -54,12 +57,14 @@ from ctxdiff.analyze.cache import (
     pairs_denominator,
 )
 from ctxdiff.analyze.differ import filter_calls
+from ctxdiff.analyze.evictions import EvictionReport, analyze_evictions
 from ctxdiff.analyze.tokens import (
     CallTokens,
     RunTokens,
     analyze_run,
     registered_tool_names,
 )
+from ctxdiff.analyze.window import pct_text, round1
 from ctxdiff.store.base import Store
 
 # --- the assertion surface ------------------------------------------------------
@@ -72,11 +77,13 @@ MAX_CONTEXT = "max-context"
 MAX_CONTEXT_PCT = "max-context-pct"
 REQUIRE_STABLE_PREFIX = "require-stable-prefix"
 NO_DEAD_SCHEMAS = "no-dead-schemas"
+NO_TAGGED_EVICTION = "no-tagged-eviction"
 MAX_GROWTH = "max-growth"
 MAX_GROWTH_PCT = "max-growth-pct"
 
 ASSERTION_ORDER = [MAX_CONTEXT, MAX_CONTEXT_PCT, REQUIRE_STABLE_PREFIX,
-                   NO_DEAD_SCHEMAS, MAX_GROWTH, MAX_GROWTH_PCT]
+                   NO_DEAD_SCHEMAS, NO_TAGGED_EVICTION,
+                   MAX_GROWTH, MAX_GROWTH_PCT]
 
 # Width the renderer left-justifies an assertion name to: the longest name in
 # ASSERTION_ORDER, so every summary starts in the same column.
@@ -94,12 +101,17 @@ class Thresholds:
     `max_context_pct` is a percentage OF. ctxdiff ships no model→window table
     by design (they change per model and per provider, and a stale table would
     silently move everyone's CI threshold), so the window is supplied by the
-    user or the percentage assertion is simply not available."""
+    user or the percentage assertion is simply not available. The CLI fills this
+    field through `analyze.window.resolve_context_window` — the same
+    flag-then-`CTXDIFF_CONTEXT_WINDOW` path `ctxdiff tokens` and the dashboard
+    use, so a gate and the report a human reads beside it can never be scored
+    against two different windows."""
     max_context: int | None = None
     context_window: int | None = None
     max_context_pct: float | None = None
     require_stable_prefix: bool = False
     no_dead_schemas: bool = False
+    no_tagged_eviction: bool = False
     max_growth: int | None = None
     max_growth_pct: float | None = None
 
@@ -113,6 +125,7 @@ class Thresholds:
             self.max_context_pct is not None,
             self.require_stable_prefix,
             self.no_dead_schemas,
+            self.no_tagged_eviction,
             self.max_growth is not None,
             self.max_growth_pct is not None,
         ])
@@ -186,15 +199,18 @@ def _plural(n: int, word: str) -> str:
 def _pct(value: float) -> str:
     """A percentage rendered to one decimal. Values are rounded to 1 decimal
     BEFORE formatting (see `_round1`) so the JS twin's `toFixed(1)` and this
-    `:.1f` cannot disagree on a boundary case."""
-    return f"{value:.1f}"
+    `:.1f` cannot disagree on a boundary case. Delegates to `analyze.window` so
+    the percentage `check` prints and the percentage `tokens` prints go through
+    ONE formatter — the two commands quoting the same trace must never differ in
+    the last digit."""
+    return pct_text(value)
 
 
 def _round1(value: float) -> float:
-    """`round(value, 1)` — factored out so the JS port has one named thing to
-    mirror with its `pyRound1` helper rather than an inline `round` call at
-    each site."""
-    return round(value, 1)
+    """`round(value, 1)` — the shared rounding step from `analyze.window`, named
+    here so every call site in this module reads the same and the JS port has
+    one thing to mirror with its `pyRound1` helper."""
+    return round1(value)
 
 
 def _approx_marker(call: CallTokens) -> str:
@@ -470,6 +486,63 @@ def _check_no_dead_schemas(run_tokens: RunTokens,
         f"({_pct(bloat.pct_of_avg_context)}% of avg context)", details)
 
 
+# --- no-tagged-eviction ------------------------------------------------------------
+
+
+def _check_no_tagged_eviction(report: EvictionReport, turns: int,
+                              agents: int) -> AssertionResult:
+    """Fail when a block the developer TAGGED entered the context and later left
+    it for good — the existing eviction detector, with a threshold of zero.
+
+    Every word of every line comes from `analyze_evictions`: the tag, the turn
+    the block entered, the turn it disappeared, the per-agent scoping and the
+    "it never came back" rule are all decided there, so a green `check` and a
+    hand-read `ctxdiff tokens` can never tell two different stories about the
+    same trace. What is new here is only the comparison against zero.
+
+    Three states are reported rather than two, because "PASS" has three
+    different meanings and only one of them is reassuring:
+
+    - nothing was TAGGED at all — the assertion is structurally vacuous, and
+      saying so is what tells a reader to go add a `tracer.tag()` rather than
+      trust a tick that measured nothing;
+    - nothing could be PAIRED (a single turn, or a fan-out where each agent has
+      one turn) — the same no-pairs distinction every other assertion draws;
+    - tagged blocks existed, pairs existed, and none of them was evicted, which
+      is the pass that actually means something."""
+    if report.tagged_blocks == 0:
+        return AssertionResult(
+            NO_TAGGED_EVICTION, True,
+            "no tagged blocks in this run — nothing to lose "
+            "(tag load-bearing content with tracer.tag)", [])
+    if report.pairs_analyzed == 0:
+        return AssertionResult(
+            NO_TAGGED_EVICTION, True,
+            _no_pairs_summary(turns, agents, "pairs to check"), [])
+    tagged_text = (f"all {_plural(report.tagged_blocks, 'tagged block')} "
+                   f"survived {_plural(report.pairs_analyzed, 'turn pair')}")
+    if not report.evictions:
+        return AssertionResult(NO_TAGGED_EVICTION, True, tagged_text, [])
+    # The TAG is the one fragment of these lines the developer authored rather
+    # than ctxdiff, so it goes through `_flatten` for the same reason a tool
+    # schema's name does: one violation, one line, even inside the Action's
+    # fenced job summary.
+    details = [
+        f"the block you tagged '{_flatten(e.label)}' at turn {e.tagged_seq}"
+        f"{_agent_chip(e.agent)} was evicted at turn {e.evicted_seq} · "
+        f"{e.tokens:,} tok"
+        for e in report.evictions
+    ]
+    # One event per tagged block per agent (`analyze_evictions` dedupes by
+    # content hash within each group), so this numerator and `tagged_blocks`
+    # count the same kind of thing and the sentence cannot contradict itself.
+    return AssertionResult(
+        NO_TAGGED_EVICTION, False,
+        f"{_plural(len(report.evictions), 'tagged block')} evicted of "
+        f"{report.tagged_blocks} across "
+        f"{_plural(report.pairs_analyzed, 'turn pair')}", details)
+
+
 # --- max-growth / max-growth-pct ---------------------------------------------------
 
 
@@ -638,6 +711,8 @@ def analyze_check(ct: Store, thresholds: Thresholds,
 
     run_tokens = analyze_run(ct, agent=agent) if thresholds.needs_token_analysis else None
     cache_report = analyze_cache(ct, agent=agent) if thresholds.require_stable_prefix else None
+    eviction_report = (analyze_evictions(ct, agent=agent)
+                       if thresholds.no_tagged_eviction else None)
 
     results: list[AssertionResult] = []
     if run_tokens is not None and thresholds.max_context is not None:
@@ -661,6 +736,11 @@ def analyze_check(ct: Store, thresholds: Thresholds,
         all_blocks = [ct.get_call_blocks(c.id) for c in ct.get_calls()]
         results.append(_check_no_dead_schemas(
             run_tokens, len(registered_tool_names(all_blocks))))
+    if eviction_report is not None:
+        # Same turn/agent counts the prefix assertion gets, and for the same
+        # reason: an EvictionReport with zero pairs cannot say WHY it has none.
+        results.append(_check_no_tagged_eviction(
+            eviction_report, len(calls), len({c.agent for c in calls})))
     if run_tokens is not None and thresholds.max_growth is not None:
         results.append(_check_max_growth(run_tokens.calls, thresholds.max_growth))
     if run_tokens is not None and thresholds.max_growth_pct is not None:

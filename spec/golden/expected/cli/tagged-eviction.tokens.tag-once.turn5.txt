@@ -1,0 +1,11 @@
+run total · in 321 tok · out 60 tok (5/5 calls reported usage)
+
+turn 5 · 49 tokens [returns·answer]
+  ████████████                   history            20 tok   40.8%
+  ████████████                   user               19 tok   38.8%
+  ██████                         system             10 tok   20.4%
+  provider reports 61 prompt tokens · Δ +12
+
+⚠ [agent:returns] the block you tagged 'rag' at turn 1 was evicted at turn 5
+  'Refund policy: 30 days from delivery, unworn items only.'
+  [rag·user] 14 tok · entered at turn 1 · last present at turn 4 · never returned

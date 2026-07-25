@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 
 import yaml
 
@@ -240,6 +241,13 @@ def _run_check_step(tmp_path, env: dict, report: str = "ctxdiff check · 1 turn"
 
     # The `env:` block's defaults, resolved from the inputs exactly as GitHub
     # would resolve them when a workflow sets nothing.
+    #
+    # DERIVED from the step's own `env:` mapping rather than listed by hand: the
+    # step runs under `set -u`, so an env var the action references and this
+    # harness forgets is an UNBOUND VARIABLE — the script dies at line one with
+    # exit 127 and every test in the file fails with an error that says nothing
+    # about the missing name. Reading the mapping means adding an assertion to
+    # the action can never break the harness that tests it.
     inputs = _action()["inputs"]
     full_env = {
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -249,20 +257,11 @@ def _run_check_step(tmp_path, env: dict, report: str = "ctxdiff check · 1 turn"
         "STUB_REPORT": report,
         "STUB_CODE": str(code),
         "NO_COLOR": "1",
-        "RUNTIME": inputs["runtime"]["default"],
-        "VERSION": inputs["version"]["default"],
-        "SUMMARY": inputs["summary"]["default"],
-        "IN_PROJECT": inputs["project"]["default"],
-        "IN_SESSION": inputs["session"]["default"],
-        "IN_AGENT": inputs["agent"]["default"],
-        "IN_MAX_CONTEXT": inputs["max-context"]["default"],
-        "IN_CONTEXT_WINDOW": inputs["context-window"]["default"],
-        "IN_MAX_CONTEXT_PCT": inputs["max-context-pct"]["default"],
-        "IN_MAX_GROWTH": inputs["max-growth"]["default"],
-        "IN_MAX_GROWTH_PCT": inputs["max-growth-pct"]["default"],
-        "IN_REQUIRE_STABLE_PREFIX": inputs["require-stable-prefix"]["default"],
-        "IN_NO_DEAD_SCHEMAS": inputs["no-dead-schemas"]["default"],
     }
+    for name, expression in (step.get("env") or {}).items():
+        match = re.search(r"inputs\.([\w-]+)", str(expression))
+        if match:
+            full_env[name] = inputs[match.group(1)]["default"]
     full_env.update(env)
     proc = subprocess.run([bash, "-c", step["run"]], capture_output=True,
                           text=True, env=full_env)

@@ -80,8 +80,20 @@ export type {
   UsageTotals,
   RunTokens,
 } from "./analyze/tokens.js";
-export { analyzeCache, groupBreaks, pairsDenominator } from "./analyze/cache.js";
+export { analyzeCache, groupBreaks, pairsDenominator, flattenSnippet } from "./analyze/cache.js";
 export type { PrefixBreak, CacheReport } from "./analyze/cache.js";
+export { analyzeEvictions } from "./analyze/evictions.js";
+export type { TaggedEviction, EvictionReport } from "./analyze/evictions.js";
+export {
+  CONTEXT_WINDOW_ENV,
+  CONTEXT_WINDOW_ALARM_PCT,
+  ContextWindowError,
+  parseContextWindow,
+  resolveContextWindow,
+  windowPct,
+  isAlarming,
+  formatWindowShare,
+} from "./analyze/window.js";
 export {
   analyzeCheck,
   checkPassed,
@@ -101,6 +113,7 @@ export {
   renderAgentSummary,
   renderCacheReport,
   renderCheckReport,
+  renderEvictions,
   renderSessionsList,
   renderAgentsList,
 } from "./render.js";

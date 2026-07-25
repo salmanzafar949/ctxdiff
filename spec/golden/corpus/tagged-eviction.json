@@ -1,0 +1,337 @@
+{
+  "id": "tagged-eviction",
+  "title": "Tagged blocks that leave the context — and the four ways they only look like they did",
+  "why": "`ctxdiff tokens` names a block the developer TAGGED that entered an agent's context and later left it for good — 'the block you tagged rag at turn 1 was evicted at turn 4'. That sentence is only worth printing if it is never printed wrongly, so this fixture is mostly counter-examples. Session 1 (one agent) carries: a tagged block that really is evicted and never returns (reported); a second tagged block that is absent for one turn and BACK the next (not reported — it was crowded out, not forgotten); a tagged block whose text is EDITED in place, which the differ classifies as 'modified' and a naive hash-presence scan would call an eviction; and ordinary heuristically-labeled history that is evicted every turn and must stay silent, since that is what a context window IS. Session 2 interleaves two agents so the writer's turn cannot make the researcher's tagged block look lost — a hand-off is not an eviction — and then evicts it for real on the researcher's own timeline, which is the case that must carry an [agent:researcher] chip. The block token counts are also the fixture for `--context-window`: turn totals here are small and stable, so a percentage regression shows up as a one-character diff.",
+  "why_session_3": "Sessions 1 and 2 both set `tags` on EVERY call, and that is not what capture produces — it is what HID a bug that made this whole feature silent. `tracer.tag()` buffers labels for the NEXT recorded call and clears itself, so a block tagged once is stored `label_source='tagged'` on exactly ONE call and `heuristic` on every later call that still carries the same text. Session 3 is therefore the REAL-WORLD shape and the README's own advertised sentence: `tags` on the first call only, the retrieved policy present on turns 1-4, and a summarizer rebuilding a shorter history at turn 5 that drops it for good. A detector that decides taggedness from the older side of the evicting pair reports NOTHING here — `evictions: []`, no stanza in `tokens`, and `check --no-tagged-eviction` printing 'all 1 tagged block survived 4 turn pairs' and exiting 0. The ordinary history the same rebuild threw away (two questions and two answers, heuristically labeled) must stay silent in the same output, which is what makes this a test of the narrowing and not just of the fix.",
+  "sessions": [
+    {
+      "run_id": "e9000000000000000000000000000001",
+      "project": "tagged-eviction",
+      "started_at": "2026-03-07T08:00:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "f9000000000000000000000000000001",
+          "seq": 1,
+          "agent": "solo",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 60, "completion_tokens": 10, "total_tokens": 70},
+          "latency_ms": 100,
+          "error": null,
+          "tags": [
+            ["rag", "Enterprise pricing FAQ"],
+            ["notes", "Operator notes"],
+            ["brief", "Brief revision"]
+          ],
+          "blocks": [
+            ["system", "message", "You are a support assistant. Cite the pricing docs."],
+            ["system", "message", "Brief revision A: answer in one paragraph."],
+            ["user", "message", "Enterprise pricing FAQ: the 2026 volume discount is 22 percent above 500 seats."],
+            ["user", "message", "Operator notes: never quote a discount without the seat threshold."],
+            ["user", "message", "What discount do we offer?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000002",
+          "seq": 2,
+          "agent": "solo",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 90, "completion_tokens": 12, "total_tokens": 102},
+          "latency_ms": 110,
+          "error": null,
+          "tags": [
+            ["rag", "Enterprise pricing FAQ"],
+            ["notes", "Operator notes"],
+            ["brief", "Brief revision"]
+          ],
+          "blocks": [
+            ["system", "message", "You are a support assistant. Cite the pricing docs."],
+            ["system", "message", "Brief revision B: answer in one paragraph."],
+            ["user", "message", "Enterprise pricing FAQ: the 2026 volume discount is 22 percent above 500 seats."],
+            ["user", "message", "Operator notes: never quote a discount without the seat threshold."],
+            ["user", "message", "What discount do we offer?"],
+            ["assistant", "message", "Twenty-two percent above five hundred seats."],
+            ["user", "message", "And below that threshold?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000003",
+          "seq": 3,
+          "agent": "solo",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 84, "completion_tokens": 11, "total_tokens": 95},
+          "latency_ms": 120,
+          "error": null,
+          "tags": [
+            ["notes", "Operator notes"],
+            ["brief", "Brief revision"]
+          ],
+          "blocks": [
+            ["system", "message", "You are a support assistant. Cite the pricing docs."],
+            ["system", "message", "Brief revision B: answer in one paragraph."],
+            ["user", "message", "Operator notes: never quote a discount without the seat threshold."],
+            ["user", "message", "What discount do we offer?"],
+            ["assistant", "message", "Twenty-two percent above five hundred seats."],
+            ["user", "message", "And below that threshold?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000004",
+          "seq": 4,
+          "agent": "solo",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 78, "completion_tokens": 9, "total_tokens": 87},
+          "latency_ms": 130,
+          "error": null,
+          "tags": [
+            ["brief", "Brief revision"]
+          ],
+          "blocks": [
+            ["system", "message", "You are a support assistant. Cite the pricing docs."],
+            ["system", "message", "Brief revision B: answer in one paragraph."],
+            ["user", "message", "What discount do we offer?"],
+            ["assistant", "message", "Twenty-two percent above five hundred seats."],
+            ["user", "message", "And below that threshold?"],
+            ["assistant", "message", "The list price applies below five hundred seats."]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000005",
+          "seq": 5,
+          "agent": "solo",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 96, "completion_tokens": 14, "total_tokens": 110},
+          "latency_ms": 140,
+          "error": null,
+          "tags": [
+            ["notes", "Operator notes"],
+            ["brief", "Brief revision"]
+          ],
+          "blocks": [
+            ["system", "message", "You are a support assistant. Cite the pricing docs."],
+            ["system", "message", "Brief revision B: answer in one paragraph."],
+            ["user", "message", "Operator notes: never quote a discount without the seat threshold."],
+            ["assistant", "message", "Twenty-two percent above five hundred seats."],
+            ["user", "message", "And below that threshold?"],
+            ["assistant", "message", "The list price applies below five hundred seats."],
+            ["user", "message", "Write it up for the customer."]
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": "e9000000000000000000000000000002",
+      "project": "tagged-eviction",
+      "started_at": "2026-03-07T09:00:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "f9000000000000000000000000000011",
+          "seq": 1,
+          "agent": "researcher",
+          "step": "gather",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48},
+          "latency_ms": 100,
+          "error": null,
+          "tags": [["rag", "Retrieved passage"]],
+          "blocks": [
+            ["system", "message", "You are the RESEARCHER. Gather facts."],
+            ["user", "message", "Retrieved passage: Mars has two moons, Phobos and Deimos."]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000012",
+          "seq": 2,
+          "agent": "writer",
+          "step": "compose",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 22, "completion_tokens": 6, "total_tokens": 28},
+          "latency_ms": 110,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are the WRITER. Compose prose."],
+            ["user", "message", "Write an intro about Mars."]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000013",
+          "seq": 3,
+          "agent": "researcher",
+          "step": "gather",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 58, "completion_tokens": 9, "total_tokens": 67},
+          "latency_ms": 120,
+          "error": null,
+          "tags": [["rag", "Retrieved passage"]],
+          "blocks": [
+            ["system", "message", "You are the RESEARCHER. Gather facts."],
+            ["user", "message", "Retrieved passage: Mars has two moons, Phobos and Deimos."],
+            ["assistant", "message", "Mars is the fourth planet from the Sun."],
+            ["user", "message", "Anything about its moons?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000014",
+          "seq": 4,
+          "agent": "writer",
+          "step": "compose",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 34, "completion_tokens": 7, "total_tokens": 41},
+          "latency_ms": 130,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are the WRITER. Compose prose."],
+            ["user", "message", "Write an intro about Mars."],
+            ["assistant", "message", "Mars, the red planet, has fascinated observers."]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000015",
+          "seq": 5,
+          "agent": "researcher",
+          "step": "gather",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 52, "completion_tokens": 10, "total_tokens": 62},
+          "latency_ms": 140,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are the RESEARCHER. Gather facts."],
+            ["assistant", "message", "Mars is the fourth planet from the Sun."],
+            ["user", "message", "Anything about its moons?"],
+            ["assistant", "message", "Phobos and Deimos, both small and irregular."]
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": "e9000000000000000000000000000003",
+      "project": "tagged-eviction",
+      "started_at": "2026-03-07T10:00:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "f9000000000000000000000000000021",
+          "seq": 1,
+          "agent": "returns",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 38, "completion_tokens": 9, "total_tokens": 47},
+          "latency_ms": 100,
+          "error": null,
+          "tags": [["rag", "Refund policy"]],
+          "blocks": [
+            ["system", "message", "You are a returns assistant. Cite the policy."],
+            ["user", "message", "Refund policy: 30 days from delivery, unworn items only."],
+            ["user", "message", "Can I return these boots after three weeks?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000022",
+          "seq": 2,
+          "agent": "returns",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 56, "completion_tokens": 11, "total_tokens": 67},
+          "latency_ms": 110,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a returns assistant. Cite the policy."],
+            ["user", "message", "Refund policy: 30 days from delivery, unworn items only."],
+            ["user", "message", "Can I return these boots after three weeks?"],
+            ["assistant", "message", "Yes — three weeks is inside the window."],
+            ["user", "message", "They have been worn once indoors."]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000023",
+          "seq": 3,
+          "agent": "returns",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 74, "completion_tokens": 12, "total_tokens": 86},
+          "latency_ms": 120,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a returns assistant. Cite the policy."],
+            ["user", "message", "Refund policy: 30 days from delivery, unworn items only."],
+            ["user", "message", "Can I return these boots after three weeks?"],
+            ["assistant", "message", "Yes — three weeks is inside the window."],
+            ["user", "message", "They have been worn once indoors."],
+            ["assistant", "message", "Let me check what unworn means here."],
+            ["user", "message", "Does indoor wear count?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000024",
+          "seq": 4,
+          "agent": "returns",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 92, "completion_tokens": 13, "total_tokens": 105},
+          "latency_ms": 130,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a returns assistant. Cite the policy."],
+            ["user", "message", "Refund policy: 30 days from delivery, unworn items only."],
+            ["user", "message", "Can I return these boots after three weeks?"],
+            ["assistant", "message", "Yes — three weeks is inside the window."],
+            ["user", "message", "They have been worn once indoors."],
+            ["assistant", "message", "Let me check what unworn means here."],
+            ["user", "message", "Does indoor wear count?"],
+            ["assistant", "message", "Indoor wear is still wear under this policy."],
+            ["user", "message", "So what are my options?"]
+          ]
+        },
+        {
+          "call_id": "f9000000000000000000000000000025",
+          "seq": 5,
+          "agent": "returns",
+          "step": "answer",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 61, "completion_tokens": 15, "total_tokens": 76},
+          "latency_ms": 140,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a returns assistant. Cite the policy."],
+            ["user", "message", "Does indoor wear count?"],
+            ["assistant", "message", "Indoor wear is still wear under this policy."],
+            ["user", "message", "So what are my options?"],
+            ["assistant", "message", "Store credit, or an exchange for the same size."],
+            ["user", "message", "Quote me the policy line for that."]
+          ]
+        }
+      ]
+    }
+  ]
+}

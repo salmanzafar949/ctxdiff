@@ -11,7 +11,9 @@
  * different stories. So every number compared against a threshold is one the
  * other commands already print: turn totals and schema bloat come from
  * `analyzeRun`, prefix breaks (including the digest-based attribution for
- * same-slot image swaps) come from `analyzeCache`, and the "N of M registered
+ * same-slot image swaps) come from `analyzeCache`, evicted tagged blocks come
+ * from `analyzeEvictions` (the differ's own `evicted` classification, scoped per
+ * agent, narrowed to `labelSource === "tagged"`), and the "N of M registered
  * tools" denominator comes from `registeredToolNames` — the very call `ctxdiff
  * tokens` makes for its own bloat line. What is new here is only: comparison
  * against a user-supplied limit, the selection of which turn/agent/block to
@@ -43,6 +45,7 @@ import {
   type CacheReport,
 } from "./cache.js";
 import { filterCalls } from "./diff.js";
+import { analyzeEvictions, type EvictionReport } from "./evictions.js";
 import { pyComma, pyRound1 } from "./pyround.js";
 import {
   analyzeRun,
@@ -61,6 +64,7 @@ export const MAX_CONTEXT = "max-context";
 export const MAX_CONTEXT_PCT = "max-context-pct";
 export const REQUIRE_STABLE_PREFIX = "require-stable-prefix";
 export const NO_DEAD_SCHEMAS = "no-dead-schemas";
+export const NO_TAGGED_EVICTION = "no-tagged-eviction";
 export const MAX_GROWTH = "max-growth";
 export const MAX_GROWTH_PCT = "max-growth-pct";
 
@@ -69,6 +73,7 @@ export const ASSERTION_ORDER = [
   MAX_CONTEXT_PCT,
   REQUIRE_STABLE_PREFIX,
   NO_DEAD_SCHEMAS,
+  NO_TAGGED_EVICTION,
   MAX_GROWTH,
   MAX_GROWTH_PCT,
 ];
@@ -87,7 +92,10 @@ export const NAME_WIDTH = Math.max(...ASSERTION_ORDER.map((n) => n.length));
  * `maxContextPct` is a percentage OF. ctxdiff ships no model→window table by
  * design (they change per model and per provider, and a stale table would
  * silently move everyone's CI threshold), so the window is supplied by the user
- * or the percentage assertion is simply not available. Mirrors Python
+ * or the percentage assertion is simply not available. The CLI fills it through
+ * `resolveContextWindow` — the same flag-then-`CTXDIFF_CONTEXT_WINDOW` path
+ * `ctxdiff tokens` and the dashboard use, so a gate and the report a human reads
+ * beside it can never be scored against two different windows. Mirrors Python
  * `Thresholds`.
  */
 export interface Thresholds {
@@ -96,6 +104,7 @@ export interface Thresholds {
   maxContextPct: number | null;
   requireStablePrefix: boolean;
   noDeadSchemas: boolean;
+  noTaggedEviction: boolean;
   maxGrowth: number | null;
   maxGrowthPct: number | null;
 }
@@ -110,6 +119,7 @@ export function anyRequested(t: Thresholds): boolean {
     t.maxContextPct !== null ||
     t.requireStablePrefix ||
     t.noDeadSchemas ||
+    t.noTaggedEviction ||
     t.maxGrowth !== null ||
     t.maxGrowthPct !== null
   );
@@ -492,6 +502,78 @@ function checkNoDeadSchemas(runTokens: RunTokens, totalTools: number): Assertion
   };
 }
 
+// --- no-tagged-eviction ------------------------------------------------------------
+
+/**
+ * Fail when a block the developer TAGGED entered the context and later left it
+ * for good — the existing eviction detector, with a threshold of zero. Mirrors
+ * Python `_check_no_tagged_eviction`.
+ *
+ * Every word of every line comes from `analyzeEvictions`: the tag, the turn the
+ * block entered, the turn it disappeared, the per-agent scoping and the "it
+ * never came back" rule are all decided there, so a green `check` and a
+ * hand-read `ctxdiff tokens` can never tell two different stories about the same
+ * trace. What is new here is only the comparison against zero.
+ *
+ * Three states are reported rather than two, because "PASS" has three different
+ * meanings and only one of them is reassuring: nothing was TAGGED at all (the
+ * assertion is structurally vacuous, and saying so is what tells a reader to go
+ * add a `tracer.tag()`); nothing could be PAIRED (a single turn, or a fan-out
+ * where each agent has one turn); or tagged blocks existed, pairs existed, and
+ * none of them was evicted.
+ */
+function checkNoTaggedEviction(
+  report: EvictionReport,
+  turns: number,
+  agents: number,
+): AssertionResult {
+  if (report.taggedBlocks === 0) {
+    return {
+      name: NO_TAGGED_EVICTION,
+      passed: true,
+      summary:
+        "no tagged blocks in this run — nothing to lose " +
+        "(tag load-bearing content with tracer.tag)",
+      details: [],
+    };
+  }
+  if (report.pairsAnalyzed === 0) {
+    return {
+      name: NO_TAGGED_EVICTION,
+      passed: true,
+      summary: noPairsSummary(turns, agents, "pairs to check"),
+      details: [],
+    };
+  }
+  const taggedText =
+    `all ${plural(report.taggedBlocks, "tagged block")} survived ` +
+    `${plural(report.pairsAnalyzed, "turn pair")}`;
+  if (!report.evictions.length) {
+    return { name: NO_TAGGED_EVICTION, passed: true, summary: taggedText, details: [] };
+  }
+  // The TAG is the one fragment of these lines the developer authored rather
+  // than ctxdiff, so it goes through `flatten` for the same reason a tool
+  // schema's name does: one violation, one line, even inside the Action's fenced
+  // job summary.
+  const details = report.evictions.map(
+    (e) =>
+      `the block you tagged '${flatten(e.label)}' at turn ${e.taggedSeq}` +
+      `${agentChip(e.agent)} was evicted at turn ${e.evictedSeq} · ` +
+      `${pyComma(e.tokens)} tok`,
+  );
+  // One event per tagged block per agent (`analyzeEvictions` dedupes by content
+  // hash within each group), so this numerator and `taggedBlocks` count the same
+  // kind of thing and the sentence cannot contradict itself.
+  return {
+    name: NO_TAGGED_EVICTION,
+    passed: false,
+    summary:
+      `${plural(report.evictions.length, "tagged block")} evicted of ` +
+      `${report.taggedBlocks} across ${plural(report.pairsAnalyzed, "turn pair")}`,
+    details,
+  };
+}
+
 // --- max-growth / max-growth-pct ---------------------------------------------------
 
 /**
@@ -694,6 +776,7 @@ export function analyzeCheck(
 
   const runTokens = needsTokenAnalysis(thresholds) ? analyzeRun(ct, agent) : null;
   const cacheReport = thresholds.requireStablePrefix ? analyzeCache(ct, agent) : null;
+  const evictionReport = thresholds.noTaggedEviction ? analyzeEvictions(ct, agent) : null;
 
   const results: AssertionResult[] = [];
   if (runTokens !== null && thresholds.maxContext !== null) {
@@ -724,6 +807,17 @@ export function analyzeCheck(
     // "N of M" for the same trace.
     const allBlocks = ct.getCalls().map((c) => ct.getCallBlocks(c.id));
     results.push(checkNoDeadSchemas(runTokens, registeredToolNames(allBlocks).size));
+  }
+  if (evictionReport !== null) {
+    // Same turn/agent counts the prefix assertion gets, and for the same reason:
+    // an EvictionReport with zero pairs cannot say WHY it has none.
+    results.push(
+      checkNoTaggedEviction(
+        evictionReport,
+        calls.length,
+        new Set(calls.map((c) => c.agent)).size,
+      ),
+    );
   }
   if (runTokens !== null && thresholds.maxGrowth !== null) {
     results.push(checkMaxGrowth(runTokens.calls, thresholds.maxGrowth));

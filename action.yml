@@ -90,6 +90,13 @@ inputs:
     description: Fail if a tool schema is registered but never invoked ("true"/"false").
     required: false
     default: "false"
+  no-tagged-eviction:
+    description: >-
+      Fail if a block tagged with tracer.tag() entered an agent's context and
+      later left it for good ("true"/"false"). Heuristically-labeled blocks are
+      never included: every agent loop evicts ordinary history by design.
+    required: false
+    default: "false"
   max-growth:
     description: >-
       Fail if the context grows by more than this many tokens between two
@@ -196,6 +203,7 @@ runs:
         IN_MAX_GROWTH_PCT: ${{ inputs.max-growth-pct }}
         IN_REQUIRE_STABLE_PREFIX: ${{ inputs.require-stable-prefix }}
         IN_NO_DEAD_SCHEMAS: ${{ inputs.no-dead-schemas }}
+        IN_NO_TAGGED_EVICTION: ${{ inputs.no-tagged-eviction }}
       run: |
         set -uo pipefail
 
@@ -245,6 +253,7 @@ runs:
         add --max-growth-pct  "$IN_MAX_GROWTH_PCT"
         flag --require-stable-prefix "$IN_REQUIRE_STABLE_PREFIX"
         flag --no-dead-schemas       "$IN_NO_DEAD_SCHEMAS"
+        flag --no-tagged-eviction    "$IN_NO_TAGGED_EVICTION"
 
         # The summary switch is a boolean input too, and the same rule applies:
         # a `summary: yes` that silently produced no summary would look exactly

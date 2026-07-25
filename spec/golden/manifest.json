@@ -29,7 +29,8 @@
     {"id": "multiagent-project", "corpus": "corpus/multiagent-project.json", "ctrace": "multiagent-project.ctrace"},
     {"id": "multipart-content", "corpus": "corpus/multipart-content.json", "ctrace": "multipart-content.ctrace"},
     {"id": "round-numbers", "corpus": "corpus/round-numbers.json", "ctrace": "round-numbers.ctrace"},
-    {"id": "image-blocks", "corpus": "corpus/image-blocks.json", "ctrace": "image-blocks.ctrace"}
+    {"id": "image-blocks", "corpus": "corpus/image-blocks.json", "ctrace": "image-blocks.ctrace"},
+    {"id": "tagged-eviction", "corpus": "corpus/tagged-eviction.json", "ctrace": "tagged-eviction.ctrace"}
   ],
   "fixtures_order_note": "`special-tokens` is FIRST on purpose. Both harnesses build the fixtures in this order inside ONE process, so every other fixture is tokenized after a block containing a literal `<|endoftext|>`. That makes the 'no silent estimate fallback' assertion (tests/test_golden.py::test_fixtures_really_run_the_exact_tokenizer and its JS twin) a live regression test for the process-wide latch this corpus once had to route around: if a per-text tokenizer refusal ever leaks back into the encoder, every fixture below turns into estimates and the suite fails immediately. Nothing else depends on the order — each fixture is an independent file with its own cases.",
 
@@ -100,7 +101,30 @@
     {"name": "round-numbers.diff.2-3", "fixture": "round-numbers", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
     {"name": "round-numbers.cache", "fixture": "round-numbers", "argv": ["cache", "--project", "{trace}"]},
     {"name": "round-numbers.sessions", "fixture": "round-numbers", "argv": ["sessions", "--project", "{trace}"]},
-    {"name": "round-numbers.agents", "fixture": "round-numbers", "argv": ["agents", "--project", "{trace}"]}
+    {"name": "round-numbers.agents", "fixture": "round-numbers", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "round-numbers.tokens.window", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "1000", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.window.below", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "34", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.window.alarm", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "33", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.window.tie", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "400", "--project", "{trace}"]},
+    {"name": "special-tokens.tokens.window.turn3", "fixture": "special-tokens", "argv": ["tokens", "--turn", "3", "--context-window", "250", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens.window", "fixture": "image-blocks", "argv": ["tokens", "--context-window", "500", "--project", "{trace}"]},
+
+    {"name": "tagged-eviction.sessions", "fixture": "tagged-eviction", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "tagged-eviction.agents", "fixture": "tagged-eviction", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000001", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.window", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000001", "--context-window", "120", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.multiagent", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000002", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.writer", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000002", "--agent", "writer", "--project", "{trace}"]},
+    {"name": "tagged-eviction.diff.2-3", "fixture": "tagged-eviction", "argv": ["diff", "--session", "e9000000000000000000000000000001", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction", "fixture": "tagged-eviction", "exit": 1, "argv": ["check", "--session", "e9000000000000000000000000000001", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction.multiagent", "fixture": "tagged-eviction", "exit": 1, "argv": ["check", "--session", "e9000000000000000000000000000002", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction.writer", "fixture": "tagged-eviction", "argv": ["check", "--session", "e9000000000000000000000000000002", "--agent", "writer", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.tag-once", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000003", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.tag-once.turn1", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000003", "--turn", "1", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.tag-once.turn5", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000003", "--turn", "5", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction.tag-once", "fixture": "tagged-eviction", "exit": 1, "argv": ["check", "--session", "e9000000000000000000000000000003", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "special-tokens.check.eviction.untagged", "fixture": "special-tokens", "argv": ["check", "--max-context", "1000", "--no-dead-schemas", "--no-tagged-eviction", "--max-growth", "200", "--project", "{trace}"]}
   ],
 
   "html_cases": [
@@ -110,6 +134,7 @@
     {"name": "multiagent-project", "fixture": "multiagent-project"},
     {"name": "multipart-content", "fixture": "multipart-content"},
     {"name": "round-numbers", "fixture": "round-numbers"},
-    {"name": "image-blocks", "fixture": "image-blocks"}
+    {"name": "image-blocks", "fixture": "image-blocks"},
+    {"name": "tagged-eviction", "fixture": "tagged-eviction"}
   ]
 }

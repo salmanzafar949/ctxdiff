@@ -11,7 +11,9 @@ import sys
 from ctxdiff.analyze.cache import CacheReport, group_breaks, pairs_denominator
 from ctxdiff.analyze.check import NAME_WIDTH, CheckReport
 from ctxdiff.analyze.differ import TurnDiff
+from ctxdiff.analyze.evictions import EvictionReport
 from ctxdiff.analyze.tokens import BloatReport, CallTokens, RunTokens, UsageTotals
+from ctxdiff.analyze.window import format_window_share
 
 # Bare ANSI SGR constants — no colorama/rich, per CLAUDE.md's "runtime deps:
 # tiktoken only" rule. Codes are terminated per-segment by _RESET.
@@ -147,7 +149,7 @@ def _bar(pct: float) -> str:
     return "█" * length
 
 
-def render_call_tokens(ct: CallTokens) -> str:
+def render_call_tokens(ct: CallTokens, context_window: int | None = None) -> str:
     """Render one call's token attribution (spec §6.3/§7.1): a header line
     naming the turn, its total tokens (thousands-separated), and a `~approx`
     marker IFF `ct.approximate` — the spec's "always marked approximate,
@@ -156,13 +158,27 @@ def render_call_tokens(ct: CallTokens) -> str:
     label slice, biggest spender first (already sorted by the analyzer).
     When provider usage is available and reconciles to a known prompt-token
     key, a dim line beneath reports it alongside the delta from our own
-    count — omitted entirely when there's nothing to reconcile against."""
+    count — omitted entirely when there's nothing to reconcile against.
+
+    `context_window`, when the user has stated one (`--context-window` or
+    `CTXDIFF_CONTEXT_WINDOW`), turns the bare total into a SHARE — `18,400 /
+    200,000 tok · 9.2%`, warning-marked past `CONTEXT_WINDOW_ALARM_PCT` — which
+    is the form that answers the question people open this command with. With no
+    window the header is byte-for-byte what it always was: ctxdiff ships no
+    model→window table, so it renders no percentage it cannot back up.
+
+    The `(~approx)` marker stays where it has always been, immediately after the
+    numbers it qualifies, so it keeps qualifying the percentage too: a share
+    computed from a partly-estimated total is exactly as approximate as the
+    total."""
     enabled = _color_enabled()
     lines: list[str] = []
 
     approx_marker = " (~approx)" if ct.approximate else ""
     agent_step = _agent_step_tag(ct.agent, ct.step)
-    lines.append(f"turn {ct.seq} · {ct.total_tokens:,} tokens{approx_marker}{agent_step}")
+    total = (f"{ct.total_tokens:,} tokens" if context_window is None
+             else format_window_share(ct.total_tokens, context_window))
+    lines.append(f"turn {ct.seq} · {total}{approx_marker}{agent_step}")
 
     for s in ct.slices:
         bar = _bar(s.pct).ljust(_BAR_WIDTH)
@@ -202,6 +218,47 @@ def render_bloat(bloat: BloatReport, total_tools: int | None) -> str:
         f"every call"
     )
     return _paint(line, _YELLOW, enabled)
+
+
+def render_evictions(report: EvictionReport) -> str | None:
+    """Render the tagged-eviction warning block for `ctxdiff tokens`, or None
+    when there is nothing to warn about (the overwhelmingly common case, and the
+    reason this returns None rather than a reassuring line: a report that says
+    "no evictions" on every run trains people to stop reading it).
+
+    One three-line stanza per eviction, in the analyzer's timeline order:
+
+    - a yellow headline in the words the bug is usually described in — "the
+      block you tagged 'rag' at turn 3 was evicted at turn 6" — prefixed with an
+      `[agent:NAME]` chip on a multi-agent run, spelled exactly as
+      `ctxdiff cache` spells its own. The turn in it is `tagged_seq`, the turn
+      the TAG was applied, because that is what the sentence claims happened
+      there;
+    - the block's snippet, repr-quoted like every other snippet the CLI prints,
+      so control characters in captured text are visible rather than acting on
+      the terminal;
+    - a facts line: the block's cost, the turn the CONTENT entered the context
+      (`entered_seq`, which is not always the turn it was tagged on), the last
+      turn that still carried it, and the standing reminder that this report only
+      ever names blocks that never came back (see `analyze.evictions`).
+
+    Only TAGGED blocks appear here. Every agent loop evicts heuristically
+    labeled history by design, so including those would bury this line in the
+    ordinary behaviour of every framework there is."""
+    if not report.evictions:
+        return None
+    enabled = _color_enabled()
+    lines: list[str] = []
+    for e in report.evictions:
+        chip = f"[agent:{e.agent}] " if e.agent is not None else ""
+        headline = (f"⚠ {chip}the block you tagged '{e.label}' at turn "
+                    f"{e.tagged_seq} was evicted at turn {e.evicted_seq}")
+        lines.append(_paint(headline, _YELLOW, enabled))
+        lines.append(f"  {repr(e.snippet)}")
+        lines.append(f"  [{e.label}·{e.role}] {e.tokens:,} tok · entered at "
+                     f"turn {e.entered_seq} · last present at turn "
+                     f"{e.last_seen_seq} · never returned")
+    return "\n".join(lines)
 
 
 def render_usage_summary(usage: UsageTotals, agent: str | None = None) -> str:
@@ -248,14 +305,24 @@ def render_agent_summary(run_tokens: RunTokens) -> str | None:
 def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
                        total_tools: int | None,
                        agent_summary: str | None = None,
-                       usage_summary: str | None = None) -> str:
+                       usage_summary: str | None = None,
+                       context_window: int | None = None,
+                       evictions: EvictionReport | None = None) -> str:
     """Render `ctxdiff tokens`' full output: the run-level provider-usage rollup
     FIRST (when supplied), then an optional per-agent block-token summary (when
     the run is multi-agent and unfiltered), then one block per selected call
     (already filtered to a single turn by the caller when `--turn` is given),
-    then the bloat warning appended when there is one AND it actually names
-    unused tools (a BloatReport with an empty unused list — every registered
-    tool got used — has nothing worth printing)."""
+    then the tagged-eviction warnings, then the bloat warning appended when
+    there is one AND it actually names unused tools (a BloatReport with an empty
+    unused list — every registered tool got used — has nothing worth printing).
+
+    `context_window` is threaded down to every turn header (see
+    `render_call_tokens`); None means no window was stated and every header
+    renders exactly as it did before percentages existed.
+
+    Evictions print BEFORE bloat because they are the more expensive fact: dead
+    schemas cost tokens, an evicted tagged block cost the agent something it was
+    told to remember. Both are omitted entirely when empty."""
     if not calls:
         return "no calls in this run"
     sections: list[str] = []
@@ -263,7 +330,11 @@ def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
         sections.append(usage_summary)
     if agent_summary:
         sections.append(agent_summary)
-    sections.extend(render_call_tokens(c) for c in calls)
+    sections.extend(render_call_tokens(c, context_window) for c in calls)
+    if evictions is not None:
+        eviction_block = render_evictions(evictions)
+        if eviction_block:
+            sections.append(eviction_block)
     if bloat is not None and bloat.unused_tools:
         sections.append(render_bloat(bloat, total_tools))
     return "\n\n".join(sections)

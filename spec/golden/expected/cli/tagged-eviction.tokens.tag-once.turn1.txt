@@ -1,0 +1,7 @@
+run total · in 321 tok · out 60 tok (5/5 calls reported usage)
+
+turn 1 · 33 tokens [returns·answer]
+  █████████████                  rag                14 tok   42.4%
+  █████████                      system             10 tok   30.3%
+  ████████                       user                9 tok   27.3%
+  provider reports 38 prompt tokens · Δ +5

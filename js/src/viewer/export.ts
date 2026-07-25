@@ -35,6 +35,8 @@ import type { Call, CallBlock } from "../models.js";
 import { diffTurns, distinctAgents, type DiffEntry, type TurnDiff } from "../analyze/diff.js";
 import { analyzeRun, usageTotals, type RunTokens } from "../analyze/tokens.js";
 import { analyzeCache, type CacheReport } from "../analyze/cache.js";
+import { analyzeEvictions, type EvictionReport } from "../analyze/evictions.js";
+import { CONTEXT_WINDOW_ALARM_PCT, windowPct } from "../analyze/window.js";
 import { compareCodePoints } from "../analyze/sessions.js";
 import { renderPage } from "./template.js";
 import { PyFloat, pyJsonDumps, htmlEscape } from "./pyjson.js";
@@ -144,15 +146,36 @@ function serializeDiff(td: TurnDiff): Record<string, unknown> {
   };
 }
 
-/** A RunTokens → a JSON dict (per-call slices + run-level bloat). Percentages
- * are wrapped in PyFloat so they serialize as Python floats. Mirrors Python
- * `_serialize_tokens`. */
-function serializeTokens(rt: RunTokens): Record<string, unknown> {
+/**
+ * A RunTokens → a JSON dict (per-call slices + run-level bloat). Percentages are
+ * wrapped in PyFloat so they serialize as Python floats. Mirrors Python
+ * `_serialize_tokens`.
+ *
+ * `contextWindow` and each call's `pct_of_window` carry the share-of-window
+ * story into the page. The percentage is computed HERE rather than in the
+ * template's JavaScript on purpose: `windowPct` rounds the way CPython's `round`
+ * does and the Python exporter rounds the same way, so both SDKs emit the same
+ * digits into the same file. A `toFixed` in the browser would put a third
+ * rounding rule in the path and make the exported HTML's hash depend on which
+ * SDK produced it. Both fields are null when no window was supplied, and the
+ * page then renders exactly as it always has.
+ *
+ * `window_alarm_pct` travels with them so the page's warning styling and the
+ * CLI's `⚠` marker trip at the same number, from one constant.
+ */
+function serializeTokens(
+  rt: RunTokens,
+  contextWindow: number | null,
+): Record<string, unknown> {
   return {
+    context_window: contextWindow,
+    window_alarm_pct: new PyFloat(CONTEXT_WINDOW_ALARM_PCT),
     calls: rt.calls.map((c) => ({
       seq: c.seq,
       total: c.totalTokens,
       approximate: c.approximate,
+      pct_of_window:
+        contextWindow === null ? null : new PyFloat(windowPct(c.totalTokens, contextWindow)),
       slices: c.slices.map((s) => ({ label: s.label, tokens: s.tokens, pct: new PyFloat(s.pct) })),
       reconciliation_delta: c.reconciliationDelta,
     })),
@@ -190,6 +213,37 @@ function serializeCache(cr: CacheReport): Record<string, unknown> {
   };
 }
 
+/**
+ * An EvictionReport → a JSON dict: each tagged block that entered an agent's
+ * context and left it for good, with the turn it was tagged on, the turn its
+ * content entered, the turn it disappeared and enough of the block to recognize
+ * it. `tagged_seq` and `entered_seq` are two different facts and both travel, so
+ * the page can name the tag against the turn that carried it. Mirrors Python
+ * `_serialize_evictions`.
+ *
+ * Only TAGGED blocks are ever in here, so the dashboard can render every entry
+ * as a warning without a threshold of its own. `pairs_analyzed`/`tagged_blocks`
+ * travel along so the panel can tell "nothing was tagged" apart from "nothing
+ * was lost" — two very different reassurances.
+ */
+function serializeEvictions(er: EvictionReport): Record<string, unknown> {
+  return {
+    evictions: er.evictions.map((e) => ({
+      label: e.label,
+      agent: e.agent,
+      tagged_seq: e.taggedSeq,
+      entered_seq: e.enteredSeq,
+      last_seen_seq: e.lastSeenSeq,
+      evicted_seq: e.evictedSeq,
+      tokens: e.tokens,
+      role: e.role,
+      snippet: e.snippet,
+    })),
+    pairs_analyzed: er.pairsAnalyzed,
+    tagged_blocks: er.taggedBlocks,
+  };
+}
+
 // --- payload assembly ----------------------------------------------------------
 
 /**
@@ -199,7 +253,10 @@ function serializeCache(cr: CacheReport): Record<string, unknown> {
  * pure analyzers (single source of truth) and serializes their results with the
  * SAME field order as the Python builder. Mirrors Python `build_payload`.
  */
-export function buildPayload(ct: ReadableStore): Record<string, unknown> {
+export function buildPayload(
+  ct: ReadableStore,
+  contextWindow: number | null = null,
+): Record<string, unknown> {
   const run = ct.getRun();
   const calls = ct.getCalls();
   const blocksByCall = new Map<string, CallBlock[]>();
@@ -232,8 +289,11 @@ export function buildPayload(ct: ReadableStore): Record<string, unknown> {
   }
 
   const runTokens = analyzeRun(ct);
-  const tokensOut = serializeTokens(runTokens);
+  const tokensOut = serializeTokens(runTokens, contextWindow);
   const cacheOut = serializeCache(analyzeCache(ct));
+  // analyzeEvictions groups per agent for the same reason analyzeCache does, so
+  // a hand-off is never embedded in the page as a lost block.
+  const evictionsOut = serializeEvictions(analyzeEvictions(ct));
 
   // stats: dedup ratio + context growth
   const distinct = new Set<string>();
@@ -297,6 +357,7 @@ export function buildPayload(ct: ReadableStore): Record<string, unknown> {
     diffs: diffsOut,
     tokens: tokensOut,
     cache: cacheOut,
+    evictions: evictionsOut,
     stats: {
       distinct_blocks: distinct.size,
       total_block_refs: totalRefs,
@@ -537,6 +598,11 @@ export interface ProjectPayloadOptions {
   sessionSelected?: boolean;
   /** Build the project around THIS session instead of the reader's bound one. */
   focusSessionId?: string;
+  /** The context window every percentage in the page is taken against, resolved
+   * by `resolveContextWindow` (flag, then `CTXDIFF_CONTEXT_WINDOW`). Omitted or
+   * null means no window is known and the page shows no percentages — ctxdiff
+   * ships no model→window table by design. */
+  contextWindow?: number | null;
 }
 
 /**
@@ -574,15 +640,20 @@ export function buildProjectPayload(
 
   // Non-focus details, newest first — the focus session's own detail is the
   // payload's top level and is never duplicated here.
+  // The window is threaded into EVERY embedded session, not just the focus one:
+  // the dashboard's level-3 view is reachable for each of them, and a page where
+  // three sessions show percentages and the fourth silently does not would read
+  // as a bug in the data rather than as one export flag.
+  const contextWindow = opts.contextWindow ?? null;
   const details: Record<string, unknown> = {};
   for (const s of sessionRows) {
     const sid = s.id as string;
     if (s.detail === true && sid !== focusId) {
-      details[sid] = buildPayload(new PinnedReader(reader, sid));
+      details[sid] = buildPayload(new PinnedReader(reader, sid), contextWindow);
     }
   }
 
-  const payload = buildPayload(new PinnedReader(reader, focusId));
+  const payload = buildPayload(new PinnedReader(reader, focusId), contextWindow);
   payload.project = {
     name: focusRun.project,
     sessions_total: sessions.length,

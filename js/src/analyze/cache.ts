@@ -46,8 +46,8 @@ export interface CacheReport {
 
 /** Collapse text to a single flattened, truncated line (whitespace → single
  * spaces, then hard-cut at `limit` with an ellipsis). Mirrors Python
- * `_flatten_snippet`. */
-function flattenSnippet(text: string, limit = 80): string {
+ * `flatten_snippet`. */
+export function flattenSnippet(text: string, limit = 80): string {
   const flat = text.split(/\s+/u).filter((s) => s.length > 0).join(" ");
   return flat.slice(0, limit) + (flat.length > limit ? "…" : "");
 }

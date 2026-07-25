@@ -1,0 +1,4 @@
+solo  sessions=1  calls=5  tokens=464
+researcher  sessions=1  calls=3  tokens=177
+writer  sessions=1  calls=2  tokens=69
+returns  sessions=1  calls=5  tokens=381

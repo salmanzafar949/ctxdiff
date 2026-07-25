@@ -40,6 +40,12 @@ import { snapshotProject, snapshotStore } from "./store/snapshot.js";
 import { diffCalls, diffTurns } from "./analyze/diff.js";
 import { analyzeRun, registeredToolNames, usageTotals } from "./analyze/tokens.js";
 import { analyzeCache } from "./analyze/cache.js";
+import { analyzeEvictions } from "./analyze/evictions.js";
+import {
+  CONTEXT_WINDOW_ENV,
+  ContextWindowError,
+  resolveContextWindow,
+} from "./analyze/window.js";
 import { analyzeCheck, anyRequested, checkPassed, type Thresholds } from "./analyze/check.js";
 import { pyComma as comma } from "./analyze/pyround.js";
 import { isTraceFile, listFileCalls, listFileSessions } from "./analyze/sessions.js";
@@ -1038,7 +1044,19 @@ async function crossAgentSides(
 
 /** `ctxdiff tokens [--turn N] [--project P] [--session S] [--agent A]`. */
 async function cmdTokens(rest: string[]): Promise<number> {
-  const args = parseCommon(rest);
+  const args = parseCommon(rest, {
+    extra: { "context-window": { type: "string" } },
+    numeric: ["context-window"],
+  });
+  // Resolved BEFORE any store is opened (same order Python uses), so a bad
+  // `CTXDIFF_CONTEXT_WINDOW` fails identically with or without a trace present.
+  let contextWindow: number | null;
+  try {
+    contextWindow = resolveWindow(args.values);
+  } catch (err) {
+    if (err instanceof SelectionError) return reportSelectionError(err);
+    throw err;
+  }
   // --session/--agent are single here: last value wins, matching argparse
   // without action="append".
   const session = args.sessions.length ? args.sessions[args.sessions.length - 1] : null;
@@ -1085,8 +1103,30 @@ async function cmdTokens(rest: string[]): Promise<number> {
 
     const usageSummary = renderUsageSummary(runTokens.usage, agent);
     const agentSummary = renderAgentSummary(runTokens);
+    // The detector always runs over the whole session — an eviction is a fact
+    // about a PAIR of turns, so it cannot be computed from one turn's blocks —
+    // but under `--turn N` the report shown beside it covers exactly that turn,
+    // and a stanza saying "…was evicted at turn 3" under a turn-1 report names
+    // something the reader did not ask about and cannot see above it. So the
+    // events are filtered to the turn that LOST the block.
+    const allEvictions = analyzeEvictions(ct, agent);
+    const evictions =
+      turn === null
+        ? allEvictions
+        : {
+            ...allEvictions,
+            evictions: allEvictions.evictions.filter((e) => e.evictedSeq === turn.value),
+          };
     process.stdout.write(
-      renderRunTokens(selected, runTokens.bloat, totalTools, agentSummary, usageSummary) + "\n",
+      renderRunTokens(
+        selected,
+        runTokens.bloat,
+        totalTools,
+        agentSummary,
+        usageSummary,
+        contextWindow,
+        evictions,
+      ) + "\n",
     );
     return 0;
   } finally {
@@ -1136,6 +1176,7 @@ const ASSERTION_FLAGS = [
   "--max-context-pct",
   "--require-stable-prefix",
   "--no-dead-schemas",
+  "--no-tagged-eviction",
   "--max-growth",
   "--max-growth-pct",
 ];
@@ -1150,6 +1191,28 @@ function intFlag(values: Record<string, unknown>, name: string): number | null {
     throw new UsageError(`ctxdiff: error: argument --${name}: invalid int value: '${raw}'`);
   }
   return parseInt(raw.trim(), 10);
+}
+
+/**
+ * The context window this invocation should render percentages against:
+ * `--context-window` if typed, else `CTXDIFF_CONTEXT_WINDOW`, else null. The ONE
+ * resolution path for `tokens`, `check`, `view` and `export`, so no two commands
+ * can disagree about the denominator on the same machine. Mirrors Python
+ * `_resolve_window`.
+ *
+ * An unusable environment value is re-thrown as a `SelectionError` so it reports
+ * as the usage error it is (exit 2, message printed verbatim) rather than as a
+ * failure to read a trace — the variable is part of how the command was invoked,
+ * not part of what it was pointed at.
+ */
+function resolveWindow(values: Record<string, unknown>): number | null {
+  const flag = intFlag(values, "context-window");
+  try {
+    return resolveContextWindow(flag);
+  } catch (err) {
+    if (err instanceof ContextWindowError) throw new SelectionError(err.message);
+    throw err;
+  }
 }
 
 /** Read one percentage threshold flag, or null when it was not passed. Mirrors
@@ -1175,13 +1238,18 @@ function pctFlag(values: Record<string, unknown>, name: string): number | null {
  *    otherwise exit 0 having verified nothing — a green tick in CI that means
  *    "nobody asked a question", which is the exact failure this command exists
  *    to prevent.
- * 2. `--max-context-pct` without `--context-window` is refused: the percentage
- *    has no denominator. ctxdiff deliberately ships no model→window table
- *    (windows differ per model and per provider and change under you), so the
- *    window is the user's to supply.
- * 3. `--context-window` without `--max-context-pct` is refused too — nothing
- *    would consume it, and silently ignoring a flag someone typed is how a CI
- *    gate ends up asserting less than its author believes.
+ * 2. `--max-context-pct` with NO window at all is refused: the percentage has no
+ *    denominator. ctxdiff deliberately ships no model→window table (windows
+ *    differ per model and per provider and change under you), so the window is
+ *    the user's to supply — as `--context-window N` or as
+ *    `CTXDIFF_CONTEXT_WINDOW`, resolved by the ONE `resolveWindow` path
+ *    `ctxdiff tokens` and the dashboard use.
+ * 3. The `--context-window` FLAG without `--max-context-pct` is refused too —
+ *    nothing would consume it, and silently ignoring a flag someone typed is how
+ *    a CI gate ends up asserting less than its author believes. Only the flag: an
+ *    inherited `CTXDIFF_CONTEXT_WINDOW` is ambient configuration for the whole
+ *    shell, and failing a `--max-context` check because the environment happens
+ *    to know the window would be absurd.
  * 4. A limit outside its legal range is refused: the two absolute budgets and
  *    the percentage must be POSITIVE (a zero window is a division by zero),
  *    while the two growth limits may legitimately be zero — "this context must
@@ -1191,12 +1259,28 @@ function checkThresholds(values: Record<string, unknown>): Thresholds {
   // Built first so "was anything asked for?" is answered by the analyzer's own
   // `anyRequested` — the single definition of that question, rather than a
   // second copy here that could fall out of step the next time a flag is added.
+  // The FLAG on its own is kept beside the RESOLVED window: rule 3 below is
+  // about what the user typed, while every other use is about what was resolved.
+  const contextWindowFlag = intFlag(values, "context-window");
+  // Rule 4 for the WINDOW FLAG is stated here, before the shared resolver gets a
+  // chance to state it in its own words. `resolveContextWindow` refuses a
+  // non-positive flag too (so `tokens`/`view`/`export` inherit the rule), but its
+  // message is the generic `ctxdiff:` one; every usage error `check` emits is
+  // prefixed `ctxdiff check:`, which is what tells a CI log which step spoke.
+  // Only the flag needs the early guard: an environment-supplied window is
+  // already positive by the time `parseContextWindow` returns it.
+  if (contextWindowFlag !== null && contextWindowFlag <= 0) {
+    throw new SelectionError(
+      `ctxdiff check: --context-window must be greater than 0 (got ${contextWindowFlag})`,
+    );
+  }
   const thresholds: Thresholds = {
     maxContext: intFlag(values, "max-context"),
-    contextWindow: intFlag(values, "context-window"),
+    contextWindow: resolveWindow(values),
     maxContextPct: pctFlag(values, "max-context-pct"),
     requireStablePrefix: values["require-stable-prefix"] === true,
     noDeadSchemas: values["no-dead-schemas"] === true,
+    noTaggedEviction: values["no-tagged-eviction"] === true,
     maxGrowth: intFlag(values, "max-growth"),
     maxGrowthPct: pctFlag(values, "max-growth-pct"),
   };
@@ -1214,7 +1298,7 @@ function checkThresholds(values: Record<string, unknown>): Thresholds {
         "so the window is yours to state)",
     );
   }
-  if (contextWindow !== null && maxContextPct === null) {
+  if (contextWindowFlag !== null && maxContextPct === null) {
     throw new SelectionError(
       "ctxdiff check: --context-window is only used by --max-context-pct " +
         "— pass that too, or use --max-context N for an absolute budget",
@@ -1223,13 +1307,8 @@ function checkThresholds(values: Record<string, unknown>): Thresholds {
   // Integer and percentage limits are reported back in their own spelling — a
   // bare integer for the token budgets, one decimal for the percentages, the
   // same way every percentage in the report itself is written.
-  for (const [flag, value] of [
-    ["--max-context", maxContext],
-    ["--context-window", contextWindow],
-  ] as [string, number | null][]) {
-    if (value !== null && value <= 0) {
-      throw new SelectionError(`ctxdiff check: ${flag} must be greater than 0 (got ${value})`);
-    }
+  if (maxContext !== null && maxContext <= 0) {
+    throw new SelectionError(`ctxdiff check: --max-context must be greater than 0 (got ${maxContext})`);
   }
   if (maxContextPct !== null && maxContextPct <= 0) {
     throw new SelectionError(
@@ -1279,6 +1358,7 @@ async function cmdCheck(rest: string[]): Promise<number> {
       "max-context-pct": { type: "string" },
       "require-stable-prefix": { type: "boolean" },
       "no-dead-schemas": { type: "boolean" },
+      "no-tagged-eviction": { type: "boolean" },
       "max-growth": { type: "string" },
       "max-growth-pct": { type: "string" },
     },
@@ -1575,7 +1655,14 @@ function parseViewerArgs(
   options: Record<string, { type: "string" | "boolean" }>,
 ): { values: Record<string, unknown>; positionals: string[] } {
   try {
-    const { values, positionals } = parseArgs({ args: rest, options, allowPositionals: true });
+    // `--context-window` is the one numeric flag the viewer commands take, and a
+    // negative value must reach the resolver's "must be greater than 0" message
+    // rather than die in the parser as "expected one argument" — Python's
+    // argparse accepts `-5` as a VALUE via its negative-number heuristic, so
+    // without this the two CLIs answer the same typo differently. Same helper,
+    // same reason, as the analysis commands (see `joinNegativeNumberValues`).
+    const args = joinNegativeNumberValues(rest, ["--context-window"]);
+    const { values, positionals } = parseArgs({ args, options, allowPositionals: true });
     return { values: values as Record<string, unknown>, positionals: positionals as string[] };
   } catch (err) {
     throw usageErrorFromParse(err);
@@ -1601,6 +1688,7 @@ async function cmdExport(rest: string[]): Promise<number> {
     run: { type: "string" },
     session: { type: "string" },
     agent: { type: "string" },
+    "context-window": { type: "string" },
     out: { type: "string" },
   });
   try {
@@ -1609,6 +1697,7 @@ async function cmdExport(rest: string[]): Promise<number> {
       (values.session as string | undefined) ?? null,
       (values.agent as string | undefined) ?? null,
       values.out as string | undefined,
+      resolveWindow(values),
     );
     process.stdout.write(out + "\n");
     return 0;
@@ -1629,6 +1718,7 @@ async function writeDashboard(
   session: string | null,
   agent: string | null,
   out: string | undefined,
+  contextWindow: number | null = null,
 ): Promise<string> {
   const { reader, htmlDefault, sessionSelected, handle } = await openDashboard(
     project,
@@ -1643,7 +1733,7 @@ async function writeDashboard(
           "— pass --out FILE.html",
       );
     }
-    return exportStore(reader, target, { agent, sessionSelected });
+    return exportStore(reader, target, { agent, sessionSelected, contextWindow });
   } finally {
     reader.close();
     await handle.close();
@@ -1659,6 +1749,7 @@ async function cmdView(rest: string[]): Promise<number> {
     run: { type: "string" },
     session: { type: "string" },
     agent: { type: "string" },
+    "context-window": { type: "string" },
     "no-open": { type: "boolean" },
   });
   const tmp = join(tmpdir(), `ctxdiff-${randomUUID()}.html`);
@@ -1669,6 +1760,7 @@ async function cmdView(rest: string[]): Promise<number> {
       (values.session as string | undefined) ?? null,
       (values.agent as string | undefined) ?? null,
       tmp,
+      resolveWindow(values),
     );
   } catch (err) {
     return reportCommandFailure(err);

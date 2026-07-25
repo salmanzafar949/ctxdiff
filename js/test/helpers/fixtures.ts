@@ -14,11 +14,18 @@ import { join } from "node:path";
 
 type Row = [string, string, string]; // [role, kind, text]
 
-/** Build a CallBlock list from [role, kind, text] tuples, mirroring the recorder. */
-function blocks(rows: Row[], provider = "openai"): CallBlock[] {
+/** Build a CallBlock list from [role, kind, text] tuples, mirroring the recorder.
+ * `tags` is the (label, needle) list `tracer.tag()` registers: a needle found
+ * inside a block overrides its role-based label and marks the membership
+ * `tagged`, which is the ONLY thing the eviction detector looks at. */
+function blocks(
+  rows: Row[],
+  provider = "openai",
+  tags: [string, string][] = [],
+): CallBlock[] {
   return rows.map(([role, kind, text], position) => {
     const [tokenCount, tokenMethod] = countTokens(text, provider);
-    const [label, labelSource] = basicLabel(role, kind, text, []);
+    const [label, labelSource] = basicLabel(role, kind, text, tags);
     return {
       block: { contentHash: contentHash(role, kind, text), role, kind, text, tokenCount, tokenMethod },
       position,
@@ -293,6 +300,83 @@ export function writeFanout(dir: string): string {
   return path;
 }
 
+/**
+ * A TAGGED trace: the fixture behind the eviction detector and its
+ * counter-examples, in one interleaved multi-agent file.
+ *
+ * The researcher tags a retrieved passage at turn 1; the writer's turn 2 does
+ * not carry it (a HAND-OFF, which must never read as an eviction); the
+ * researcher still has it at turn 3; and at turn 5 it is gone for good — the one
+ * real eviction, and the only line the report may print. The writer's own
+ * timeline has nothing tagged at all, so `--agent writer` exercises the
+ * "structurally vacuous pass" branch that must not tick as if it had measured
+ * something.
+ */
+export function writeTagged(dir: string): string {
+  const path = join(dir, "tagged.ctrace");
+  const ct = CTrace.create(path, "tagged", "openai", "", "2026-07-08T00:00:00Z");
+  const rSys: Row = ["system", "message", "You are the RESEARCHER. Gather facts."];
+  const wSys: Row = ["system", "message", "You are the WRITER. Compose prose."];
+  const passage: Row = [
+    "user",
+    "message",
+    "Retrieved passage: Mars has two moons, Phobos and Deimos.",
+  ];
+  // The (label, needle) pair `tracer.tag("rag", ...)` registers: a needle found
+  // inside a block overrides its role-based label and marks it `tagged`.
+  const tags: [string, string][] = [["rag", "Retrieved passage"]];
+  ct.recordCall({
+    seq: 1, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 40, completion_tokens: 8, total_tokens: 48 },
+    latencyMs: 100, error: null,
+    callBlocks: blocks([rSys, passage], "openai", tags),
+    agent: "researcher", step: "gather", provider: "openai",
+  });
+  ct.recordCall({
+    seq: 2, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 22, completion_tokens: 6, total_tokens: 28 },
+    latencyMs: 110, error: null,
+    callBlocks: blocks([wSys, ["user", "message", "Write an intro about Mars."]]),
+    agent: "writer", step: "compose", provider: "openai",
+  });
+  ct.recordCall({
+    seq: 3, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 58, completion_tokens: 9, total_tokens: 67 },
+    latencyMs: 120, error: null,
+    callBlocks: blocks([
+      rSys, passage,
+      ["assistant", "message", "Mars is the fourth planet from the Sun."],
+      ["user", "message", "Anything about its moons?"],
+    ], "openai", tags),
+    agent: "researcher", step: "gather", provider: "openai",
+  });
+  ct.recordCall({
+    seq: 4, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 34, completion_tokens: 7, total_tokens: 41 },
+    latencyMs: 130, error: null,
+    callBlocks: blocks([
+      wSys,
+      ["user", "message", "Write an intro about Mars."],
+      ["assistant", "message", "Mars, the red planet, has fascinated observers."],
+    ]),
+    agent: "writer", step: "compose", provider: "openai",
+  });
+  ct.recordCall({
+    seq: 5, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 52, completion_tokens: 10, total_tokens: 62 },
+    latencyMs: 140, error: null,
+    callBlocks: blocks([
+      rSys,
+      ["assistant", "message", "Mars is the fourth planet from the Sun."],
+      ["user", "message", "Anything about its moons?"],
+      ["assistant", "message", "Phobos and Deimos, both small and irregular."],
+    ]),
+    agent: "researcher", step: "gather", provider: "openai",
+  });
+  ct.close();
+  return path;
+}
+
 export function makeFixtures(dir: string): {
   multiturn: string;
   multiagent: string;
@@ -302,6 +386,7 @@ export function makeFixtures(dir: string): {
   edge: string;
   unmeasured: string;
   fanout: string;
+  tagged: string;
 } {
   return {
     multiturn: writeMultiturn(dir),
@@ -312,5 +397,6 @@ export function makeFixtures(dir: string): {
     edge: writeEdgeTimestamps(dir),
     unmeasured: writeUnmeasured(dir),
     fanout: writeFanout(dir),
+    tagged: writeTagged(dir),
   };
 }
