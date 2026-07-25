@@ -1,0 +1,1 @@
+translator  sessions=1  calls=3  tokens=1,168

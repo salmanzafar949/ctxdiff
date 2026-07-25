@@ -1,0 +1,7 @@
+run total · in 1,010 tok · out 158 tok (3/3 calls reported usage)
+
+turn 3 · 367 tokens [translator·review]
+  █████████████████████████      user              305 tok   83.1%
+  ███                            history            38 tok   10.4%
+  ██                             system             24 tok    6.5%
+  provider reports 470 prompt tokens · Δ +103

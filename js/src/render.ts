@@ -91,10 +91,23 @@ export function pyRepr(s: string): string {
 
 /** First ~70 chars of `text` for a diff line: whitespace flattened to single
  * spaces, truncated with an ellipsis, then repr-quoted. Mirrors Python
- * `_snippet`. */
+ * `_snippet`.
+ *
+ * The limit counts CODE POINTS, not UTF-16 code units, because Python's
+ * `flat[:70]` and `len(flat)` both count code points — so on any text carrying
+ * astral characters (emoji, ZWJ sequences, math alphanumerics, astral CJK) a
+ * `String.prototype.slice` here would cut the snippet SHORT of Python's, print
+ * an ellipsis Python would not, and — worst of all — could cut between the two
+ * halves of a surrogate pair, leaving a lone surrogate that `pyRepr` renders as
+ * a `\ud83d` escape Python can never produce. `spec/golden/expected/cli/
+ * unicode.diff.1-2.txt` is the regression that pins this. The viewer's
+ * `sliceCp` solves the same problem the same way for the dashboard's 200-char
+ * block snippets. */
 function snippet(text: string, limit = 70): string {
   const flat = text.split(/\s+/u).filter((s) => s.length > 0).join(" ");
-  const truncated = flat.slice(0, limit) + (flat.length > limit ? "…" : "");
+  const codePoints = Array.from(flat);
+  const truncated =
+    codePoints.slice(0, limit).join("") + (codePoints.length > limit ? "…" : "");
   return pyRepr(truncated);
 }
 

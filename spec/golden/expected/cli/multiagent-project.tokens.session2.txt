@@ -1,0 +1,31 @@
+run total · in 1,760 tok · out 360 tok (3/4 calls reported usage)
+  researcher · in 1,330 · out 150
+  writer · in 430 · out 210
+
+agents: researcher · 3 calls · 615 tok   writer · 1 calls · 52 tok
+
+turn 1 · 133 tokens [researcher·search]
+  █████████████████              tool_schema        77 tok   57.9%
+  ██████████                     system             45 tok   33.8%
+  ██                             user               11 tok    8.3%
+  provider reports 540 prompt tokens · Δ +407
+
+turn 2 · 238 tokens [researcher·verify]
+  ██████████                     tool_schema        77 tok   32.4%
+  ███████                        tool_output        59 tok   24.8%
+  ██████                         history            46 tok   19.3%
+  ██████                         system             45 tok   18.9%
+  █                              user               11 tok    4.6%
+  provider reports 790 prompt tokens · Δ +552
+
+turn 3 · 244 tokens [researcher·verify]
+  █████████                      tool_schema        77 tok   31.6%
+  ███████                        tool_output        59 tok   24.2%
+  ██████                         history            46 tok   18.9%
+  ██████                         system             45 tok   18.4%
+  ██                             user               17 tok    7.0%
+
+turn 4 · 52 tokens (~approx) [writer·synthesize]
+  ███████████████                system             26 tok   50.0%
+  ███████████████                rag                26 tok   50.0%
+  provider reports 430 prompt tokens · Δ +378

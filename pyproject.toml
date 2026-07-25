@@ -10,7 +10,31 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Salman Zafar" }]
-dependencies = ["tiktoken>=0.7"]
+# PINNED TO AN EXACT VERSION, ON PURPOSE — do not relax to `>=`.
+#
+# ctxdiff ships two SDKs (PyPI `ctxdiff`, npm `ctxdiff`) that promise the same
+# trace renders to the same numbers in both. They get those numbers from two
+# INDEPENDENT reimplementations of the same `o200k_base` BPE table — tiktoken
+# here, gpt-tokenizer in js/package.json — on independent release cadences. A
+# `.ctrace` itself is safe either way (a block's content hash is sha256 over
+# role + kind + text; token counts are NOT hashed), but every rendered number
+# is downstream of a token count, so the day the two libraries disagree on one
+# encoding, `ctxdiff tokens`, the cache profiler's re-billed totals and the
+# HTML dashboard's percentages diverge between the SDKs. Floating this to
+# `>=0.7` means a transitive resolver bump can change published numbers with
+# no ctxdiff commit behind it — invisible until a user reports it.
+#
+# TO RE-PIN (a deliberate, reviewable act — never a drive-by bump):
+#   1. bump this version AND `gpt-tokenizer` in js/package.json (keep the two
+#      libraries' encodings in step; re-pinning one alone is what drift IS),
+#   2. update `tokenizers.*.pinned_version` in spec/golden/manifest.json,
+#   3. run `python spec/golden/regenerate.py` — it rewrites the committed
+#      expectations AND cross-checks that the JS SDK reproduces them,
+#   4. review the resulting diff under spec/golden/expected/. An EMPTY diff
+#      means the tokenizers still agree with the previous release. A non-empty
+#      diff is the tokenizer changing its mind about real text: understand
+#      which encoding moved before merging it.
+dependencies = ["tiktoken==0.13.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
@@ -30,7 +54,11 @@ ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · vie
 
 [tool.hatch.build.targets.sdist]
 # Keep the source tarball lean — no 2.4MB demo GIF, no tests/CI in the pip download.
-exclude = ["assets", "tests", ".github", "docs"]
+# `spec/golden` goes with `tests`: the golden corpus is only meaningful next to
+# the test suites that assert against it (tests/test_golden.py here,
+# js/test/golden.test.ts there), and neither ships. `spec/ctrace-schema.md` is
+# NOT excluded — the on-disk format is documentation a downloader may want.
+exclude = ["assets", "tests", ".github", "docs", "spec/golden"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ctxdiff"]

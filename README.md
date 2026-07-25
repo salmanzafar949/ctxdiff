@@ -771,6 +771,8 @@ Every block records a `token_count` and an honest `token_method`:
 
 Estimates are always labeled as such — never presented as exact. If `tiktoken` is unavailable for any reason, counting degrades to an estimate rather than dropping the capture, and never reaches the network at record time.
 
+**The tokenizer is pinned to an exact version.** `tiktoken` and the JS SDK's `gpt-tokenizer` are two independent reimplementations of the same `o200k_base` table on independent release cadences. A `.ctrace` is safe either way — a block's hash is `sha256(role ‖ kind ‖ text)` and token counts are *not* hashed — but every rendered number is downstream of a token count, so a floating dependency could change published numbers with no ctxdiff commit behind it. Both SDKs pin exactly, and a committed [golden corpus](spec/golden/) makes each SDK reproduce a frozen set of CLI outputs and dashboard hashes on every CI run. Re-pinning is deliberate: bump both, run `python spec/golden/regenerate.py`, review the diff. See **[spec/golden/README.md](spec/golden/README.md)**.
+
 ---
 
 ## Provider recipes
@@ -950,6 +952,17 @@ pytest tests/eval           # real-SDK integration tests (HTTP stubbed, no netwo
 ```
 
 The eval suite drives the real `openai`, `anthropic`, `google-genai`, `boto3`, and `langchain` SDKs with their HTTP transport stubbed (`respx` for httpx-based SDKs, `botocore.stub.Stubber` for boto3), so it needs no API keys and makes no network calls. It skips cleanly if the `eval` extra isn't installed.
+
+### The cross-SDK golden corpus
+
+`pytest` also runs `tests/test_golden.py`, which rebuilds every fixture in [`spec/golden/corpus/`](spec/golden/) with this SDK's tokenizer and compares the result to committed CLI output and dashboard hashes — **the same files the JS suite compares against.** It is what keeps "the two SDKs render identical numbers" true as `tiktoken` and `gpt-tokenizer` release independently. Nothing in it skips: a missing expectation or an unpinned tokenizer is an error.
+
+```bash
+python spec/golden/regenerate.py           # rewrite the goldens, then verify the JS SDK agrees
+python spec/golden/regenerate.py --check   # verify only (what CI runs)
+```
+
+Regenerate whenever a change is *supposed* to move a number, and put the resulting diff in the PR — it is the evidence that the new numbers are correct. Full rationale, corpus contents and the re-pinning procedure: **[spec/golden/README.md](spec/golden/README.md)**.
 
 ---
 

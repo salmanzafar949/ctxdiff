@@ -1,0 +1,9 @@
+── researcher · turn 2  →  writer · turn 4 ──
+── turn 2 → turn 4 · 7 blocks changed · +52 −238 tokens ──
+~ [system·system] [-C-]{+You are the writer. T+}ur[-rent sessio-]n t{+he researcher's f+}i{+ndings into a five-line su+}m{+mary a VP can act on. No h+}e[-: 2026-03-04T14:22:48Z-]{+dging.+}
+− [tool_schema·system] '{"function": {"description": "Search the public web and return ranked …'  −77 tok
++ [rag·user] 'FINDINGS: - Nothing material changed since last week; the prefix-stabi…'  +26 tok
+− [system·system] 'You are the researcher. Gather primary sources, quote them verbatim, a…'  −27 tok
+− [user·user] "Re-run last week's pricing question against the current docs."  −11 tok
+− [history·assistant] '{"function": {"arguments": "{\\"query\\": \\"prompt cache read pricing 20…'  −46 tok
+− [tool_output·tool] '1. Provider docs: cached prefix reads are billed at a fraction of the …'  −59 tok

@@ -1,0 +1,6 @@
+── turn 1 → turn 2 · 4 blocks changed · +319 −222 tokens ──
+~ [user·user] {"image_url": {"detail": "high", "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws[-LCws-]FCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR"}, "type": "image_url"}
++ [history·assistant] '{"function": {"arguments": "{\\"selector\\": \\"</script> </ script>\\", \\…'  +43 tok
++ [tool_output·tool] '{"call_id": "call_v1", "output": "<div class=\\"panel\\"><script>alert(\'…'  +36 tok
++ [user·user] 'Now transcribe the literal text you saw, including the </script> seque…'  +20 tok
+= 4 unchanged blocks · 149 tok

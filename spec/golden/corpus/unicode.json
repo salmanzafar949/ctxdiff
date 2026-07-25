@@ -1,0 +1,74 @@
+{
+  "id": "unicode",
+  "title": "Unicode, emoji and CJK tokenization",
+  "why": "The single most likely place for tiktoken and gpt-tokenizer to disagree. Multi-codepoint grapheme clusters (ZWJ families, skin-tone modifiers, flag sequences), CJK/Hangul/Devanagari, RTL scripts, combining vs. precomposed accents, invisible format characters and astral-plane math alphanumerics all cross byte-pair boundaries in ways a merge-table revision can move. Every token number below is produced by the SDK's own tokenizer at build time, so a divergence changes the rendered output and fails the golden.",
+  "sessions": [
+    {
+      "run_id": "a0000000000000000000000000000001",
+      "project": "unicode-corpus",
+      "started_at": "2026-03-01T08:15:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "c0000000000000000000000000000001",
+          "seq": 1,
+          "agent": "translator",
+          "step": "draft",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.0},
+          "usage": {"prompt_tokens": 210, "completion_tokens": 44, "total_tokens": 254},
+          "latency_ms": 180,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a careful translator. Preserve every emoji, grapheme cluster and bidirectional mark exactly as written; never normalize."],
+            ["user", "message", "日本語のトークン化テスト。これは漢字とひらがなとカタカナの混在文です。文脈ウィンドウのデバッガについて説明してください。"],
+            ["user", "message", "中文分词测试：上下文窗口调试器，用于大语言模型智能体。请用一句话总结。"]
+          ]
+        },
+        {
+          "call_id": "c0000000000000000000000000000002",
+          "seq": 2,
+          "agent": "translator",
+          "step": "draft",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.0},
+          "usage": {"prompt_tokens": 330, "completion_tokens": 51, "total_tokens": 381},
+          "latency_ms": 205,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a careful translator. Preserve every emoji, grapheme cluster and bidirectional mark exactly as written; never normalize."],
+            ["user", "message", "日本語のトークン化テスト。これは漢字とひらがなとカタカナの混在文です。文脈ウィンドウのデバッガについて説明してください。"],
+            ["user", "message", "中文分词测试：上下文窗口调试器，用于大语言模型智能体。请用一句话总结。"],
+            ["assistant", "message", "컨텍스트 창 디버거는 에이전트가 모델에 보낸 내용을 그대로 기록합니다."],
+            ["user", "message", "🚀 ship it 🎉 — emoji stress: 👨‍👩‍👧‍👦 ZWJ family, 🏳️‍🌈 flag sequence, 🤦🏽‍♀️ skin-tone modifier, 👍🏿 standalone modifier."]
+          ]
+        },
+        {
+          "call_id": "c0000000000000000000000000000003",
+          "seq": 3,
+          "agent": "translator",
+          "step": "review",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.0},
+          "usage": {"prompt_tokens": 470, "completion_tokens": 63, "total_tokens": 533},
+          "latency_ms": 240,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a careful translator. Preserve every emoji, grapheme cluster and bidirectional mark exactly as written; never normalize."],
+            ["user", "message", "日本語のトークン化テスト。これは漢字とひらがなとカタカナの混在文です。文脈ウィンドウのデバッガについて説明してください。"],
+            ["user", "message", "中文分词测试：上下文窗口调试器，用于大语言模型智能体。请用一句话总结。"],
+            ["assistant", "message", "컨텍스트 창 디버거는 에이전트가 모델에 보낸 내용을 그대로 기록합니다."],
+            ["user", "message", "🚀 ship it 🎉 — emoji stress: 👨‍👩‍👧‍👦 ZWJ family, 🏳️‍🌈 flag sequence, 🤦🏽‍♀️ skin-tone modifier, 👍🏿 standalone modifier."],
+            ["assistant", "message", "Отлично. Проверка токенизации кириллицы прошла успешно."],
+            ["user", "message", "مرحبا بالعالم! اختبار الترميز العربي مع نص من اليمين إلى اليسار. עברית: בדיקת אסימונים. मूल्यांकन: हिन्दी टोकनाइज़ेशन परीक्षण।"],
+            ["user", "message", "Edge cases in one line: combining 'é å ñ' vs precomposed 'é å ñ'; ligatures ﬁ ﬂ; fractions ½ ⅓ ¼; roman ⅷ; enclosed ⒜⒝⒞; math 𝕌𝕟𝕚𝕔𝕠𝕕𝕖 𝓶𝓪𝓽𝓱 𝔞𝔩𝔭𝔥𝔞; astral CJK 𠜎 𤭢 𰻞; invisible zero​width​space and ‎ bidi ‮ marks ‬ here."]
+          ]
+        }
+      ]
+    }
+  ]
+}

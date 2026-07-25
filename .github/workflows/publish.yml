@@ -26,6 +26,7 @@ on:
       - "src/**"
       - "pyproject.toml"
       - "tests/**"
+      - "spec/golden/**"
       - "README.md"
       - ".github/workflows/publish.yml"
   pull_request:
@@ -33,6 +34,7 @@ on:
       - "src/**"
       - "pyproject.toml"
       - "tests/**"
+      - "spec/golden/**"
       - "README.md"
       - ".github/workflows/publish.yml"
   workflow_dispatch:
@@ -56,6 +58,24 @@ jobs:
           pip install -e ".[dev,eval]"
       - name: Run the full suite (unit + real-SDK eval, HTTP stubbed)
         run: pytest -q
+
+      # The cross-SDK golden corpus (spec/golden/) — the mechanism that keeps
+      # "byte-identical between the Python and JS SDKs" true permanently. The
+      # assertions themselves already ran inside pytest above
+      # (tests/test_golden.py, which never skips: a missing expectation or an
+      # unpinned tokenizer is an ERROR there, not a skip). This step runs the
+      # REGENERATOR in --check mode as well, for two things pytest cannot cover:
+      # that `regenerate.py` still runs at all (a rotted regenerator is how a
+      # golden corpus quietly stops being maintainable), and that the exact
+      # command CONTRIBUTING tells a contributor to run reports the same verdict
+      # CI does.
+      #
+      # `--no-js` because this job has no Node toolchain. The JS half of the
+      # SAME goldens is enforced in js.yml, which runs both sides — so between
+      # the two workflows every golden is checked by both SDKs on every change
+      # that can affect it.
+      - name: Golden corpus — Python side must reproduce the committed numbers
+        run: python spec/golden/regenerate.py --check --no-js
 
   build:
     name: build distribution

@@ -1,0 +1,5 @@
+── turn 2 → turn 3 · 3 blocks changed · +155 −31 tokens ──
+~ [system·system] You are a senior code reviewer. Point at the defect, name the mechanism, and propose the smallest correct fix. Never rewrite code that is already correct.{+ Always show a runnable diff.+}
++ [history·assistant] 'The seed should be `a, b = 0, 1`. Diff: ```diff - a, b = 1, 1 + a, b =…'  +45 tok
++ [user·user] 'Good. Now port it to TypeScript with the same tests: ```ts export func…'  +73 tok
+= 6 unchanged blocks · 602 tok

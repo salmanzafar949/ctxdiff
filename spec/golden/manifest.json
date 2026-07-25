@@ -1,0 +1,82 @@
+{
+  "manifest_version": 1,
+  "doc": "The shared contract for ctxdiff's cross-SDK golden corpus. BOTH SDKs read this file: the Python harness (spec/golden/harness.py, driven by tests/test_golden.py) and the JS harness (js/test/helpers/golden.ts, driven by js/test/golden.test.ts). Each SDK rebuilds every fixture from spec/golden/corpus/*.json with ITS OWN tokenizer, hasher and labeler, renders the cases below with ITS OWN CLI and viewer, and compares against the committed expectations in spec/golden/expected/. A drift in either SDK fails; a drift in both still fails until `python spec/golden/regenerate.py` is run deliberately and the diff is reviewed.",
+
+  "tz": "UTC",
+  "no_color": true,
+
+  "ctxdiff_version": "0.0.0-golden",
+  "ctxdiff_version_note": "The `ctxdiff_version` written into every golden run row is PINNED to this literal rather than taken from each SDK's own version constant. The two packages version independently (PyPI `ctxdiff` and npm `ctxdiff` are separate release trains), and that field is embedded verbatim in the HTML payload — so without this pin the HTML hash could never be shared between the SDKs and the strongest half of the check would be lost. The field itself is covered by tests/test_store.py and js/test/store.test.ts; nothing else in the golden depends on it.",
+
+  "tokenizers": {
+    "python": {
+      "package": "tiktoken",
+      "pinned_version": "0.13.0",
+      "encoding": "o200k_base"
+    },
+    "javascript": {
+      "package": "gpt-tokenizer",
+      "pinned_version": "3.4.0",
+      "encoding": "o200k_base"
+    },
+    "note": "Both are pinned to an EXACT version (pyproject.toml / js/package.json). These two libraries are independent reimplementations of the same BPE encoding on independent release cadences, so a floating bump on either side could change a rendered token number without a single line of ctxdiff changing. Re-pinning is a deliberate act: bump the pin, run `python spec/golden/regenerate.py`, and review the resulting diff — a non-empty diff is the tokenizer changing its mind, and must be understood before merging."
+  },
+
+  "fixtures": [
+    {"id": "unicode", "corpus": "corpus/unicode.json", "ctrace": "unicode.ctrace"},
+    {"id": "code-and-schemas", "corpus": "corpus/code-and-schemas.json", "ctrace": "code-and-schemas.ctrace"},
+    {"id": "multiagent-project", "corpus": "corpus/multiagent-project.json", "ctrace": "multiagent-project.ctrace"},
+    {"id": "multipart-content", "corpus": "corpus/multipart-content.json", "ctrace": "multipart-content.ctrace"},
+    {"id": "round-numbers", "corpus": "corpus/round-numbers.json", "ctrace": "round-numbers.ctrace"}
+  ],
+
+  "cli_cases": [
+    {"name": "unicode.diff.1-2", "fixture": "unicode", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "unicode.diff.2-3", "fixture": "unicode", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "unicode.tokens", "fixture": "unicode", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "unicode.tokens.turn3", "fixture": "unicode", "argv": ["tokens", "--turn", "3", "--project", "{trace}"]},
+    {"name": "unicode.cache", "fixture": "unicode", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "unicode.sessions", "fixture": "unicode", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "unicode.agents", "fixture": "unicode", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "code-and-schemas.diff.1-2", "fixture": "code-and-schemas", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "code-and-schemas.diff.2-3", "fixture": "code-and-schemas", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "code-and-schemas.tokens", "fixture": "code-and-schemas", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "code-and-schemas.cache", "fixture": "code-and-schemas", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "code-and-schemas.sessions", "fixture": "code-and-schemas", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "code-and-schemas.agents", "fixture": "code-and-schemas", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "multiagent-project.sessions", "fixture": "multiagent-project", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "multiagent-project.agents", "fixture": "multiagent-project", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "multiagent-project.tokens.session1", "fixture": "multiagent-project", "argv": ["tokens", "--session", "e1a2b3c4d5e6", "--project", "{trace}"]},
+    {"name": "multiagent-project.tokens.session2", "fixture": "multiagent-project", "argv": ["tokens", "--session", "e7f8a9b0c1d2", "--project", "{trace}"]},
+    {"name": "multiagent-project.tokens.researcher", "fixture": "multiagent-project", "argv": ["tokens", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--project", "{trace}"]},
+    {"name": "multiagent-project.cache.session2", "fixture": "multiagent-project", "argv": ["cache", "--session", "e7f8a9b0c1d2", "--project", "{trace}"]},
+    {"name": "multiagent-project.cache.researcher", "fixture": "multiagent-project", "argv": ["cache", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--project", "{trace}"]},
+    {"name": "multiagent-project.diff.1-2", "fixture": "multiagent-project", "argv": ["diff", "--session", "e7f8a9b0c1d2", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "multiagent-project.diff.cross-session", "fixture": "multiagent-project", "argv": ["diff", "--session", "e1a2b3c4d5e6", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--turn", "2", "--project", "{trace}"]},
+    {"name": "multiagent-project.diff.cross-agent", "fixture": "multiagent-project", "argv": ["diff", "--agent", "researcher:2", "--agent", "writer:4", "--session", "e7f8a9b0c1d2", "--project", "{trace}"]},
+
+    {"name": "multipart-content.diff.1-2", "fixture": "multipart-content", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "multipart-content.tokens", "fixture": "multipart-content", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "multipart-content.cache", "fixture": "multipart-content", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "multipart-content.sessions", "fixture": "multipart-content", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "multipart-content.agents", "fixture": "multipart-content", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "round-numbers.tokens", "fixture": "round-numbers", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.turn1", "fixture": "round-numbers", "argv": ["tokens", "--turn", "1", "--project", "{trace}"]},
+    {"name": "round-numbers.diff.1-2", "fixture": "round-numbers", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "round-numbers.diff.2-3", "fixture": "round-numbers", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "round-numbers.cache", "fixture": "round-numbers", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "round-numbers.sessions", "fixture": "round-numbers", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "round-numbers.agents", "fixture": "round-numbers", "argv": ["agents", "--project", "{trace}"]}
+  ],
+
+  "html_cases": [
+    {"name": "unicode", "fixture": "unicode"},
+    {"name": "code-and-schemas", "fixture": "code-and-schemas"},
+    {"name": "multiagent-project", "fixture": "multiagent-project"},
+    {"name": "multipart-content", "fixture": "multipart-content"},
+    {"name": "round-numbers", "fixture": "round-numbers"}
+  ]
+}

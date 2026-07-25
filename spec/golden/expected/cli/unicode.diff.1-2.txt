@@ -1,0 +1,4 @@
+── turn 1 → turn 2 · 2 blocks changed · +75 −0 tokens ──
++ [history·assistant] '컨텍스트 창 디버거는 에이전트가 모델에 보낸 내용을 그대로 기록합니다.'  +22 tok
++ [user·user] '🚀 ship it 🎉 — emoji stress: 👨\u200d👩\u200d👧\u200d👦 ZWJ family, 🏳️\u200d🌈 flag sequence, 🤦🏽…'  +53 tok
+= 3 unchanged blocks · 94 tok

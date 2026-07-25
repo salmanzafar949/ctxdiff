@@ -1,0 +1,5 @@
+── turn 1 → turn 2 · 3 blocks changed · +123 −18 tokens ──
+~ [system·system] Current session time: 2026-03-04T14:22:[-31-]{+48+}Z
++ [history·assistant] '{"function": {"arguments": "{\\"query\\": \\"prompt cache read pricing 20…'  +46 tok
++ [tool_output·tool] '1. Provider docs: cached prefix reads are billed at a fraction of the …'  +59 tok
+= 3 unchanged blocks · 115 tok

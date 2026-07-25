@@ -413,6 +413,8 @@ Wrapping is **absolute** fail-open: it never throws into your app, never breaks 
 
 Exact for OpenAI via the pure-JS `o200k_base` tokenizer (verified to match Python's `tiktoken` byte-for-byte); a documented `~4-chars/token` estimate for other providers. Estimated counts are always marked `estimate`, never passed off as exact.
 
+**`gpt-tokenizer` is pinned to an exact version** (no caret), and so is Python's `tiktoken`. They are two independent reimplementations of the same `o200k_base` table on independent release cadences. A `.ctrace` is safe either way — a block's hash is `sha256(role ‖ kind ‖ text)` and token counts are *not* hashed — but every rendered number is downstream of a token count, so `npm install` picking up a newer minor could change published numbers with no ctxdiff commit behind it. A committed [golden corpus](https://github.com/salmanzafar949/ctxdiff/tree/main/spec/golden) makes **both** SDKs reproduce a frozen set of CLI outputs and dashboard hashes on every CI run. Re-pinning is deliberate: bump both, run `npm run golden:regen`, review the diff.
+
 ---
 
 ## Provider recipes
@@ -479,8 +481,12 @@ Issues and PRs welcome — see [CONTRIBUTING.md](https://github.com/salmanzafar9
 cd js
 npm install
 npm run build
-npm test          # unit + cross-language conformance against the Python SDK
+npm test              # unit + cross-language conformance against the Python SDK
+npm run test:golden   # the cross-SDK golden corpus, on its own
+npm run golden:regen  # rewrite the goldens (needs the repo's Python venv)
 ```
+
+`npm test` includes `test/golden.test.ts`, which rebuilds every fixture in [`spec/golden/corpus/`](https://github.com/salmanzafar949/ctxdiff/tree/main/spec/golden) with this SDK's tokenizer and compares against committed CLI output and dashboard hashes — **the same files the Python suite compares against.** Nothing in it skips: a missing expectation or an unpinned tokenizer is a failure. Regenerate whenever a change is *supposed* to move a number, and put the diff in the PR. Full rationale and the re-pinning procedure: **[spec/golden/README.md](https://github.com/salmanzafar949/ctxdiff/blob/main/spec/golden/README.md)**.
 
 ---
 

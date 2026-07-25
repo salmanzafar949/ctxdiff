@@ -1,0 +1,5 @@
+run total · in 127 tok · out 21 tok (3/3 calls reported usage)
+
+turn 1 · 13 tokens [solo]
+  ██████████████████████████████ system             13 tok  100.0%
+  provider reports 40 prompt tokens · Δ +27
