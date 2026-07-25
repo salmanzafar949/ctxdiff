@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ctxdiff"
 version = "0.4.1"
-description = "git diff for your agent's context window — a context-window debugger for LLM agents"
+description = "Find what breaks your LLM agent's prompt cache and wastes its context — git diff for the context window"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

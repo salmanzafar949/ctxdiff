@@ -8,7 +8,9 @@
 [![Node 22+](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg?logo=node.js&logoColor=white)](https://nodejs.org)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/CONTRIBUTING.md)
 
-**git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
+**Find the character that's breaking your agent's prompt cache on every turn** — and the tool schemas you pay for on every call but never invoke.
+
+*`git diff` for your agent's context window:* see exactly what your LLM saw, turn by turn, block by block.
 
 **Pick your language:** [🐍 Python](#install) · [🟨 JavaScript / TypeScript](js/README.md) — same `.ctrace` format, same CLI, cross-compatible.
 

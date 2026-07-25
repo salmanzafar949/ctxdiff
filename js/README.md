@@ -6,7 +6,9 @@
 [![Node 22+](https://img.shields.io/badge/node-22%2B-blue.svg)](https://nodejs.org/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/CONTRIBUTING.md)
 
-**git diff for your agent's context window.** See exactly what your LLM saw — turn by turn, block by block.
+**Find the character that's breaking your agent's prompt cache on every turn** — and the tool schemas you pay for on every call but never invoke.
+
+*`git diff` for your agent's context window:* see exactly what your LLM saw, turn by turn, block by block.
 
 `ctxdiff` is a local-first debugger for the context window of LLM agents. Wrap your OpenAI, Anthropic, or Gemini client in one line, run your agent, and every call's context is recorded — as content-hashed, deduplicated *blocks* — into a single-file SQLite trace you can inspect, diff, and share. Nothing leaves your machine.
 
