@@ -1,0 +1,352 @@
+# ctxdiff's GitHub Action: assert an agent's context budget on every pull
+# request, and fail the build when it regresses.
+#
+# WHY THIS FILE IS AT THE REPOSITORY ROOT. GitHub resolves `uses:
+# owner/repo@ref` against `action.yml` (or `action.yaml`) at the ROOT of the
+# repository, and nowhere else. Living under `.github/actions/ctxdiff-check/`
+# is the convention for an action a repo uses on ITSELF — consumers would then
+# have to spell `uses: salmanzafar949/ctxdiff/.github/actions/ctxdiff-check@v1`,
+# which is longer, undiscoverable and not listable on the Marketplace. This
+# action exists FOR OTHER PEOPLE'S repositories, so it takes the root path that
+# makes `uses: salmanzafar949/ctxdiff@v1` work.
+#
+# WHY COMPOSITE, NOT DOCKER OR JAVASCRIPT. All this does is install a published
+# package and run one CLI command. A Docker action would pay a container build
+# or pull on every run for no isolation anyone needs; a JavaScript action would
+# mean committing a bundled `dist/` and pinning it separately from the npm
+# package that already exists. A composite action runs on whatever the job's
+# runner already has, in the job's own workspace, and stays readable as shell.
+#
+# WHY A JOB SUMMARY AND NOT A PR COMMENT. The check table is written to
+# `$GITHUB_STEP_SUMMARY`, which needs no token, no `permissions:` block and no
+# network call. A PR comment would need `pull-requests: write` — which many
+# organizations disable by default, and which is READ-ONLY on pull requests from
+# forks no matter what the repository settings say. An adoption feature whose
+# reporting silently stops working on exactly the pull requests outside
+# contributors open is not unattended CI. The summary renders on every run,
+# including forks; a failure additionally emits a `::error::` annotation so it
+# surfaces inline in the Actions UI and in the PR's checks list. Anyone who does
+# want a comment can build one from the `report` output without this action
+# holding a write token on their behalf.
+name: ctxdiff check
+description: >-
+  Assert your agent's context budget in CI — max context per turn, prompt-cache
+  prefix stability, and dead tool schemas — and fail the build when it regresses.
+author: Salman Zafar
+
+branding:
+  icon: check-circle
+  color: purple
+
+inputs:
+  # --- what to read ---------------------------------------------------------
+  project:
+    description: >-
+      Which project to check: a .ctrace path or a database DSN (passed straight
+      to `--project`). Defaults to the most recently modified *.ctrace in
+      working-directory, which is what a test run that captured one trace
+      leaves behind.
+    required: false
+    default: ""
+  session:
+    description: >-
+      Which session in the project (an id or any unambiguous prefix). Required
+      only when the project holds several — a fresh CI trace holds one.
+    required: false
+    default: ""
+  agent:
+    description: >-
+      Scope the check to one agent's calls, so a pipeline can gate each agent
+      against its own budget in its own step.
+    required: false
+    default: ""
+  working-directory:
+    description: Directory to run in (where the .ctrace was written).
+    required: false
+    default: "."
+
+  # --- the assertions (all opt-in; at least one is required) ----------------
+  max-context:
+    description: Fail if any turn's context exceeds this many tokens.
+    required: false
+    default: ""
+  context-window:
+    description: >-
+      The model's context window in tokens — the denominator max-context-pct is
+      a percentage of. You supply it: ctxdiff ships no model→window table,
+      because those change per model and per provider and a stale table would
+      silently move your threshold.
+    required: false
+    default: ""
+  max-context-pct:
+    description: Fail if any turn's context exceeds this percentage of context-window.
+    required: false
+    default: ""
+  require-stable-prefix:
+    description: Fail if the prompt-cache prefix breaks anywhere in the run ("true"/"false").
+    required: false
+    default: "false"
+  no-dead-schemas:
+    description: Fail if a tool schema is registered but never invoked ("true"/"false").
+    required: false
+    default: "false"
+  max-growth:
+    description: >-
+      Fail if the context grows by more than this many tokens between two
+      consecutive turns of the same agent.
+    required: false
+    default: ""
+  max-growth-pct:
+    description: >-
+      Fail if the context grows by more than this percentage between two
+      consecutive turns of the same agent.
+    required: false
+    default: ""
+
+  # --- how to run it --------------------------------------------------------
+  runtime:
+    description: >-
+      Which SDK to run the check with, "python" (pip) or "node" (npx). Both
+      produce byte-identical output on the same trace, so pick whichever your
+      job already has set up.
+    required: false
+    default: python
+  version:
+    description: >-
+      Exact ctxdiff version to install (e.g. "0.1.0"). Empty installs the latest
+      release. Pin it if you want a threshold verdict that cannot move under you.
+    required: false
+    default: ""
+  summary:
+    description: Write the check table to the job summary ("true"/"false").
+    required: false
+    default: "true"
+
+outputs:
+  passed:
+    description: '"true" when every requested assertion passed, "false" otherwise.'
+    value: ${{ steps.check.outputs.passed }}
+  exit-code:
+    description: "ctxdiff check's exit code: 0 all-pass, 1 violation, 2 usage error."
+    value: ${{ steps.check.outputs.exit-code }}
+  report:
+    description: >-
+      The full check report as text. Exposed so a workflow that genuinely wants
+      a PR comment can post it with its own token and its own permissions,
+      rather than this action requiring `pull-requests: write` from everyone.
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    # Every input reaches the shell through the ENVIRONMENT, never through
+    # `${{ }}` interpolation into the script body. Interpolation splices the
+    # value into the source text before bash ever sees it, so an input carrying
+    # a quote and a semicolon becomes executable code — and these inputs are
+    # exactly the kind a workflow might wire to `github.event.*`, which a fork's
+    # pull request controls. Env vars are data no matter what they contain.
+    - name: Install ctxdiff
+      shell: bash
+      env:
+        RUNTIME: ${{ inputs.runtime }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$RUNTIME" in
+          python)
+            # `python3 -m pip` rather than a bare `pip`: on a runner without a
+            # venv active the two can resolve to different interpreters, and
+            # the one that matters is the one that will run the console script.
+            python3 -m pip install --disable-pip-version-check --quiet \
+              "ctxdiff${VERSION:+==$VERSION}"
+            ;;
+          node)
+            # npx resolves the package at run time, so nothing to install here.
+            # Asserting node exists now, though, turns "no node on this runner"
+            # into a clear failure at the install step rather than an obscure
+            # one three lines into the check.
+            node --version
+            ;;
+          *)
+            echo "::error title=ctxdiff check::unknown runtime '$RUNTIME' (expected 'python' or 'node')"
+            exit 2
+            ;;
+        esac
+
+    - name: ctxdiff check
+      id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        # The report is written to the job summary as fenced plain text, so ANSI
+        # escapes would show up as literal garbage in it. ctxdiff already
+        # disables color off a TTY; this makes it explicit and independent of
+        # how the runner attaches its streams.
+        NO_COLOR: "1"
+        RUNTIME: ${{ inputs.runtime }}
+        VERSION: ${{ inputs.version }}
+        SUMMARY: ${{ inputs.summary }}
+        IN_PROJECT: ${{ inputs.project }}
+        IN_SESSION: ${{ inputs.session }}
+        IN_AGENT: ${{ inputs.agent }}
+        IN_MAX_CONTEXT: ${{ inputs.max-context }}
+        IN_CONTEXT_WINDOW: ${{ inputs.context-window }}
+        IN_MAX_CONTEXT_PCT: ${{ inputs.max-context-pct }}
+        IN_MAX_GROWTH: ${{ inputs.max-growth }}
+        IN_MAX_GROWTH_PCT: ${{ inputs.max-growth-pct }}
+        IN_REQUIRE_STABLE_PREFIX: ${{ inputs.require-stable-prefix }}
+        IN_NO_DEAD_SCHEMAS: ${{ inputs.no-dead-schemas }}
+      run: |
+        set -uo pipefail
+
+        # Assemble argv from the inputs. An empty input contributes NOTHING —
+        # an assertion nobody asked for must not be silently applied, and a
+        # flag with an empty value would be a usage error rather than a no-op.
+        # `args` is what the CLI receives; `shown` is what the log echoes. They
+        # differ in exactly one place — see `secret` — so the echoed line stays
+        # a faithful transcript of the command without reproducing a value that
+        # must not be written down.
+        args=()
+        shown=()
+        add() { [ -n "$2" ] && { args+=("$1" "$2"); shown+=("$1" "$2"); } || true; }
+        # A project can be a database DSN carrying a password, and Actions masks
+        # a value only when it came from `secrets.*` — a DSN assembled in the
+        # workflow, or read from a plain `env:`, is masked by nothing and would
+        # be printed verbatim into a build log anyone with read access can
+        # fetch. THAT a project was named is worth logging; which one is not.
+        secret() { [ -n "$2" ] && { args+=("$1" "$2"); shown+=("$1" "***"); } || true; }
+        # A boolean input is "true", "false" or a MISTAKE — and a mistake must
+        # fail the step, never be skipped. GitHub's expression parser resolves
+        # `true`/`false` to booleans, but an unquoted `yes`/`on`/`1`/`y`/`TRUE`
+        # in a workflow arrives here as that literal string. Matching only
+        # "true" and shrugging at everything else means
+        # `require-stable-prefix: yes` silently drops the assertion: the step
+        # runs a check that asserts less than its author wrote, exits 0, and
+        # stays green forever with nothing in the log to notice. Refusing an
+        # unrecognized value is the only behavior that cannot do that.
+        flag() {
+          case "$2" in
+            true) args+=("$1"); shown+=("$1") ;;
+            ""|false) ;;
+            *)
+              echo "::error title=ctxdiff check::input for $1 must be 'true' or 'false' (got '$2')"
+              exit 2
+              ;;
+          esac
+        }
+
+        secret --project      "$IN_PROJECT"
+        add --session         "$IN_SESSION"
+        add --agent           "$IN_AGENT"
+        add --max-context     "$IN_MAX_CONTEXT"
+        add --context-window  "$IN_CONTEXT_WINDOW"
+        add --max-context-pct "$IN_MAX_CONTEXT_PCT"
+        add --max-growth      "$IN_MAX_GROWTH"
+        add --max-growth-pct  "$IN_MAX_GROWTH_PCT"
+        flag --require-stable-prefix "$IN_REQUIRE_STABLE_PREFIX"
+        flag --no-dead-schemas       "$IN_NO_DEAD_SCHEMAS"
+
+        # The summary switch is a boolean input too, and the same rule applies:
+        # a `summary: yes` that silently produced no summary would look exactly
+        # like a broken action.
+        case "$SUMMARY" in
+          true|false) ;;
+          *)
+            echo "::error title=ctxdiff check::input for summary must be 'true' or 'false' (got '$SUMMARY')"
+            exit 2
+            ;;
+        esac
+
+        if [ "$RUNTIME" = "node" ]; then
+          cmd=(npx --yes "ctxdiff${VERSION:+@$VERSION}" check)
+        else
+          cmd=(ctxdiff check)
+        fi
+
+        # `shown`, not `args` — the --project value is redacted there. Guarded
+        # with `${shown[*]+…}` for the same bash 3.2 reason as the call below.
+        echo "+ ${cmd[*]} ${shown[*]+"${shown[*]}"}"
+        # Both streams are captured: stdout carries the PASS/FAIL table, stderr
+        # carries the usage errors (exit 2) and the "no trace here" line (exit
+        # 1). A summary that showed only stdout would be EMPTY for exactly the
+        # failures that need explaining most.
+        #
+        # `${args[@]+"${args[@]}"}` rather than `"${args[@]}"`: under `set -u`,
+        # bash 3.2 — still the /bin/bash on GitHub's macOS runners — treats an
+        # EMPTY array's expansion as an unbound variable and kills the step with
+        # no output and no summary. The no-input case must reach the CLI and
+        # come back as its own usage error (exit 2, "nothing to assert"), which
+        # is the message that tells the author what to fix.
+        set +e
+        report="$("${cmd[@]}" ${args[@]+"${args[@]}"} 2>&1)"
+        code=$?
+        set -e
+
+        printf '%s\n' "$report"
+
+        {
+          echo "exit-code=$code"
+          if [ "$code" -eq 0 ]; then echo "passed=true"; else echo "passed=false"; fi
+        } >> "$GITHUB_OUTPUT"
+        # A random delimiter, per GitHub's own guidance for multi-line outputs:
+        # a fixed one could appear inside a report that quotes a user's prompt
+        # text, which is an output-injection bug, not a formatting one.
+        delim="ctxdiff_$(date +%s%N)_$RANDOM"
+        {
+          echo "report<<$delim"
+          printf '%s\n' "$report"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$SUMMARY" = "true" ]; then
+          # The fence is made LONGER than the longest run of backticks anywhere
+          # in the report. A report quotes captured text — a tool schema's name,
+          # a prompt snippet in a cache-break explanation — which on a fork pull
+          # request is written by an outside contributor. A fixed three-backtick
+          # fence is closed by any line the report happens to contain that
+          # starts one, and everything after it renders as markdown in the job
+          # summary: headings, links, an invented "✅ check passed". CommonMark
+          # says a fence is closed only by a run at least as long as the one
+          # that opened it, so counting first makes the fence unclosable by its
+          # own content. (ctxdiff also flattens newlines out of every captured
+          # fragment it prints; this is the second lock on the same door, since
+          # the report is not the only thing that could ever grow a backtick.)
+          # Counted with awk alone (no grep, whose "no match" exit status would
+          # trip `set -e`/`pipefail` on the overwhelmingly common backtick-free
+          # report).
+          longest=$(printf '%s\n' "$report" | awk '
+            { run = 0; best = 0
+              for (i = 1; i <= length($0); i++) {
+                if (substr($0, i, 1) == "`") { run++; if (run > best) best = run }
+                else run = 0
+              }
+              if (best > max) max = best }
+            END { print max + 0 }')
+          if [ "$longest" -ge 3 ]; then ticks=$((longest + 1)); else ticks=3; fi
+          fence=$(printf '`%.0s' $(seq "$ticks"))
+          {
+            if [ "$code" -eq 0 ]; then
+              echo "### ✅ ctxdiff check passed"
+            else
+              echo "### ❌ ctxdiff check failed"
+            fi
+            echo
+            echo "$fence"
+            printf '%s\n' "$report"
+            echo "$fence"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        # One annotation line so the failure is visible in the checks list and
+        # inline in the Actions UI, not only inside the log — but it must say
+        # WHICH failure. Exit 2 is a usage error (an impossible flag
+        # combination, an unresolvable --session): nothing was measured and no
+        # budget was violated, and telling an author their context budget blew
+        # up when they actually mistyped a flag sends them to read a trace that
+        # is not the problem.
+        if [ "$code" -eq 1 ]; then
+          echo "::error title=ctxdiff check::ctxdiff check failed (exit 1) — a budget was violated, or the trace could not be read; see the job summary for the full report"
+        elif [ "$code" -ne 0 ]; then
+          echo "::error title=ctxdiff check::ctxdiff check could not run (exit $code) — usage error; see the job summary for the message"
+        fi
+        exit $code

@@ -28,6 +28,7 @@ on:
       - "tests/**"
       - "spec/golden/**"
       - "README.md"
+      - "action.yml"
       - ".github/workflows/publish.yml"
   pull_request:
     paths:
@@ -36,6 +37,7 @@ on:
       - "tests/**"
       - "spec/golden/**"
       - "README.md"
+      - "action.yml"
       - ".github/workflows/publish.yml"
   workflow_dispatch:
 

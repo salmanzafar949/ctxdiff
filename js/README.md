@@ -70,9 +70,10 @@ It's built to sit **alongside** your observability stack, not replace it.
 - 🟩🟥🟨 **Git-style turn diffing** — `npx ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **Token attribution** — `npx ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **Prompt-cache profiling** — `npx ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
+- 🚦 **Context budgets in CI** — `npx ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas`: assert the budget, exit non-zero when it regresses. Ships as a [GitHub Action](#github-action) that posts the PASS/FAIL table to the job summary — so context size becomes a tracked metric on every pull request, not something you remember to look at.
 - 🖥️ **Self-contained HTML dashboard** — `npx ctxdiff view` / `export`: a one-file, zero-external-request, **three-level** dashboard — every agent in the project, then that agent's sessions (in your local timezone), then its turn-by-turn scrubber, diff panel, token heatmap, cache findings and block inspector — safe to attach to a bug ticket.
 - 🏷️ **Semantic tagging** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
-- 🤝 **Multi-agent runs** — `tracer.wrap(client, { agent: "researcher" })` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters `diff`/`tokens`/`cache` (and names a side of a cross-agent diff), `npx ctxdiff agents` rolls every agent up across a project's sessions, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
+- 🤝 **Multi-agent runs** — `tracer.wrap(client, { agent: "researcher" })` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters `diff`/`tokens`/`cache`/`check` (and names a side of a cross-agent diff), `npx ctxdiff agents` rolls every agent up across a project's sessions, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `configure({ store: new PostgresStore({ dsn }) })` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, the drivers are optional peers, and a dead database degrades capture without ever touching your agent.
 - 🔒 **Privacy first** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **Honest numbers** — exact `o200k_base` token counts for OpenAI (matching Python's `tiktoken`); estimates are always *marked* as estimates.
@@ -149,6 +150,7 @@ ct.close();
 | `diff --turn N --turn M` | git-style block diff between two turns (char-level inline diffs) |
 | `tokens [--turn N]` | per-label token heatmap, provider reconciliation, schema-bloat report |
 | `cache` | prompt-cache prefix-break profiler + price-free wasted-spend estimate |
+| `check [assertions]` | assert context budgets and **exit non-zero** when they regress (the CI gate) |
 | `sessions` | list every session ctxdiff can see — id, **local** start time, turns, agents |
 | `agents` | every agent in the project, aggregated across **all** its sessions |
 | `view [--no-open]` | open a self-contained HTML dashboard in your browser |
@@ -185,6 +187,76 @@ npx ctxdiff diff --session 4f3a2b1c9d8e --agent researcher:1 --agent writer:2
 ```
 
 Both print a scope header naming the two sides (an ordinary same-session diff is unchanged). Timestamps are stored UTC and displayed in **your local timezone** with the offset shown — identical to the Python CLI for the same stored value.
+
+### `ctxdiff check` — the CI gate
+
+Everything above is something you *run and read*. `check` is the same analysis with a **threshold** attached and a **non-zero exit** when it's crossed, so a context regression fails the build instead of waiting to be noticed.
+
+```bash
+npx ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas
+```
+
+```
+ctxdiff check · 6 turns · my-agent.ctrace (session 4f3a2b1c9d8e)
+PASS  max-context            peak 7,214 tok at turn 4 · limit 8,000
+FAIL  require-stable-prefix  2 breaks across 5 turn pairs · 1,482 tok re-billed
+  turn 1 → turn 2 [agent:researcher] [system·modified] breaks 2/2 pairs — modified system block — first difference at char 39: '31' → '48'
+FAIL  no-dead-schemas        1 of 2 registered tools never used · 220 tok/call (35.2% of avg context)
+  tool schema 'deploy_to_production' registered but never invoked
+
+check FAILED · 2 of 3 assertions failed
+```
+
+Every assertion is **opt-in**, and `check` with none is a usage error (exit 2) rather than a pass — a gate that verified nothing must never be the thing keeping a build green.
+
+| Assertion | Fails when |
+| --- | --- |
+| `--max-context N` | any turn's context exceeds **N tokens** |
+| `--max-context-pct P` + `--context-window N` | any turn exceeds **P%** of a context window **you state** |
+| `--require-stable-prefix` | the prompt-cache prefix breaks anywhere in the run |
+| `--no-dead-schemas` | a tool schema is registered but never invoked |
+| `--max-growth N` / `--max-growth-pct P` | the context grows more than that between two consecutive turns of the same agent |
+
+Plus the same `--project` / `--session` / `--agent` selectors, so one workflow can hold each agent to its own budget. **Exit codes**: `0` all-pass · `1` violated (or no trace to read) · `2` usage error.
+
+ctxdiff ships **no model→window table** by design — windows differ per model and per provider and change under you — so `--max-context-pct` requires `--context-window N` and reports both the percentage and the token budget it works out to.
+
+`check` is a threshold layer over the analyzers you already read (it calls the same `tokens` and `cache` code paths), so a red build and a hand-run report can never tell two different stories.
+
+**A floor is never certified.** Some blocks cost real tokens ctxdiff cannot know — an image passed as a **remote URL** (never fetched) or a `file_id`, or in a format the sniffer doesn't recognize. Those are stored as **zero** tokens rather than a fabricated guess, which makes that turn's total a lower bound, and comparing a lower bound to a budget has exactly one possible wrong answer: a silent PASS. So `check` refuses the comparison and reports the turn as `unmeasured` (`8 tok (~approx) · 2 blocks of unknown token cost — a floor, not a measurement`) instead. The header also names the trace and session the verdict came from, since with no `--project` the newest `*.ctrace` in the directory is what gets read.
+
+### GitHub Action
+
+Your agent's tests already run on every pull request. Point ctxdiff at that run and the context window becomes something CI *watches*:
+
+```yaml
+# .github/workflows/context-budget.yml
+name: context budget
+on: [pull_request]
+
+jobs:
+  budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      # 1. Run your agent's tests — `tracer.wrap(client)` is already in the code
+      #    path, so the run leaves a .ctrace behind.
+      - run: npm ci && npm test
+
+      # 2. Assert the budget. Non-zero exit fails the job.
+      - uses: salmanzafar949/ctxdiff@v1
+        with:
+          runtime: node          # `npx ctxdiff` — no pip, no setup-python
+          project: my-agent.ctrace
+          max-context: 8000
+          require-stable-prefix: true
+          no-dead-schemas: true
+```
+
+The action installs ctxdiff, runs `check`, writes the PASS/FAIL table to the **job summary** (`$GITHUB_STEP_SUMMARY` — free, tokenless, and works on pull requests from forks, where a PR comment's `pull-requests: write` is read-only no matter what the repo settings say), and exits with the check's own status. Full input reference and the PR-comment escape hatch: [the Python README's GitHub Action section](../README.md#github-action).
 
 ---
 

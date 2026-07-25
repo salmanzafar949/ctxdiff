@@ -99,9 +99,10 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 - 🟩🟥🟨 **[Git-style turn diffing](#ctxdiff-diff---turn-n---turn-m)** — `ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **[Token attribution](#ctxdiff-tokens---turn-n)** — `ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **[Prompt-cache profiling](#ctxdiff-cache)** — `ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
+- 🚦 **[Context budgets in CI](#ctxdiff-check)** — `ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas`: assert the budget, exit non-zero when it regresses. Ships as a [GitHub Action](#github-action) that posts the PASS/FAIL table to the job summary — so context size becomes a tracked metric on every pull request, not something you remember to look at.
 - 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request, **three-level** dashboard — every agent in the project, then that agent's sessions (in your local timezone), then its turn-by-turn scrubber, diff panel, token heatmap, cache findings and block inspector — safe to attach to a bug ticket.
 - 🏷️ **[Semantic tagging](#semantic-tagging)** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
-- 🤝 **[Multi-agent runs](#multi-agent-runs)** — `tracer.wrap(client, agent="researcher")` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters on `diff`/`tokens`/`cache`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
+- 🤝 **[Multi-agent runs](#multi-agent-runs)** — `tracer.wrap(client, agent="researcher")` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters on `diff`/`tokens`/`cache`/`check`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `ctxdiff.configure(store=PostgresStore(dsn=...))` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, drivers are optional extras, and a dead database degrades capture without ever touching your agent.
 - 🔒 **[Privacy first](#redaction)** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **[Honest numbers](#token-counting)** — exact `tiktoken` counts for OpenAI; estimates are always *marked* as estimates, never passed off as precise.
@@ -331,6 +332,78 @@ hint: a dynamic value inside an early system block breaks the prefix every turn 
 
 A run with a stable prefix throughout prints a single green `✓ prefix stable across all N turn pairs` line instead.
 
+### `ctxdiff check`
+
+The CI gate. Everything above is something you *run and read*; `check` is the same analysis with a **threshold** attached and a **non-zero exit** when it's crossed — so a context regression fails the build instead of waiting to be noticed.
+
+```bash
+ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas
+npx ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas
+```
+
+```
+$ ctxdiff check --max-context 8000 --require-stable-prefix --no-dead-schemas
+ctxdiff check · 6 turns · my-agent.ctrace (session 4f3a2b1c9d8e)
+PASS  max-context            peak 7,214 tok at turn 4 · limit 8,000
+FAIL  require-stable-prefix  2 breaks across 5 turn pairs · 1,482 tok re-billed
+  turn 1 → turn 2 [agent:researcher] [system·modified] breaks 2/2 pairs — modified system block — first difference at char 39: '31' → '48'
+FAIL  no-dead-schemas        1 of 2 registered tools never used · 220 tok/call (35.2% of avg context)
+  tool schema 'deploy_to_production' registered but never invoked
+
+check FAILED · 2 of 3 assertions failed
+$ echo $?
+1
+```
+
+**Every assertion is opt-in**, and `check` with none is a usage error (exit 2) rather than a pass — a gate that verified nothing must never be the thing keeping a build green.
+
+| Assertion | Fails when |
+| --- | --- |
+| `--max-context N` | any turn's context exceeds **N tokens** |
+| `--max-context-pct P` + `--context-window N` | any turn exceeds **P%** of a context window **you state** (see below) |
+| `--require-stable-prefix` | the prompt-cache prefix breaks anywhere in the run |
+| `--no-dead-schemas` | a tool schema is registered but never invoked |
+| `--max-growth N` | the context grows by more than **N tokens** between two consecutive turns of the same agent |
+| `--max-growth-pct P` | …or by more than **P%** |
+
+Plus the same `--project` / `--session` / `--agent` selectors as every other command, so one workflow can hold each agent to its own budget.
+
+**Exit codes**: `0` every requested assertion passed · `1` at least one was violated (or there was no trace to read) · `2` a usage error. The same convention the other subcommands follow.
+
+**No trace is a failure, not a pass.** `ctxdiff check` in a directory with no `.ctrace` exits 1. The day capture silently breaks, a gate that greened on an absent trace would keep the build green forever.
+
+**Why you supply the context window.** ctxdiff ships **no model→window table**, on purpose: windows differ per model and per provider and change under you, and a stale table baked into a released version would silently move everybody's threshold. So `--max-context-pct` requires `--context-window N` and the check reports both the percentage and the token budget it works out to:
+
+```
+$ ctxdiff check --context-window 128000 --max-context-pct 25
+ctxdiff check · 3 turns · session 4f3a2b1c9d8e
+FAIL  max-context-pct        1 turn over limit · peak 27.0% of 128,000 tok window at turn 3 · limit 25.0% (32,000 tok)
+  turn 3 [agent:solo] · 34,560 tok · 27.0% of 128,000 tok window · limit 25.0% (32,000 tok)
+
+check FAILED · 1 of 1 assertion failed
+```
+
+**Which number is "the turn's context".** `--max-context` compares against the same total `ctxdiff tokens` prints as `turn N · X tokens` — the sum of that call's stored block tokens — not the provider's reported prompt count. It's present for every call (provider usage is optional, and a threshold that silently skips unreported turns is a check that passes by not looking), and it's the number you'll compare the failure against. A turn whose total mixes in estimated blocks is marked `(~approx)` — on the PASS lines too, since a high-water mark quoted without it reads as a measurement.
+
+**A floor is never certified.** Some blocks cost real tokens ctxdiff cannot know: an image passed as a **remote URL** (never fetched) or a `file_id`, or in a format the sniffer doesn't recognize. Those are stored as **zero** tokens rather than a fabricated guess, which makes that turn's total a *lower bound*. Comparing a lower bound to a budget has exactly one possible wrong answer — a silent PASS — so `check` refuses the comparison and fails instead:
+
+```
+ctxdiff check · 2 turns · my-agent.ctrace (session 4f3a2b1c9d8e)
+FAIL  max-context            2 turns unmeasured · peak 8 tok (~approx) at turn 2 · limit 500
+  turn 1 · 4 tok (~approx) · 1 block of unknown token cost — a floor, not a measurement · limit 500
+  turn 2 · 8 tok (~approx) · 2 blocks of unknown token cost — a floor, not a measurement · limit 500
+```
+
+(Those two turns really cost 800 and 1,600 tokens — the provider said so in `usage`, which `ctxdiff tokens` shows as a `Δ`.) The fix is on the capture side: send the image as data rather than a URL, and the cost becomes knowable.
+
+**The report says what it read.** With no `--project`, ctxdiff reads the most recently modified `*.ctrace` in the working directory — so the header names that file and the session, and a green check can be audited rather than taken on trust.
+
+**Growth is measured within an agent, never across a hand-off** — the same grouping rule the [cache profiler](#ctxdiff-cache) uses. On an interleaved multi-agent timeline, `researcher → writer` is not a 300-token explosion; it's two independent contexts.
+
+`check` is a threshold layer over the analyzers you already read — it calls the same `tokens` and `cache` code paths — so a red build and a hand-run report can never tell two different stories. (Pinned by the [golden corpus](#the-cross-sdk-golden-corpus): both SDKs must reproduce the same report *and* the same exit code.)
+
+Next: wire it into [a GitHub workflow](#github-action).
+
 Two more diff shapes fall out of the selectors, both reusing the exact same differ:
 
 **Cross-session** — the regression case. Same agent, same turn, two runs:
@@ -389,6 +462,135 @@ ctxdiff view                                  # all agents (level 1)
 ctxdiff view --agent researcher               # that agent's sessions (level 2)
 ctxdiff view --session 4f3a2b1c9d8e           # that session's turns (level 3)
 ctxdiff view --agent researcher --session 4f3a2b1c  # that agent's turns in that run
+```
+
+---
+
+## GitHub Action
+
+**Context budget as a tracked metric.** Your agent's tests already run on every pull request. Point ctxdiff at that run and the context window becomes something CI *watches* — the same way it watches coverage — instead of something you profile after a bill arrives.
+
+The shape is two steps: **your tests produce a `.ctrace`**, then **the action asserts the budget**.
+
+```yaml
+# .github/workflows/context-budget.yml
+name: context budget
+
+on: [pull_request]
+
+jobs:
+  budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 1. Run your agent's tests. Anything that exercises the agent works —
+      #    the point is that `tracer.wrap(client)` is already in the code path,
+      #    so the run leaves a .ctrace behind. Replay/VCR fixtures mean no API
+      #    keys and no flakiness; a nightly job can run it live instead.
+      - name: Run the agent's tests (writes ./my-agent.ctrace)
+        run: |
+          pip install -e .
+          pytest tests/test_agent.py
+
+      # 2. Assert the budget. Non-zero exit fails the job.
+      - name: Assert the context budget
+        uses: salmanzafar949/ctxdiff@v1
+        with:
+          project: my-agent.ctrace
+          max-context: 8000
+          require-stable-prefix: true
+          no-dead-schemas: true
+```
+
+That's the whole thing. The action installs ctxdiff, runs `ctxdiff check`, writes the PASS/FAIL table to the **job summary**, and exits with the check's own status.
+
+### Inputs
+
+| Input | Maps to | Default |
+| --- | --- | --- |
+| `project` | `--project` — a `.ctrace` path or a [database DSN](#storage-backends) | newest `*.ctrace` in `working-directory` |
+| `session` | `--session` | the only session |
+| `agent` | `--agent` | all agents |
+| `max-context` | `--max-context N` | *(off)* |
+| `context-window` | `--context-window N` | *(off)* |
+| `max-context-pct` | `--max-context-pct P` | *(off)* |
+| `require-stable-prefix` | `--require-stable-prefix` | `false` |
+| `no-dead-schemas` | `--no-dead-schemas` | `false` |
+| `max-growth` | `--max-growth N` | *(off)* |
+| `max-growth-pct` | `--max-growth-pct P` | *(off)* |
+| `runtime` | `python` (pip) or `node` (npx) — [byte-identical output](#the-cli) either way | `python` |
+| `version` | exact ctxdiff version to install | latest |
+| `working-directory` | where the `.ctrace` was written | `.` |
+| `summary` | write the table to `$GITHUB_STEP_SUMMARY` | `true` |
+
+**Outputs**: `passed` (`"true"`/`"false"`), `exit-code`, and `report` (the full text).
+
+Every assertion input defaults to **off**, so `uses: salmanzafar949/ctxdiff@v1` with no `with:` block fails with a usage error rather than silently enforcing a budget nobody configured.
+
+The two boolean inputs accept **`true` or `false` and nothing else**. YAML has many spellings of yes, but only an unquoted `true`/`false` is resolved to a boolean by the workflow parser — `require-stable-prefix: yes` arrives at the action as the string `"yes"`. Rather than treat that as "not true" and quietly drop the assertion (a check that asserts less than you wrote, exits 0, and stays green forever), the action **fails the step** and names the value it could not read.
+
+### Gating each agent separately
+
+`--agent` is a real selector, so one job can hold a cheap writer and an expensive researcher to different budgets:
+
+```yaml
+      - name: Researcher budget
+        uses: salmanzafar949/ctxdiff@v1
+        with:
+          project: pipeline.ctrace
+          agent: researcher
+          max-context: 24000
+          require-stable-prefix: true
+
+      - name: Writer budget
+        uses: salmanzafar949/ctxdiff@v1
+        with:
+          project: pipeline.ctrace
+          agent: writer
+          max-context: 4000
+          max-growth: 800
+```
+
+### Job summary, not a PR comment
+
+The check table goes to **`$GITHUB_STEP_SUMMARY`**, and the action requests **no token and no `permissions:` block at all**. That is a deliberate choice over posting a PR comment:
+
+- A comment needs `pull-requests: write`. Many organizations set the default `GITHUB_TOKEN` to read-only, and on pull requests **from forks** it is read-only regardless of repository settings — so comment-based reporting silently stops working on exactly the PRs an outside contributor opens. A gate whose reporting depends on repo settings you may not control is not unattended CI.
+- The build is already red, and GitHub already links the failing job. The summary is one click from the PR's checks list, renders on every run including forks, needs no API call (no rate limit, no third-party action in your supply chain), and doesn't add a notification to every push.
+
+A failure additionally emits a `::error::` annotation, so it shows inline in the Actions UI rather than only inside the log.
+
+If you *do* want a comment, the `report` output is there and you can post it with your own token — which keeps the write permission in your workflow, where you can see it, instead of inside a third-party action:
+
+```yaml
+      - name: Assert the context budget
+        id: budget
+        uses: salmanzafar949/ctxdiff@v1
+        continue-on-error: true
+        with: { project: my-agent.ctrace, max-context: 8000 }
+
+      - if: steps.budget.outputs.passed == 'false'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ~~~~
+            ${{ steps.budget.outputs.report }}
+            ~~~~
+```
+
+The fence is **tildes, not backticks**, and that is not a style choice. The report quotes captured text — a tool schema's name, a snippet from a prompt — which on a fork pull request is written by an outside contributor. A backtick fence is closed by any line inside it that starts a long-enough run of backticks, and everything after that renders as markdown in your comment, including a forged "✅ check passed". A tilde fence can only be closed by tildes, so nothing the report can contain will break out of it. (The job summary does the same thing by measuring the longest backtick run and opening a longer fence; a static YAML template cannot measure, so it uses a delimiter the content does not use.)
+
+### Not on GitHub?
+
+`ctxdiff check` is just a CLI with an exit code — the action adds installation and a summary, nothing else. Any CI runs it in one line:
+
+```bash
+ctxdiff check --project my-agent.ctrace --max-context 8000 --require-stable-prefix
 ```
 
 ---
@@ -688,7 +890,7 @@ tracer.close()
 - **`wrap(client, agent=...)`** — each wrap builds its own provider adapter and recorder, so two agents on two providers each record correctly (no cross-contamination). `agent` is optional; unlabeled calls are grouped as `(unlabeled)`.
 - **`mark(step)`** — sets a **sticky** step label applied to every subsequent call in the **current execution context** until the next `mark()`; `mark(None)` clears it. (Contrast `tag()`, which is next-call-only.) Stickiness is per context: `asyncio.gather`/`to_thread` copy the context per task, so a task's `mark()` never relabels a sibling's calls. **Caveat — raw thread pools:** a `ThreadPoolExecutor` reuses workers without resetting their context, so a `mark()` lingers on that worker — a later task on the same worker that does *not* call `mark()` inherits the previous step. Under a raw pool, call `mark()` at the start of every task, or use the scoped form below.
 - **`with tracer.step("phase"): ...`** *(recommended under concurrency)* — scopes the step label to the block and **resets it on exit**, so it can't leak across logical tasks even in a reused thread pool (and stays correct under asyncio). A task that opens no `step()` block records `step=None`, never a sibling's leftover label.
-- **`--agent NAME`** — filters `ctxdiff diff`, `tokens`, and `cache` to one agent's calls. Turn numbers stay global `seq` values everywhere; `diff --agent` validates that both `--turn` values belong to that agent.
+- **`--agent NAME`** — filters `ctxdiff diff`, `tokens`, `cache` and `check` to one agent's calls. Turn numbers stay global `seq` values everywhere; `diff --agent` validates that both `--turn` values belong to that agent.
 - **Agent-aware analysis** — cache-prefix stability is computed **within each agent's own timeline**, so an adjacent cross-agent hand-off is never mistaken for a cache break. `ctxdiff tokens` prints a per-agent token summary, `ctxdiff agents` rolls every agent up across all of a project's sessions, `ctxdiff sessions` lists each session's agents, and the [HTML dashboard](#html-dashboard) shows a colored chip per agent, an agent-colored underline on each turn bar, and an "agent hand-off" marker (diffing against that agent's *own* previous turn).
 
 `ctxdiff tokens` also opens with a run-level rollup of **provider-reported** usage (input/output tokens, normalized across all four provider key shapes), with an honest coverage fraction and a per-agent breakdown:
