@@ -1,0 +1,4 @@
+── turn 2 → turn 3 · 2 blocks changed · +93 −0 tokens ──
++ [history·assistant] 'Write-up: treat every `<|…|>` spelling as untrusted text, log it verba…'  +34 tok
++ [user·user] 'Last one — a long ordinary paragraph placed AFTER every control-token …'  +59 tok
+= 6 unchanged blocks · 268 tok

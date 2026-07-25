@@ -34,4 +34,27 @@ describe("countTokens", () => {
     expect(countTokens("", "openai")).toEqual([0, "tiktoken"]);
     expect(countTokens("", "anthropic")).toEqual([0, "estimate"]);
   });
+
+  it("a literal special-token spelling encodes as text rather than throwing", () => {
+    // gpt-tokenizer refuses by default to encode text that spells a control
+    // token. ctxdiff is measuring a payload that was already sent, and the
+    // OpenAI API escapes those spellings, so the model saw plain characters
+    // too — counting them as plain characters is the truthful number, and it
+    // is the one Python's `disallowed_special=()` produces: 9, not the
+    // character estimate's 5.
+    expect(countTokens("a <|endoftext|> b", "openai")).toEqual([9, "tiktoken"]);
+  });
+
+  it("a special-token block does not degrade the blocks around it", () => {
+    // The JS mirror of the Python regression test. gpt-tokenizer's guard is
+    // WIDER than tiktoken's (it rejects the whole `<|...|>` family, while
+    // o200k_base only reserves `<|endoftext|>` and `<|endofprompt|>`), so
+    // before the fix `<|im_start|>` was an exact count in Python and an
+    // estimate here — a cross-SDK disagreement on ordinary text. Both are now
+    // plain text in both SDKs, and neighbours are untouched either way.
+    expect(countTokens("hello world", "openai")).toEqual([2, "tiktoken"]);
+    expect(countTokens("<|im_start|>", "openai")).toEqual([6, "tiktoken"]);
+    expect(countTokens("<|endofprompt|>", "openai")).toEqual([7, "tiktoken"]);
+    expect(countTokens("hello world", "openai")).toEqual([2, "tiktoken"]);
+  });
 });

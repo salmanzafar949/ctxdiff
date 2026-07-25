@@ -245,39 +245,34 @@ def test_a_failing_case_is_never_frozen_into_the_goldens(traces):
         harness.render_cli_case(broken, traces)
 
 
-# --- a known cross-SDK divergence, pinned rather than hidden --------------------
+# --- a former cross-SDK divergence, now a convergence check ---------------------
 
 
-def test_known_divergence_a_special_token_poisons_the_python_encoder(traces):
-    """PINS A REAL, CURRENT DISAGREEMENT between the two SDKs, so it cannot
-    change without someone noticing.
+def test_convergence_a_special_token_no_longer_poisons_the_python_encoder(traces):
+    """WAS a pinned divergence; is now the check that keeps it closed.
 
-    Text containing a literal special-token spelling (`<|endoftext|>`) makes
-    BOTH tokenizers raise — tiktoken's `disallowed_special` guard and
-    gpt-tokenizer's equivalent — and both SDKs correctly fall back to the
-    character estimate for that block. They then diverge on what happens NEXT:
+    Text containing a literal special-token spelling (`<|endoftext|>`) used to
+    make both tokenizers raise, and the two SDKs then handled it differently:
+    Python latched the failure into the module-level `_ENCODER_UNAVAILABLE`
+    sentinel, so EVERY subsequent openai count in the process degraded to an
+    estimate, while JS fell back only for the offending text. One user message
+    quoting `<|endoftext|>` — a tokenizer tutorial, a prompt-injection writeup,
+    a pasted model card — silently turned a whole Python-captured trace into
+    estimates that still rendered as ordinary numbers.
 
-      * Python latches the failure into the module-level `_ENCODER_UNAVAILABLE`
-        sentinel, so EVERY subsequent openai count in the process is an
-        estimate;
-      * JS falls back only for the offending text and keeps counting exactly.
+    Both halves of that are fixed. Both SDKs now encode the literal as the
+    plain characters it is (`disallowed_special=()` / `disallowedSpecial: new
+    Set()`), which is the truthful count because the OpenAI API escapes those
+    spellings rather than honouring them; and Python's latch is now scoped to
+    encoder CONSTRUCTION failure — tiktoken missing, encoding unknown, download
+    blocked — where no future call could succeed anyway. A text that will not
+    encode falls back for itself alone and leaves the encoder live.
 
-    So one user message quoting `<|endoftext|>` — a tokenizer tutorial, a
-    prompt-injection writeup, a training-data sample — makes a Python-captured
-    trace report estimates for everything after it while a JS-captured trace of
-    the same conversation reports exact counts. That is a genuine parity gap.
-
-    It is pinned HERE and kept OUT of the shared corpus for two reasons, both
-    stated so the choice is reviewable rather than silent. First, a shared
-    golden must be reproducible by both SDKs, and this case is by definition not
-    — freezing it would mean committing two contradictory expectations and
-    losing the "same goldens" guarantee for everything else. Second, Python's
-    latch is PROCESS-WIDE: a corpus fixture containing this text would turn
-    every later fixture's counts into estimates, making the whole suite
-    order-dependent. Fixing the latch (scoping it to encoder CONSTRUCTION
-    failure, which is the network-download case its docstring actually
-    justifies, rather than to any encode error) would let this move into the
-    corpus; that is a behavior change and belongs in its own reviewed commit."""
+    Asserted per call WITH the method, because the count alone would not
+    distinguish "exact" from "a close estimate", which is precisely the
+    confusion the bug produced. `<|endoftext|>` now lives in the shared corpus
+    (`spec/golden/corpus/special-tokens.json`) as well, first in the fixture
+    order, so every other fixture is tokenized after it."""
     from ctxdiff.tokenize import counter
 
     saved = counter._ENCODER
@@ -285,15 +280,32 @@ def test_known_divergence_a_special_token_poisons_the_python_encoder(traces):
         counter._ENCODER = None  # a clean process, as a fresh import would be
         assert counter.count_tokens("hello world", "openai") == (2, "tiktoken")
 
-        # The offending block itself: both SDKs agree here — estimate, 5 tokens
-        # for these 17 characters (ceil(17/4)).
-        assert counter.count_tokens("a <|endoftext|> b", "openai") == (5, "estimate")
+        # The offending block itself: nine tokens for these 17 characters, and
+        # marked EXACT. The JS SDK returns byte-identical values — asserted
+        # across the language boundary in js/test/conformance.test.ts.
+        assert counter.count_tokens("a <|endoftext|> b", "openai") == (9, "tiktoken")
 
-        # ...and here they do NOT. Python has latched; JS would still say
-        # (2, 'tiktoken'). Asserted as the CURRENT TRUTH, not as desired
-        # behavior — if this line starts failing, the latch was fixed and the
-        # two SDKs now agree, which is good news that should be reviewed, not a
-        # regression.
-        assert counter.count_tokens("hello world", "openai") == (3, "estimate")
+        # ...and the block after it is untouched. This is the line that used to
+        # read (3, 'estimate').
+        assert counter.count_tokens("hello world", "openai") == (2, "tiktoken")
+        assert counter._ENCODER is not counter._ENCODER_UNAVAILABLE
     finally:
         counter._ENCODER = saved
+
+
+def test_the_special_token_fixture_does_not_poison_the_others(tmp_path):
+    """ORDER-INDEPENDENCE, proved rather than assumed.
+
+    The `special-tokens` fixture is deliberately FIRST in the manifest, so the
+    module-scoped `traces` build already tokenizes every other fixture after a
+    block containing `<|endoftext|>`. This rebuilds the whole corpus with the
+    fixture order REVERSED and asserts the resulting numbers are identical —
+    which is the property that let the case into the shared corpus at all. With
+    the old process-wide latch this failed loudly: whichever fixtures happened
+    to be built after `special-tokens` came out in estimates."""
+    reversed_manifest = dict(MANIFEST, fixtures=list(reversed(MANIFEST["fixtures"])))
+    rebuilt = harness.build_all(reversed_manifest, str(tmp_path))
+    for case in MANIFEST["cli_cases"]:
+        assert harness.render_cli_case(case, rebuilt) == \
+            harness.read_cli_golden(case["name"]), \
+            f"{case['name']} changed when the fixtures were built in another order"

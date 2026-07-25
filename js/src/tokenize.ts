@@ -8,13 +8,28 @@
 import { encode as encodeO200k } from "gpt-tokenizer/encoding/o200k_base";
 
 /**
+ * An empty disallowed-special set, built once and reused.
+ *
+ * By default gpt-tokenizer (like tiktoken) THROWS on any text that literally
+ * spells a special token — `<|endoftext|>`, `<|fim_prefix|>`, … — so a caller
+ * cannot smuggle a control token into a prompt by accident. ctxdiff is not
+ * building a prompt; it is measuring one that was already sent, and the OpenAI
+ * API escapes those spellings rather than honouring them, so to the model they
+ * were ordinary text too. Disabling the guard makes the literal encode as the
+ * plain characters it is, which is both the truthful count and byte-for-byte
+ * what Python's `encode(text, disallowed_special=())` returns — nine tokens
+ * for `a <|endoftext|> b` in both SDKs.
+ */
+const NOTHING_DISALLOWED: Set<string> = new Set();
+
+/**
  * Exact OpenAI token count over the `o200k_base` encoding (GPT-4o family). The
  * gpt-tokenizer encoder is loaded once at module init and reused; there is no
  * network access (the merges table ships inside the package), so unlike the
  * Python path there is no download-on-first-use failure mode to guard.
  */
 function tiktokenCount(text: string): number {
-  return encodeO200k(text).length;
+  return encodeO200k(text, { disallowedSpecial: NOTHING_DISALLOWED }).length;
 }
 
 /**
@@ -34,6 +49,12 @@ function estimateCount(text: string): number {
  * the Python SDK: an empty string for openai is (0, 'tiktoken')). If the exact
  * tokenizer ever throws, fall back to the estimate and mark it 'estimate' — a
  * debugging tool must never crash the host over a token count.
+ *
+ * The fallback is scoped to the offending text and nothing else: the encoder
+ * stays live, so the very next block still gets an exact count. Python matches
+ * this exactly — its `_ENCODER_UNAVAILABLE` latch now fires only when the
+ * encoder cannot be CONSTRUCTED (a failure mode this SDK does not have, since
+ * the merges table is bundled), never for a single text that would not encode.
  */
 export function countTokens(text: string, provider: string): [number, string] {
   if (!text) return [0, provider === "openai" ? "tiktoken" : "estimate"];

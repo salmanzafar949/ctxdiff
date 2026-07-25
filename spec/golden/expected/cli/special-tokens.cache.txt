@@ -1,0 +1,1 @@
+✓ prefix stable across all 2 turn pairs — minimum stable prefix 97 tokens

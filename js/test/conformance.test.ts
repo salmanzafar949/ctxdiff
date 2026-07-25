@@ -18,6 +18,7 @@ import { CTrace } from "../src/store/ctrace.js";
 import { Recorder } from "../src/capture/recorder.js";
 import { AnthropicAdapter } from "../src/capture/anthropic.js";
 import { GeminiAdapter } from "../src/capture/gemini.js";
+import { countTokens } from "../src/tokenize.js";
 import type { Adapter } from "../src/capture/base.js";
 
 // vitest runs with cwd = the js/ package dir; the repo root is one level up.
@@ -331,4 +332,92 @@ sess("worker", 2)
   // conformance `it`s above are reported by vitest as explicit SKIPs (via
   // `it.skipIf`), which already surfaces the state honestly — a vacuous passing
   // assertion here would only disguise a skipped cross-language run as green.
+});
+
+/**
+ * Cross-language TOKENIZER conformance, asserted on the pair `(count, method)`
+ * rather than on the count alone.
+ *
+ * The method is half the promise. A block counted at 9 by one SDK and estimated
+ * at 5 by the other is an obvious divergence; a block estimated at 9 by one and
+ * counted at 9 by the other is a silent one — the numbers agree today and drift
+ * apart the moment the text changes, and only one of the two reports is honest
+ * about being approximate. Both are compared here.
+ *
+ * The battery is built from literal special-token spellings on purpose. That is
+ * where the two SDKs used to disagree in two independent ways: tiktoken's
+ * `o200k_base` reserves only `<|endoftext|>` and `<|endofprompt|>`, while
+ * gpt-tokenizer's guard rejects the whole `<|...|>` family, so `<|im_start|>`
+ * was exact in Python and an estimate in JS; and Python additionally LATCHED
+ * the refusal process-wide, so every later count in a Python capture degraded
+ * to an estimate while JS kept counting exactly. Both SDKs now switch the guard
+ * off (`disallowed_special=()` / `disallowedSpecial: new Set()`) and count the
+ * literals as the plain text the API actually delivers to the model.
+ *
+ * The trailing ordinary strings are not padding: they are the neighbours. They
+ * are compared AFTER the special-token entries in the same interpreter and the
+ * same Node process, so a per-text refusal that leaked back into either
+ * encoder's cached state would show up here as an estimate.
+ */
+describe("cross-language conformance (token counts AND methods agree)", () => {
+  const hasVenv = existsSync(venvPython);
+
+  it.skipIf(!hasVenv)(
+    "Python and JS return identical (count, method) for special-token literals",
+    () => {
+      const probes = [
+        "hello world",
+        "a <|endoftext|> b",
+        "<|endoftext|>",
+        "<|endofprompt|>",
+        "<|im_start|>system<|im_end|>",
+        "<|fim_prefix|>def f():<|fim_suffix|>",
+        "<|not_a_real_token|>",
+        "<|endoftext| with no closing pipe",
+        'prompt = "summarize" + "<|endoftext|>" + user_input',
+        "an ordinary sentence counted after every literal above",
+        "🚀 ship it — unicode after a special token still counts exactly",
+      ];
+
+      // The JS half, in one pass over the battery.
+      const js = probes.map((t) => countTokens(t, "openai"));
+
+      // The Python half, spawned against the venv SDK. The probes are handed
+      // over as a JSON argument rather than interpolated into source, so a
+      // quote or backslash in a probe cannot change the program being run.
+      const pyScript = `
+import json, sys
+from ctxdiff.tokenize.counter import count_tokens
+for text in json.loads(sys.argv[1]):
+    count, method = count_tokens(text, "openai")
+    print(count, method)
+`;
+      const proc = spawnSync(venvPython, ["-c", pyScript, JSON.stringify(probes)], {
+        encoding: "utf8",
+        env: { ...process.env, PYTHONPATH: pySrc },
+      });
+      expect(
+        proc.status,
+        `python tokenizer failed (status ${proc.status}):\n${proc.stderr}`,
+      ).toBe(0);
+
+      const py = proc.stdout
+        .trim()
+        .split("\n")
+        .map((line) => {
+          const [count, method] = line.split(" ");
+          return [Number(count), method] as [number, string];
+        });
+
+      expect(py).toHaveLength(probes.length);
+      // Compared as one array so a failure names every disagreeing probe at
+      // once instead of stopping at the first.
+      expect(js).toEqual(py);
+
+      // ...and every one of them is EXACT. Asserted separately because
+      // `js.toEqual(py)` would also be satisfied by both SDKs estimating
+      // everything — the vacuous-agreement failure mode.
+      expect(js.map(([, method]) => method)).toEqual(probes.map(() => "tiktoken"));
+    },
+  );
 });

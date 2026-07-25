@@ -1,0 +1,5 @@
+── turn 1 → turn 2 · 3 blocks changed · +171 −0 tokens ──
++ [history·assistant] 'The API escapes it: the string arrives at the model as the thirteen ch…'  +50 tok
++ [user·user] 'Good. Now the rest of the family, in one line, so the tokenizer sees t…'  +86 tok
++ [user·user] 'And a fenced sample so it also appears inside code: ```text prompt = "…'  +35 tok
+= 3 unchanged blocks · 97 tok

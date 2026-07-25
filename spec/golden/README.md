@@ -91,6 +91,7 @@ an HTML hash breaks, the CLI goldens beside it usually say why in plain text.
 
 | fixture | what it is there to catch |
 | --- | --- |
+| `special-tokens` | Literal control-token spellings quoted as ordinary content — `<|endoftext|>`, `<|endofprompt|>`, the `<|im_*|>` and `<|fim_*|>` family, a near-miss and an unterminated one — inline, in prose and inside a fenced block. This is the case both tokenizers refuse to encode unless the disallowed-special guard is switched off, and the case that used to latch Python's encoder for the whole process. It is deliberately **first** in the manifest's fixture list, so every other fixture is tokenized after it in the same process: if a per-text refusal ever leaks back into the encoder, the "no silent estimate fallback" assertion fails on every fixture below. |
 | `unicode` | Emoji ZWJ families, skin-tone modifiers, flag sequences, CJK/Hangul/Devanagari/Arabic/Hebrew, combining vs. precomposed accents, invisible bidi/zero-width marks, astral math alphanumerics — the likeliest place for two BPE implementations to disagree, and (as it turned out) the place where a UTF-16-vs-code-point truncation bug in the JS CLI was caught. |
 | `code-and-schemas` | Fenced Python/SQL/TypeScript blocks and two long JSON tool schemas, one registered but never invoked. Dense punctuation and indentation runs are the merge-table region that moves most between releases; the unused schema puts the bloat detector's token cost and percentage on the compared surface. |
 | `multiagent-project` | Two sessions in one project file, two agents each: the `sessions` listing (labels, local-time rendering), the `agents` rollup across sessions, per-agent attribution, cross-session and cross-agent diffs, a developer-tagged `rag` block, and a live clock in the system prompt so the cache profiler reports a real prefix break with attribution and a fix hint. |
@@ -139,27 +140,49 @@ test suites can *assert* the environment matches rather than assume it.
 
 ## Known cross-SDK divergences
 
-Recorded here rather than hidden, because a corpus that quietly omits the cases
-it fails is worse than no corpus.
+**None currently.** Recorded here rather than hidden either way, because a
+corpus that quietly omits the cases it fails is worse than no corpus.
 
-**A literal `<|endoftext|>` latches the Python tokenizer for the whole
-process.** Both libraries refuse to encode a literal special-token spelling, and
-both SDKs correctly fall back to the character estimate *for that block*. They
-then diverge on what happens next: Python latches the failure into a
-module-level sentinel, so every subsequent openai count in the process is an
-estimate, while JS falls back only for the offending text. One user message
-quoting `<|endoftext|>` therefore makes a Python-captured trace report estimates
-for everything after it while a JS-captured trace of the same conversation
-reports exact counts.
+### Fixed: a literal `<|endoftext|>` no longer latches the Python tokenizer
 
-It is pinned by `tests/test_golden.py::test_known_divergence_a_special_token_poisons_the_python_encoder`
-and kept **out** of the shared corpus for two stated reasons: a shared golden
-must be reproducible by both SDKs and this case by definition is not, and
-Python's latch is process-wide, so a fixture containing it would turn every
-later fixture's counts into estimates and make the suite order-dependent.
-Scoping the latch to encoder *construction* failure — the network-download case
-its docstring actually justifies — would fix it and let the case move into the
-corpus. That is a behavior change and belongs in its own reviewed commit.
+This section used to record a live divergence. It is kept as the account of what
+was wrong, because the fixture that now covers it only makes sense against it.
+
+Both libraries refused to encode a literal special-token spelling, and both SDKs
+fell back to the character estimate *for that block*. They then diverged on what
+happened next: Python latched the failure into a module-level
+`_ENCODER_UNAVAILABLE` sentinel, so **every subsequent openai count in the
+process** became an estimate, while JS fell back only for the offending text.
+One user message quoting `<|endoftext|>` — a prompt-injection writeup, a
+tokenizer tutorial, a pasted model card — therefore made a Python-captured trace
+report estimates for everything after it, rendered as ordinary numbers, while a
+JS-captured trace of the same conversation reported exact counts.
+
+A second, quieter divergence sat underneath it: the two libraries do not agree
+on *which* literals are special. tiktoken's `o200k_base` reserves only
+`<|endoftext|>` and `<|endofprompt|>`; gpt-tokenizer's guard rejects the whole
+`<|…|>` family. So `<|im_start|>` was an exact count in Python and an estimate
+in JS, with no error on either side.
+
+**The fix** (both SDKs, one commit):
+
+1. Encode with the guard switched off — `disallowed_special=()` in Python,
+   `disallowedSpecial: new Set()` in JS — so the literal is counted as the plain
+   text it is. That is the truthful number: the OpenAI API escapes those
+   spellings rather than honouring them, so the model received characters too.
+   `a <|endoftext|> b` is now 9 tokens, `tiktoken`, in both SDKs.
+2. Scope Python's latch to encoder **construction** failure — tiktoken missing,
+   encoding unknown, download blocked, the network case the sentinel was always
+   for. A text that will not encode now falls back for itself alone, marked
+   `token_method='estimate'`, and leaves the encoder live for every other block.
+
+`<|endoftext|>` consequently moved **into** the shared corpus as the
+`special-tokens` fixture, and the pin became a convergence check:
+`tests/test_golden.py::test_convergence_a_special_token_no_longer_poisons_the_python_encoder`,
+with `::test_the_special_token_fixture_does_not_poison_the_others` rebuilding the
+whole corpus in reverse fixture order to prove the result is order-independent.
+The cross-language `(count, method)` comparison lives in
+`js/test/conformance.test.ts`.
 
 ## Adding a case
 

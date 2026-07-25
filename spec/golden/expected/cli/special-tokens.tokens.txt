@@ -1,0 +1,18 @@
+run total · in 1,250 tok · out 224 tok (3/3 calls reported usage)
+
+turn 1 · 97 tokens [redteam·probe]
+  █████████████████████          user               67 tok   69.1%
+  █████████                      system             30 tok   30.9%
+  provider reports 190 prompt tokens · Δ +93
+
+turn 2 · 268 tokens [redteam·probe]
+  █████████████████████          user              188 tok   70.1%
+  ██████                         history            50 tok   18.7%
+  ███                            system             30 tok   11.2%
+  provider reports 420 prompt tokens · Δ +152
+
+turn 3 · 361 tokens [redteam·writeup]
+  █████████████████████          user              247 tok   68.4%
+  ███████                        history            84 tok   23.3%
+  ██                             system             30 tok    8.3%
+  provider reports 640 prompt tokens · Δ +279
