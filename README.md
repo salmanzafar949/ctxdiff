@@ -99,7 +99,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 - 🟩🟥🟨 **[Git-style turn diffing](#ctxdiff-diff---turn-n---turn-m)** — `ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
 - 📊 **[Token attribution](#ctxdiff-tokens---turn-n)** — `ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **[Prompt-cache profiling](#ctxdiff-cache)** — `ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
-- 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request dashboard with a turn scrubber, diff panel, token heatmap, cache findings, and block inspector — safe to attach to a bug ticket.
+- 🖥️ **[Self-contained HTML dashboard](#html-dashboard)** — `ctxdiff view` / `ctxdiff export`: a one-file, zero-external-request, **three-level** dashboard — every agent in the project, then that agent's sessions (in your local timezone), then its turn-by-turn scrubber, diff panel, token heatmap, cache findings and block inspector — safe to attach to a bug ticket.
 - 🏷️ **[Semantic tagging](#semantic-tagging)** — `tracer.tag("rag", chunks)` for exact provenance labels; a cheap heuristic covers the rest.
 - 🤝 **[Multi-agent runs](#multi-agent-runs)** — `tracer.wrap(client, agent="researcher")` and `tracer.mark("step")` attribute every call to the agent (and step) that made it; `--agent` filters on `diff`/`tokens`/`cache`, and the dashboard colors each agent's turns. Cross-agent hand-offs are never miscounted as cache breaks.
 - 🗄️ **[Pluggable storage](#storage-backends)** — local-first `.ctrace` by default; `ctxdiff.configure(store=PostgresStore(dsn=...))` (or `CTXDIFF_STORE=…`) once, and every run lands in your **PostgreSQL/MySQL** instead. Tables auto-create, drivers are optional extras, and a dead database degrades capture without ever touching your agent.
@@ -254,13 +254,15 @@ Every subcommand reads one **session** out of one **project**. Four selectors sa
 | Selector | Means | Default |
 | --- | --- | --- |
 | `--project PATH\|DSN` | which project DB — a `.ctrace` path or a [database DSN](#storage-backends) | the configured store, else the most recently modified `*.ctrace` in the cwd |
-| `--session ID` | which session in it (an id, or any unambiguous prefix of one) | the only session — **required when the project holds several** |
+| `--session ID` | which session in it (an id, or any unambiguous prefix of one) | the only session — **required when the project holds several** (except `export`/`view`, see below) |
 | `--agent NAME` | scope the analysis to one agent | all agents |
 | `--turn N` | a specific turn (call seq) | every turn |
 
 `--run` is still accepted everywhere as an alias for `--project`, so existing scripts keep working.
 
-**Ambiguity is never guessed at.** One session in the project and you need no flag; several, and the command stops with a usage error (exit 2) that *lists the sessions* so you can pick one — quietly analyzing "the newest" would give you a confidently wrong answer about a run you weren't asking about. The same rule applies to `--agent`: a name that matches nobody is a bad flag, not an empty report.
+**Ambiguity is never guessed at.** One session in the project and you need no flag; several, and the *analysis* command stops with a usage error (exit 2) that *lists the sessions* so you can pick one — quietly analyzing "the newest" would give you a confidently wrong answer about a run you weren't asking about. The same rule applies to `--agent`: a name that matches nobody is a bad flag, not an empty report.
+
+`export` and `view` are the one exception, because the [dashboard](#html-dashboard) covers the whole project rather than analyzing one session: they never require `--session`, and use the selectors to pick which of the dashboard's three levels to open on.
 
 ```
 $ ctxdiff tokens
@@ -380,25 +382,61 @@ writer      sessions=2  calls=7   tokens=19,884
 
 Write (`export`) or write-and-open (`view`) the self-contained HTML dashboard — see [HTML dashboard](#html-dashboard) below.
 
+Both cover the **whole project** — every agent, every session — so neither needs `--session` even when the project holds many runs. The two selectors instead **preselect which level the page opens on**:
+
+```bash
+ctxdiff view                                  # all agents (level 1)
+ctxdiff view --agent researcher               # that agent's sessions (level 2)
+ctxdiff view --session 4f3a2b1c9d8e           # that session's turns (level 3)
+ctxdiff view --agent researcher --session 4f3a2b1c  # that agent's turns in that run
+```
+
 ---
 
 ## HTML dashboard
 
-`ctxdiff view` opens a local time-travel dashboard for a run in your browser; `ctxdiff export --out run.html` writes the same dashboard to a path you choose, without opening anything — the one you attach to a bug ticket. Both call the same exporter, so they're always in sync.
+`ctxdiff view` opens a local time-travel dashboard in your browser; `ctxdiff export --out run.html` writes the same dashboard to a path you choose, without opening anything — the one you attach to a bug ticket. Both call the same exporter, so they're always in sync.
 
-The output is **one self-contained `.html` file**: the page, styles, script, and the entire run's data are embedded in a single JSON island — no CDN, no font, no image, no external request of any kind (asserted in tests: the file contains no `http://`/`https://` substring anywhere). It opens from a `file://` URL, works offline, and is safe to email or attach to an issue tracker.
+The output is **one self-contained `.html` file**: the page, styles, script, and the run data are embedded in a single JSON island — no CDN, no font, no image, no external request of any kind (asserted in tests: the file contains no `http://`/`https://` substring anywhere). It opens from a `file://` URL, works offline, and is safe to email or attach to an issue tracker.
 
-Seven panels, all reading from the same precomputed analyzer output the CLI uses (one source of truth — the dashboard never re-implements diff/token/cache logic in JavaScript):
+### Three levels: agents → sessions → turns
 
-- **Scrubber** — a turn-by-turn strip across the top; click a bar or use ← → to jump between turns.
-- **Turn diff** — the selected turn's added/evicted/modified blocks vs. the previous turn.
+The dashboard is **agent-first**, because "which agent" is the question you actually have when you open a project that holds many runs.
+
+| Level | What it lists | Click a row to |
+| --- | --- | --- |
+| **1 — Agents** | every agent in the project, aggregated across **all** its sessions: how many sessions it ran in, how many calls it made, its provider-reported token spend, and when it was first and last seen | drill to that agent's sessions |
+| **2 — Sessions** | every session that agent appeared in, newest first, with the session's **local** start time, that agent's turns in it (`2 / 3`), its spend, and the model | drill to that session's turns |
+| **3 — Turns** | the turn-by-turn detail, scoped to the chosen agent within the chosen session | inspect a turn |
+
+A breadcrumb (`all agents › researcher › 2026-07-21 22:42:30 +04:00`) walks back up, and the agent chips at level 3 change or clear the scope, so a session's full multi-agent timeline is always one click away.
+
+**A single-agent, single-session project opens straight on level 3** — the common case never clicks twice, and the single-run dashboard is exactly what it always was.
+
+Level 3 is the original seven panels, all reading from the same precomputed analyzer output the CLI uses (one source of truth — the dashboard never re-implements diff/token/cache logic in JavaScript):
+
+- **Scrubber** — a turn-by-turn strip across the top; click a bar or use ← → to jump between turns. Scoped to the selected agent, so the arrows walk *that agent's* timeline.
+- **Turn diff** — the selected turn's added/evicted/modified blocks vs. the previous turn (an agent hand-off diffs against that agent's *own* previous turn instead).
 - **Token allocation** — the selected turn's label breakdown, same data as `ctxdiff tokens`.
 - **Cache alignment** — every prefix break found across the run, same data as `ctxdiff cache`.
 - **Blocks** — the full block list for the selected turn (role, kind, label, token count, an 8-char content-hash prefix).
 - **Growth** — context size across turns, so a run that balloons is visible at a glance.
-- **Header stats** — project, provider, run start time, distinct-vs-total block counts (the dedup story).
+- **Header stats** — project, provider, session start time, distinct-vs-total block counts (the dedup story).
 
-Block text is written into the page as a JSON island and rendered with `textContent` at view time — never `innerHTML` — so a captured block containing `</script>` or literal HTML markup can never execute or break out of the tag, even though it's shown verbatim. The one deliberate redaction on export: each call's stored `params` is reduced to `{"model": ...}` — sampling settings, API keys, or anything else that might have ridden along in `params` never makes it into the shareable file (block text redaction is still governed by your own `redact()` hook, applied earlier at capture time).
+### Timestamps are converted in *your* browser
+
+Every timestamp is stored in UTC and rendered in the **viewer's** local timezone with the offset shown (`2026-07-21 22:42:30 +04:00`), at render time — never baked in at export. The file is meant to be shared, so two people in two timezones see the same bytes describe their own wall clock. It matches `ctxdiff sessions`' local-time column exactly.
+
+### What gets embedded (and the cap)
+
+A project database can hold thousands of sessions, and the artifact has to stay one file with no network — so the two halves are treated differently:
+
+- **Levels 1 and 2 are never capped.** They are aggregates computed from the session list and each session's call rows alone (no block reads), so every session and every agent in the project is always listed, however large the database.
+- **Level 3 detail is embedded for the 25 most recent sessions**, plus whichever session `--session` names. That is the part with real size. Older sessions still appear at level 2 with all their totals, marked *detail not embedded*, and the page names the cap. Re-export with `--session <id>` to drill into one of them.
+
+### Security
+
+All trace-derived text — block text, **agent names**, session labels, provider and model strings — is written into the JSON island and rendered with `textContent` at view time, never `innerHTML`, so a captured block (or an agent named `</script><img onerror=...>`) can never execute or break out of the tag, even though it's shown verbatim. The one deliberate redaction on export: each call's stored `params` is reduced to `{"model": ...}` — sampling settings, API keys, or anything else that might have ridden along in `params` never makes it into the shareable file (block text redaction is still governed by your own `redact()` hook, applied earlier at capture time).
 
 ---
 
@@ -464,7 +502,7 @@ ctxdiff diff --session 4f3a2b1c9d8e --turn 7 --turn 8
 ctxdiff export --session 4f3a2b1c9d8e --out run.html
 ```
 
-A shared database fills up with sessions fast, so the same [ambiguity rule](#the-cli) applies: with more than one session, `--session` is required and the error lists them. `ctxdiff sessions` is how you get that list on purpose.
+A shared database fills up with sessions fast, so the same [ambiguity rule](#the-cli) applies to the analysis commands: with more than one session, `--session` is required and the error lists them. `ctxdiff sessions` is how you get that list on purpose — and `ctxdiff export`/`view` need no session at all, since the [dashboard](#html-dashboard) lists every agent and session in the store for you.
 
 `--project PATH` (or its `--run` alias) always wins: a path names a file, so it reads that `.ctrace` even when a database is configured — and `--project <dsn>` reads *that* database whatever is configured. The same rule applies on the write side — `trace.init(project, path=...)` is always a local file.
 

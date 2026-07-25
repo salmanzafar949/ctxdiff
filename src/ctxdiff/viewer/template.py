@@ -6,15 +6,41 @@ guarantee, so the growth chart is built as an HTML string and handed to
 `innerHTML`, where the HTML parser namespaces `<svg>` automatically — no
 `createElementNS` and no xmlns needed).
 
+THE PAGE IS AGENT-FIRST AND THREE-LEVEL:
+
+- LEVEL 1 lists every agent in the project across every session, with its
+  aggregate footprint. It is the landing view, because "which agent" is the
+  question someone opening a multi-agent project actually has.
+- LEVEL 2 lists the sessions ONE agent appeared in, newest first, with each
+  session's local start time and that agent's turns and spend in it.
+- LEVEL 3 is the turn-by-turn detail — scrubber, block diff, token heatmap,
+  cache breaks, block inspector, growth chart — scoped to the chosen agent
+  within the chosen session.
+
+A breadcrumb walks back up, and a project with one session and one agent skips
+straight to level 3, so the single-session dashboard is unchanged for the case
+it was designed for.
+
+TIMESTAMPS ARE CONVERTED IN THE BROWSER. Everything is stored in UTC and
+rendered in the VIEWER's local zone by `localTime()` at render time, never baked
+in at export — the file is meant to be shared, and the reader may well be in a
+different zone than the machine that captured the run. The same bytes therefore
+show different clock times to different viewers, which is correct.
+
 `render_page` fills two markers: `__CTXDIFF_TITLE__` (the already-escaped
-`<title>` text) and `__CTXDIFF_DATA__` (the JSON island). Title is substituted
-first so a value in the data can never be mistaken for the title marker.
+`<title>` text) and `__CTXDIFF_DATA__` (the JSON island). BOTH are substituted
+in one pass, so neither value can be mistaken for the other's marker — a
+project name is user text and may spell either marker out verbatim.
 
 The runtime contract with export.py: the JSON island is read back with
-`.textContent` and parsed once; all BLOCK TEXT is rendered with `.textContent`
-(never `.innerHTML`), so untrusted trace data can never become live markup.
-Only static chrome and numeric-derived SVG use `.innerHTML`."""
+`.textContent` and parsed once; all TRACE-DERIVED TEXT — block text, and the
+AGENT NAMES and session labels levels 1/2 and the breadcrumb render — reaches
+the DOM with `.textContent` (never `.innerHTML`), so untrusted trace data can
+never become live markup. Only static chrome and numeric-derived SVG use
+`.innerHTML`."""
 from __future__ import annotations
+
+import re
 
 # The full page as one ordinary triple-quoted string. The only backslashes are
 # deliberate JS-level escapes — `\\uXXXX` (emits a JS `\uXXXX` glyph escape, so
@@ -142,12 +168,10 @@ main > *{min-width:0}
 .bar.err{
   background:linear-gradient(180deg,var(--evicted),color-mix(in srgb,var(--evicted) 45%, transparent));
 }
-/* Agent-colored underline strip on each turn bar, and dimming for bars whose
-   agent isn't the active filter. Placed AFTER .bar.sel so a dim wins on equal
-   specificity. */
+/* Agent-colored underline strip on each turn bar, so an unscoped multi-agent
+   timeline still reads as one agent handing off to another. */
 .bar-underline{position:absolute; left:2px; right:2px; bottom:0; height:3px;
   border-radius:2px}
-.bar.dim{opacity:.2}
 
 /* --- agent chips (header) --- */
 .agents{display:flex; flex-wrap:wrap; gap:6px; align-items:center; min-width:0}
@@ -267,6 +291,56 @@ sup.est{color:var(--warn); font-size:9px; margin-left:2px; font-family:var(--mon
   stroke-linejoin:round; stroke-linecap:round}
 .chart-wrap .dot{fill:var(--panel); stroke:var(--c-rag); stroke-width:1.5}
 .chart-wrap .dot-sel{fill:var(--c-rag); stroke:var(--ink); stroke-width:1.5}
+
+/* --- three-level navigation --- */
+/* `hidden` must beat the display:grid the level containers carry, or every
+   level would render at once stacked down the page. */
+[hidden]{display:none !important}
+#l3{display:grid; grid-template-columns:minmax(0,1fr); gap:18px; min-width:0}
+#l3 > *{min-width:0}
+.crumbs{display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+  font-family:var(--mono); font-size:12.5px; color:var(--secondary);
+  padding:2px 2px 0}
+.crumb{background:transparent; border:none; padding:0; cursor:pointer;
+  font:inherit; color:var(--c-rag); text-decoration:none;
+  border-bottom:1px solid color-mix(in srgb,var(--c-rag) 45%, transparent)}
+.crumb:hover{color:var(--ink); border-bottom-color:var(--ink)}
+.crumb:focus-visible{outline:2px solid var(--c-system); outline-offset:2px}
+.crumb-here{color:var(--ink); max-width:100%; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.crumb-sep{opacity:.5}
+
+/* --- level 1 / level 2 listings --- */
+table.list-table{border-collapse:collapse; width:100%; font-size:12.5px}
+.list-table th{text-align:left; font-family:var(--mono); font-size:11px;
+  text-transform:uppercase; letter-spacing:.04em; color:var(--secondary);
+  font-weight:600; padding:6px 12px; border-bottom:1px solid var(--hairline);
+  white-space:nowrap}
+.list-table td{padding:8px 12px; border-bottom:1px solid var(--hairline);
+  vertical-align:middle}
+.list-table td.num{font-family:var(--mono); color:var(--ink); text-align:right;
+  white-space:nowrap}
+.list-table td.when{font-family:var(--mono); color:var(--secondary);
+  white-space:nowrap}
+.list-table tr.row-open:hover td{background:var(--surface)}
+/* The whole first cell is the control, so the click target is the row's name
+   rather than a bare chevron — and it stays a real <button>, so keyboard and
+   screen-reader users get the same affordance a mouse user does. */
+.rowlink{background:transparent; border:none; padding:0; cursor:pointer;
+  font:inherit; color:var(--ink); font-family:var(--mono); font-size:12.5px;
+  display:inline-flex; align-items:center; gap:8px; text-align:left;
+  max-width:100%; min-width:0}
+.rowlink:hover .rowlink-name{color:var(--c-rag)}
+.rowlink:focus-visible{outline:2px solid var(--c-system); outline-offset:2px}
+.rowlink-name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.rowlink[disabled]{cursor:default; color:var(--secondary)}
+.rowlink[disabled]:hover .rowlink-name{color:var(--secondary)}
+.sub{font-family:var(--mono); font-size:11.5px; color:var(--secondary)}
+.nodetail{font-family:var(--mono); font-size:11px; color:var(--secondary);
+  border:1px solid var(--hairline); border-radius:6px; padding:1px 6px;
+  white-space:nowrap}
+.cap-note{color:var(--secondary); font-size:12px; margin:12px 0 0;
+  font-family:var(--mono)}
 </style>
 </head>
 <body>
@@ -289,24 +363,123 @@ sup.est{color:var(--warn); font-size:9px; margin-left:2px; font-family:var(--mon
 </noscript>
 
 <main id="app">
-  <section class="panel spine">
-    <div class="panel-head"><h2>Turns</h2>
-      <span class="panel-meta">click a bar &middot; &larr; &rarr; to navigate</span></div>
-    <div id="scrubber" class="scrubber" role="tablist" aria-label="turn scrubber"></div>
-  </section>
-  <section id="changed" class="panel"></section>
-  <section id="alloc" class="panel"></section>
-  <section id="cache" class="panel"></section>
-  <section id="blocks" class="panel"></section>
-  <section id="growth" class="panel"></section>
+  <nav id="crumbs" class="crumbs" aria-label="breadcrumb" hidden></nav>
+  <section id="l1" class="panel" hidden></section>
+  <section id="l2" class="panel" hidden></section>
+  <div id="l3" hidden>
+    <section class="panel spine">
+      <div class="panel-head"><h2>Turns</h2>
+        <span class="panel-meta">click a bar &middot; &larr; &rarr; to navigate</span></div>
+      <div id="scrubber" class="scrubber" role="tablist" aria-label="turn scrubber"></div>
+    </section>
+    <section id="changed" class="panel"></section>
+    <section id="alloc" class="panel"></section>
+    <section id="cache" class="panel"></section>
+    <section id="blocks" class="panel"></section>
+    <section id="growth" class="panel"></section>
+  </div>
 </main>
 
 <script id="ctxdiff-data" type="application/json">__CTXDIFF_DATA__</script>
 <script>
 "use strict";
 const DATA = JSON.parse(document.getElementById("ctxdiff-data").textContent);
-const CALLS = DATA.calls || [];
-let sel = 0;
+
+// --- the three levels --------------------------------------------------------
+// L1 ALL AGENTS -> L2 that agent's SESSIONS -> L3 one session's turn-by-turn
+// detail. The focus session's detail is the payload's TOP LEVEL (run/calls/
+// diffs/tokens/cache/stats); every other embedded session's detail lives under
+// project.details, keyed by session id. A payload with no `project` key at all
+// is a plain single-session export, which is simply L3 with nothing above it.
+const PROJECT = DATA.project || null;
+const FOCUS_DETAIL = {run: DATA.run, calls: DATA.calls, diffs: DATA.diffs,
+                      tokens: DATA.tokens, cache: DATA.cache, stats: DATA.stats};
+const P_AGENTS = PROJECT ? (PROJECT.agents || []) : [];
+const P_SESSIONS = PROJECT ? (PROJECT.sessions || []) : [];
+// Whether there is anything ABOVE the detail view to navigate to. A project with
+// one session and one agent has no L1/L2 worth showing, so the breadcrumb stays
+// hidden and the page behaves exactly like the single-session dashboard always
+// did.
+const MULTI_LEVEL = P_SESSIONS.length > 1 || P_AGENTS.length > 1;
+
+let level = 3;          // which of the three levels is on screen
+let curAgent = null;    // the agent scope: L2's subject, and L3's turn filter
+let curSession = PROJECT ? PROJECT.focus : null;
+let D = FOCUS_DETAIL;   // the ACTIVE session's detail (what every L3 panel reads)
+let CALLS = D.calls || [];
+let VIEW = [];          // indices into CALLS visible under the current scope
+let sel = 0;            // the selected turn, as an index into CALLS
+
+/** One session's detail, or null when it was not embedded (see the exporter's
+ * detail cap). The focus session is answered from the top level rather than from
+ * project.details, which is why it is never serialized twice. */
+function detailFor(sid){
+  if(!PROJECT || sid === PROJECT.focus) return FOCUS_DETAIL;
+  return (PROJECT.details || {})[sid] || null;
+}
+/** Point the L3 panels at `sid`. Returns false (changing nothing) when that
+ * session has no embedded detail, so a caller can leave the row inert instead of
+ * navigating into an empty view. */
+function openSession(sid){
+  const d = detailFor(sid);
+  if(!d) return false;
+  curSession = sid;
+  D = d;
+  CALLS = D.calls || [];
+  sel = 0;
+  return true;
+}
+/** The L2 row for `sid`, which is where a session's start time, provider and
+ * turn count live once the page has navigated away from the focus session. */
+function sessionRow(sid){
+  for(const s of P_SESSIONS) if(s.id === sid) return s;
+  return null;
+}
+/** The 12-character session prefix the CLI prints and accepts — what is shown
+ * wherever a session needs a stable name to paste back into `--session`. */
+function shortId(id){ return (id || "").slice(0, 12); }
+
+// --- local-time rendering ----------------------------------------------------
+// Timestamps are STORED in UTC and rendered in the VIEWER's local zone, here, at
+// render time — not baked in at export. The same file is meant to be shared, and
+// the person opening it is trying to match a run against "the one I did after
+// lunch" in THEIR day, not in the capturing machine's. Two viewers in two zones
+// therefore see different text from byte-identical HTML, which is the point.
+/** Normalize the timestamp spellings a store may hold into something `Date` can
+ * parse: the ISO BASIC form (`20260704T100000Z`), an hour-only offset (`+05`),
+ * and a naive value — which is UTC by ctxdiff's storage contract, so it is
+ * stamped as such rather than being read in the viewer's own zone. */
+function isoNormalize(text){
+  let t = text.trim();
+  const basic = t.match(/^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})(.*)$/);
+  if(basic) t = basic[1] + "-" + basic[2] + "-" + basic[3] + "T" +
+                basic[4] + ":" + basic[5] + ":" + basic[6] + basic[7];
+  if(/[+-][0-9]{2}$/.test(t)) t += ":00";
+  if(!/(Z|z|[+-][0-9]{2}:[0-9]{2})$/.test(t)) t += "Z";
+  return t;
+}
+/** A stored UTC timestamp as `2026-07-24 16:03:11 +04:00` in the viewer's local
+ * zone — the same columns and spelling `ctxdiff sessions` prints, so the CLI and
+ * the dashboard describe a run identically.
+ *
+ * Degrades rather than throwing: an empty value renders "-", and anything the
+ * parser cannot make sense of is echoed back unchanged, so one odd row never
+ * blanks a whole listing. */
+function localTime(value){
+  const raw = (value == null ? "" : String(value)).trim();
+  if(!raw) return "-";
+  const d = new Date(isoNormalize(raw));
+  if(isNaN(d.getTime())) return raw;
+  const p = n => (n < 10 ? "0" : "") + n;
+  // getTimezoneOffset() is minutes WEST of UTC, so the sign is inverted to read
+  // as the offset a timestamp is normally written with.
+  const off = -d.getTimezoneOffset();
+  const sign = off < 0 ? "-" : "+";
+  const ab = Math.abs(off);
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+         " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) +
+         " " + sign + p(Math.floor(ab / 60)) + ":" + p(ab % 60);
+}
 
 // --- small DOM helpers -------------------------------------------------------
 function el(tag, cls, txt){
@@ -318,8 +491,16 @@ function el(tag, cls, txt){
 function fmt(n){ return (n == null ? 0 : n).toLocaleString("en-US"); }
 // Color follows the entity: a fixed CSS var per label, violet for anything
 // unknown/custom, so the same label is the same hue in every panel.
+// The membership test asks for an OWN property: labels are arbitrary user text
+// (tracer.tag() takes any string), and a plain object INHERITS truthy values for
+// `__proto__`/`constructor`/`toString` — those read as known and interpolated
+// into `var(--c-...)`, naming a custom property the stylesheet never declares,
+// so the swatch lost its color entirely. Only the six names below may reach CSS.
 const KNOWN_LABELS = {system:1, tool_schema:1, rag:1, history:1, user:1, tool_output:1};
-function labelColor(label){ return "var(--c-" + (KNOWN_LABELS[label] ? label : "unknown") + ")"; }
+function labelColor(label){
+  const known = Object.prototype.hasOwnProperty.call(KNOWN_LABELS, label);
+  return "var(--c-" + (known ? label : "unknown") + ")";
+}
 function head(title, meta){
   const h = el("div", "panel-head");
   h.appendChild(el("h2", null, title));
@@ -330,19 +511,41 @@ function dot(label){ const d = el("span", "dot"); d.style.background = labelColo
 
 // --- agents ------------------------------------------------------------------
 // Per-agent color is assigned by order of first appearance from a fixed
-// categorical palette, cycled when a run has more agents than colors. Agent
-// NAMES are NEVER interpolated into CSS — only these fixed hex values reach a
-// style property — so a hostile agent name cannot inject styles. Every agent
-// name that reaches the DOM does so via el()/textContent.
-const AGENTS = (DATA.stats && DATA.stats.agents) || [];
-const AGENT_MULTI = AGENTS.length > 1;
+// categorical palette, cycled when a project has more agents than colors. The
+// assignment is PROJECT-wide (not per session) so one agent keeps one hue across
+// all three levels — a color that changed between two sessions of the same run
+// would make the levels read as unrelated pages. Agent NAMES are NEVER
+// interpolated into CSS — only these fixed hex values reach a style property —
+// so a hostile agent name cannot inject styles. Every agent name that reaches
+// the DOM does so via el()/textContent.
 const AGENT_PALETTE = ["#3987e5","#d95926","#199e70","#c98500","#d55181",
                        "#9085e9","#008300","#c0498a"];
-const AGENT_COLOR = {};
-AGENTS.forEach((a, i) => { AGENT_COLOR[a.name] = AGENT_PALETTE[i % AGENT_PALETTE.length]; });
-let agentFilter = null;   // active agent-chip filter (dims other agents' bars)
+// A NULL-PROTOTYPE map, because agent names are arbitrary user text and a plain
+// object inherits keys it was never given: assigning a string to `__proto__` on
+// one is a silent no-op (the setter runs, no own property appears), so that
+// agent lost its color and `agentColor` handed back Object.prototype, which the
+// browser drops as a style value. `constructor`/`toString` would have returned
+// inherited functions the same way. With no prototype, every name is data.
+const AGENT_COLOR = Object.create(null);
+(P_AGENTS.length ? P_AGENTS : ((DATA.stats && DATA.stats.agents) || []))
+  .forEach((a, i) => { AGENT_COLOR[a.name] = AGENT_PALETTE[i % AGENT_PALETTE.length]; });
 function agentKey(call){ return call && call.agent != null ? call.agent : "(unlabeled)"; }
 function agentColor(name){ return AGENT_COLOR[name] || "var(--c-unknown)"; }
+/** The active session's own agents (the L3 header chips) — a session shows only
+ * the agents that actually ran in it, not every agent in the project. */
+function sessionAgents(){ return (D.stats && D.stats.agents) || []; }
+/** Which of CALLS the current agent scope admits. An agent scope carried in from
+ * L1/L2 that turns out to be absent from this session falls back to showing
+ * everything, because an empty scrubber is a worse answer than an unscoped one.
+ * `sel` is pulled back into range whenever the scope moves it out. */
+function computeView(){
+  VIEW = [];
+  for(let i = 0; i < CALLS.length; i++){
+    if(curAgent === null || agentKey(CALLS[i]) === curAgent) VIEW.push(i);
+  }
+  if(!VIEW.length) for(let i = 0; i < CALLS.length; i++) VIEW.push(i);
+  if(VIEW.indexOf(sel) < 0) sel = VIEW.length ? VIEW[0] : 0;
+}
 // A trailing " \\u00b7 agent \\u00b7 step" fragment for a panel header, or "" when
 // neither is set. Built as plain text handed to el()/textContent by the caller.
 function agentStep(call){
@@ -354,39 +557,215 @@ function agentStep(call){
 function renderAgents(){
   const host = document.getElementById("h-agents");
   host.innerHTML = "";
-  if(!AGENT_MULTI) return;   // one (or zero) agent: no chips, nothing to filter
-  AGENTS.forEach(a => {
-    const chip = el("button", "agent-chip" + (agentFilter === a.name ? " active" : ""));
+  const agents = sessionAgents();
+  // Chips are the L3 agent SCOPE control. One agent means there is nothing to
+  // scope to, and levels 1/2 have their own subject, so neither shows chips.
+  if(level !== 3 || agents.length <= 1) return;
+  agents.forEach(a => {
+    const chip = el("button", "agent-chip" + (curAgent === a.name ? " active" : ""));
     const d = el("span", "agent-dot"); d.style.background = agentColor(a.name);
     chip.appendChild(d);
     chip.appendChild(el("span", "agent-name", a.name));      // textContent — safe
     chip.appendChild(el("span", "agent-count", "\\u00b7 " + a.calls));
     // Provider in/out on the tooltip (title attribute — value, never parsed as
     // markup); present only when this agent reported usage.
-    const uba = (DATA.stats.usage || {}).by_agent || {};
-    const io = uba[a.name];
+    const uba = (D.stats.usage || {}).by_agent || {};
+    // OWN property only: `uba` is a plain object, so an agent named __proto__
+    // or toString would otherwise inherit a truthy value and render a tooltip
+    // built from a prototype rather than from this run's numbers.
+    const io = Object.prototype.hasOwnProperty.call(uba, a.name)
+      ? uba[a.name] : null;
     if(io) chip.setAttribute("title", a.name + " \\u00b7 in " + fmt(io[0]) +
                              " \\u00b7 out " + fmt(io[1]));
-    chip.setAttribute("aria-pressed", agentFilter === a.name ? "true" : "false");
+    chip.setAttribute("aria-pressed", curAgent === a.name ? "true" : "false");
     chip.addEventListener("click", () => {
-      agentFilter = (agentFilter === a.name) ? null : a.name;  // toggle
+      curAgent = (curAgent === a.name) ? null : a.name;  // toggle the scope
       render();
     });
     host.appendChild(chip);
   });
 }
 
+// --- breadcrumb + level switching --------------------------------------------
+/** Jump to level 1 (all agents). */
+function goAgents(){ level = 1; curAgent = null; render(); }
+/** Jump to level 2: the sessions `name` appeared in. */
+function goSessions(name){ level = 2; curAgent = name; render(); }
+/** Jump to level 3: one session's detail, optionally scoped to one agent.
+ * Silently does nothing when that session's detail was not embedded — the row
+ * that would have called this is rendered inert, so this is belt and braces. */
+function goDetail(sid, name){
+  if(!openSession(sid)) return;
+  if(name !== undefined) curAgent = name;
+  level = 3;
+  render();
+}
+/** The trail back up: `all agents › <agent> › <session>`, with every ancestor a
+ * real button and the current position plain text. Hidden entirely for a project
+ * with nothing above the detail view. */
+function renderCrumbs(){
+  const host = document.getElementById("crumbs");
+  host.innerHTML = "";
+  host.hidden = !MULTI_LEVEL;
+  if(!MULTI_LEVEL) return;
+  const parts = [];
+  if(level === 1){
+    parts.push(el("span", "crumb-here", "all agents"));
+  } else {
+    const b = el("button", "crumb", "all agents");
+    b.addEventListener("click", goAgents);
+    parts.push(b);
+  }
+  if(curAgent !== null){
+    if(level === 2){
+      parts.push(el("span", "crumb-here", curAgent));      // textContent — safe
+    } else {
+      const b = el("button", "crumb", curAgent);
+      const name = curAgent;
+      b.addEventListener("click", () => goSessions(name));
+      parts.push(b);
+    }
+  }
+  if(level === 3){
+    const row = sessionRow(curSession);
+    const when = localTime(row ? row.started_at : (D.run || {}).started_at);
+    parts.push(el("span", "crumb-here",
+                  when + " \\u00b7 " + shortId(curSession || (D.run || {}).id)));
+  }
+  parts.forEach((p, i) => {
+    if(i) host.appendChild(el("span", "crumb-sep", "\\u203a"));
+    host.appendChild(p);
+  });
+}
+/** Show exactly one level's container. */
+function showLevel(){
+  document.getElementById("l1").hidden = level !== 1;
+  document.getElementById("l2").hidden = level !== 2;
+  document.getElementById("l3").hidden = level !== 3;
+}
+
+// --- level 1: all agents -----------------------------------------------------
+/** A token cell: provider in/out summed, or "-" when NO call of this row
+ * reported usage — 0 would read as "this was free", which is a lie about a
+ * provider that simply returned no usage block. */
+function tokenCell(row){
+  const td = el("td", "num");
+  td.textContent = row.reported ? fmt(row.input + row.output) : "-";
+  if(row.reported) td.title = "in " + fmt(row.input) + " \\u00b7 out " + fmt(row.output) +
+                              " \\u00b7 " + row.reported + " calls reported usage";
+  return td;
+}
+/** A clickable first cell: the row's name as a real <button>. `onOpen` null
+ * leaves it inert (used for a session whose detail was not embedded). */
+function rowLink(name, color, onOpen){
+  const b = el("button", "rowlink");
+  if(color){ const d = el("span", "agent-dot"); d.style.background = color; b.appendChild(d); }
+  b.appendChild(el("span", "rowlink-name", name));          // textContent — safe
+  if(onOpen) b.addEventListener("click", onOpen);
+  else b.disabled = true;
+  return b;
+}
+/** Build a table with `cols` headers and return its <tbody> to fill. */
+function listTable(host, cols){
+  const wrap = el("div", "table-wrap");
+  const tbl = el("table", "list-table");
+  const thead = el("thead"); const hr = el("tr");
+  cols.forEach(c => hr.appendChild(el("th", null, c)));
+  thead.appendChild(hr); tbl.appendChild(thead);
+  const tb = el("tbody");
+  tbl.appendChild(tb); wrap.appendChild(tbl); host.appendChild(wrap);
+  return tb;
+}
+/** LEVEL 1 — every agent in the project, aggregated across every session. The
+ * landing view: pick who you want to look at before picking which run. */
+function renderLevel1(){
+  const host = document.getElementById("l1");
+  host.innerHTML = "";
+  host.appendChild(head("Agents", P_AGENTS.length + " in " +
+                        (PROJECT ? PROJECT.sessions_total : P_SESSIONS.length) + " sessions"));
+  if(!P_AGENTS.length){
+    host.appendChild(el("p", "empty", "no agents in this project"));
+    return;
+  }
+  const tb = listTable(host, ["agent", "sessions", "calls", "tokens", "first seen", "last seen"]);
+  P_AGENTS.forEach(a => {
+    const tr = el("tr", "row-open");
+    const td = el("td");
+    const name = a.name;
+    td.appendChild(rowLink(name, agentColor(name), () => goSessions(name)));
+    tr.appendChild(td);
+    tr.appendChild(el("td", "num", fmt(a.sessions)));
+    tr.appendChild(el("td", "num", fmt(a.calls)));
+    tr.appendChild(tokenCell(a));
+    tr.appendChild(el("td", "when", localTime(a.first_seen)));
+    tr.appendChild(el("td", "when", localTime(a.last_seen)));
+    tb.appendChild(tr);
+  });
+}
+
+// --- level 2: one agent's sessions -------------------------------------------
+/** LEVEL 2 — every session the selected agent appeared in, newest first, with
+ * ITS turns and ITS spend in that session (not the session's totals). */
+function renderLevel2(){
+  const host = document.getElementById("l2");
+  host.innerHTML = "";
+  const rows = [];
+  P_SESSIONS.forEach(s => {
+    for(const a of (s.agents || [])) if(a.name === curAgent) rows.push([s, a]);
+  });
+  host.appendChild(head("Sessions", (curAgent || "") + " \\u00b7 " + rows.length +
+                        (rows.length === 1 ? " session" : " sessions")));
+  if(!rows.length){
+    host.appendChild(el("p", "empty", "this agent has no recorded sessions"));
+    return;
+  }
+  const tb = listTable(host, ["started", "session", "turns", "tokens", "model", ""]);
+  let capped = 0;
+  rows.forEach(([s, a]) => {
+    const tr = el("tr", "row-open");
+    const td = el("td");
+    const label = localTime(s.started_at);
+    const sid = s.id, name = curAgent;
+    td.appendChild(rowLink(label, null, s.detail ? () => goDetail(sid, name) : null));
+    tr.appendChild(td);
+    tr.appendChild(el("td", "sub", shortId(s.id)));
+    tr.appendChild(el("td", "num", fmt(a.turns) + " / " + fmt(s.turn_count)));
+    tr.appendChild(tokenCell(a));
+    tr.appendChild(el("td", "sub", (s.models || []).join(", ") || s.provider || "-"));
+    const last = el("td");
+    if(!s.detail){ capped += 1; last.appendChild(el("span", "nodetail", "detail not embedded")); }
+    tr.appendChild(last);
+    tb.appendChild(tr);
+  });
+  if(capped){
+    host.appendChild(el("p", "cap-note",
+      "turn-by-turn detail is embedded for the " + PROJECT.detail_cap +
+      " most recent sessions to keep this file self-contained \\u2014 " + capped +
+      " older " + (capped === 1 ? "session is" : "sessions are") +
+      " listed with totals only. Re-export with --session <id> to drill into one."));
+  }
+}
+
 // --- header ------------------------------------------------------------------
-function renderHeader(){
-  const r = DATA.run || {};
-  document.getElementById("h-project").textContent = r.project || "";
-  document.title = "ctxdiff \\u2014 " + (r.project || "");
-  const total = (DATA.stats.context_growth || []).reduce((a,b)=>a+b, 0);
-  const dedup = DATA.stats.distinct_blocks + " distinct blocks / " +
-                DATA.stats.total_block_refs + " references";
+/** The meta strip is LEVEL-AWARE: levels 1 and 2 describe the PROJECT (how many
+ * sessions and agents it holds), because a per-session rollup would be
+ * describing a session the user has not chosen yet; level 3 describes the
+ * session on screen, exactly as the single-session dashboard always did. */
+function projectMeta(){
+  const total = PROJECT ? PROJECT.sessions_total : P_SESSIONS.length;
+  const turns = P_SESSIONS.reduce((a, s) => a + (s.turn_count || 0), 0);
+  return [total + (total === 1 ? " session" : " sessions"),
+          P_AGENTS.length + (P_AGENTS.length === 1 ? " agent" : " agents"),
+          fmt(turns) + " turns"];
+}
+function sessionMeta(){
+  const r = D.run || {};
+  const total = (D.stats.context_growth || []).reduce((a,b)=>a+b, 0);
+  const dedup = D.stats.distinct_blocks + " distinct blocks / " +
+                D.stats.total_block_refs + " references";
   // Provider-usage rollup, shown only when at least one call reported usage —
   // never fabricate an "in 0 / out 0" from a run with no provider numbers.
-  const u = DATA.stats.usage || {};
+  const u = D.stats.usage || {};
   const cov = u.coverage || [0, 0];
   // The model segment is OMITTED entirely (not rendered as "?") when
   // r.models is empty — a run whose calls never reported a model (or, pre-
@@ -396,13 +775,22 @@ function renderHeader(){
   const modelsStr = (r.models || []).join(", ");
   const items = [ r.provider || "?" ];
   if(modelsStr) items.push(modelsStr);
-  items.push(r.started_at || "?", CALLS.length + " turns",
+  // The start time is rendered in the VIEWER's local zone, not echoed as the
+  // stored UTC string — see localTime().
+  items.push(localTime(r.started_at), CALLS.length + " turns",
              fmt(total) + " tokens");
   if(cov[0] > 0){
     items.push("in " + fmt(u.input) + " \\u00b7 out " + fmt(u.output) +
                " (" + cov[0] + "/" + cov[1] + " reported)");
   }
   items.push(dedup);
+  return items;
+}
+function renderHeader(){
+  const name = PROJECT ? PROJECT.name : ((DATA.run || {}).project || "");
+  document.getElementById("h-project").textContent = name;
+  document.title = "ctxdiff \\u2014 " + name;
+  const items = level === 3 ? sessionMeta() : projectMeta();
   const box = document.getElementById("h-meta");
   box.innerHTML = "";
   items.forEach((m, i) => {
@@ -412,12 +800,18 @@ function renderHeader(){
 }
 
 // --- scrubber ----------------------------------------------------------------
+// The scrubber shows the turns the current agent SCOPE admits (VIEW), not every
+// turn of the session — an agent's own timeline is what "this agent's runs with
+// traces" means. Bar heights are still scaled against the whole session's peak
+// so scoping never makes a turn look bigger than it was.
 function renderScrubber(){
   const strip = document.getElementById("scrubber");
   strip.innerHTML = "";
-  const growth = DATA.stats.context_growth || [];
+  const growth = D.stats.context_growth || [];
   const max = Math.max(1, ...growth);
-  CALLS.forEach((c, i) => {
+  const multi = sessionAgents().length > 1;
+  VIEW.forEach(i => {
+    const c = CALLS[i];
     const tok = growth[i] || 0;
     const b = document.createElement("button");
     b.className = "bar" + (i === sel ? " sel" : "") + (c.error ? " err" : "");
@@ -427,11 +821,9 @@ function renderScrubber(){
     b.setAttribute("aria-label", "turn " + c.seq + " \\u2014 " + fmt(tok) +
                    " tokens" + (c.error ? " (error)" : ""));
     b.addEventListener("click", () => { sel = i; render(); });
-    if(AGENT_MULTI){
-      const key = agentKey(c);
-      const u = el("span", "bar-underline"); u.style.background = agentColor(key);
+    if(multi){
+      const u = el("span", "bar-underline"); u.style.background = agentColor(agentKey(c));
       b.appendChild(u);
-      if(agentFilter && agentFilter !== key) b.classList.add("dim");
     }
     strip.appendChild(b);
   });
@@ -478,7 +870,7 @@ function renderChanged(){
     host.appendChild(el("p", "empty", "first turn \\u2014 everything is new"));
     return;
   }
-  let d = DATA.diffs[sel-1];
+  let d = D.diffs[sel-1];
   // Agent hand-off: when the previous GLOBAL turn belongs to a different
   // agent, mark it and (when available) show the diff against THIS agent's own
   // previous turn instead of the cross-agent one.
@@ -508,7 +900,7 @@ function renderChanged(){
 function renderTokens(){
   const host = document.getElementById("alloc");
   host.innerHTML = "";
-  const t = DATA.tokens.calls[sel];
+  const t = D.tokens.calls[sel];
   const h = head("Token allocation", fmt(t.total) + " tokens" + agentStep(CALLS[sel]));
   if(t.approximate){ const b = el("span", "badge", "~approx"); h.querySelector("h2").appendChild(b); }
   host.appendChild(h);
@@ -542,7 +934,7 @@ function renderTokens(){
     parts.push("\\u0394 vs measured " + (t.reconciliation_delta >= 0 ? "+" : "") + t.reconciliation_delta);
   if(parts.length) host.appendChild(el("p", "dim", "provider usage: " + parts.join("  \\u00b7  ")));
 
-  const bloat = DATA.tokens.bloat;
+  const bloat = D.tokens.bloat;
   if(bloat && bloat.unused_tools && bloat.unused_tools.length){
     host.appendChild(el("div", "bloat",
       "\\u26a0 schema bloat: " + bloat.unused_tools.join(", ") + " \\u2014 " +
@@ -555,7 +947,7 @@ function renderTokens(){
 function renderCache(){
   const host = document.getElementById("cache");
   host.innerHTML = "";
-  const cc = DATA.cache;
+  const cc = D.cache;
   host.appendChild(head("Cache alignment", cc.pairs_analyzed + " turn pairs"));
   if(cc.pairs_analyzed === 0){
     host.appendChild(el("p", "empty", cc.waste_note || "nothing to analyze"));
@@ -640,13 +1032,16 @@ function renderGrowth(){
   const host = document.getElementById("growth");
   host.innerHTML = "";
   host.appendChild(head("Context growth", null));
-  const g = DATA.stats.context_growth || [];
+  const g = VIEW.map(i => (D.stats.context_growth || [])[i] || 0);
   const n = g.length;
   const W = Math.max(320, n * 64), H = 150, pad = 26;
   const max = Math.max(1, ...g);
   const xat = i => n <= 1 ? W / 2 : pad + i * (W - 2 * pad) / (n - 1);
   const yat = v => H - pad - (v / max) * (H - 2 * pad);
   const pts = g.map((v, i) => xat(i).toFixed(1) + "," + yat(v).toFixed(1)).join(" ");
+  // The chart plots the SCOPED timeline (VIEW), so `sel` — an index into CALLS —
+  // has to be translated into this series' own index before it can mark a point.
+  const at = VIEW.indexOf(sel);
   let svg = "<svg viewBox=\\"0 0 " + W + " " + H + "\\" preserveAspectRatio=\\"xMidYMid meet\\" role=\\"img\\" aria-label=\\"context tokens per turn\\">";
   if(n > 0){
     const area = pad.toFixed(1) + "," + (H - pad) + " " + pts + " " +
@@ -654,9 +1049,9 @@ function renderGrowth(){
     svg += "<polygon class=\\"area\\" points=\\"" + area + "\\"></polygon>";
     svg += "<polyline class=\\"line\\" points=\\"" + pts + "\\"></polyline>";
     g.forEach((v, i) => {
-      svg += "<circle class=\\"" + (i === sel ? "dot-sel" : "dot") + "\\" cx=\\"" +
+      svg += "<circle class=\\"" + (i === at ? "dot-sel" : "dot") + "\\" cx=\\"" +
              xat(i).toFixed(1) + "\\" cy=\\"" + yat(v).toFixed(1) + "\\" r=\\"" +
-             (i === sel ? 4.5 : 3) + "\\"></circle>";
+             (i === at ? 4.5 : 3) + "\\"></circle>";
     });
   }
   svg += "</svg>";
@@ -666,7 +1061,18 @@ function renderGrowth(){
 }
 
 // --- orchestration -----------------------------------------------------------
+/** One entry point for every state change: recompute the scoped turn list, then
+ * repaint the header, the breadcrumb, and whichever level is on screen. Only the
+ * visible level is built, so a project with thousands of listed sessions never
+ * pays to render turn panels nobody is looking at. */
 function render(){
+  computeView();
+  renderHeader();
+  renderCrumbs();
+  showLevel();
+  if(level === 1){ renderLevel1(); return; }
+  if(level === 2){ renderLevel2(); return; }
+  if(!CALLS.length){ renderEmptyDetail(); return; }
   renderAgents();
   renderScrubber();
   renderChanged();
@@ -676,17 +1082,50 @@ function render(){
   renderGrowth();
 }
 
+/** A session with no captured calls still has to render SOMETHING at level 3 —
+ * blanking the page would look like a broken file, and the breadcrumb above it
+ * is the way back to a session that does have turns. */
+function renderEmptyDetail(){
+  ["scrubber", "changed", "alloc", "cache", "blocks", "growth"]
+    .forEach(id => { document.getElementById(id).innerHTML = ""; });
+  document.getElementById("h-agents").innerHTML = "";
+  const host = document.getElementById("changed");
+  host.appendChild(head("Turns", null));
+  host.appendChild(el("p", "empty", "this session has no captured calls"));
+}
+
+/** Move the selection one turn along the SCOPED timeline. Stepping through VIEW
+ * rather than through CALLS is what makes the arrow keys walk one agent's own
+ * turns when a scope is active, instead of jumping to another agent's. */
+function step(delta){
+  const at = VIEW.indexOf(sel);
+  const next = at + delta;
+  if(at < 0 || next < 0 || next >= VIEW.length) return false;
+  sel = VIEW[next];
+  render();
+  return true;
+}
+
 function boot(){
-  renderHeader();
-  if(!CALLS.length){
+  // Where to open: the exporter decides from the project's shape and the
+  // selectors the user passed (see `_start_level`), so a single-agent
+  // single-session project lands on its detail view rather than on a one-row
+  // listing, and `--session`/`--agent` preselect a level.
+  const start = (PROJECT && PROJECT.start) || {level: 3, agent: null, session: null};
+  level = start.level || 3;
+  curAgent = start.agent != null ? start.agent : null;
+  if(start.session != null) openSession(start.session);
+  if(level === 3 && !CALLS.length && !MULTI_LEVEL){
+    renderHeader();
     document.getElementById("app").innerHTML =
       "<section class=\\"panel\\"><p class=\\"empty\\">This run has no captured calls.</p></section>";
     return;
   }
   render();
   document.addEventListener("keydown", ev => {
-    if(ev.key === "ArrowLeft" && sel > 0){ sel--; render(); ev.preventDefault(); }
-    else if(ev.key === "ArrowRight" && sel < CALLS.length - 1){ sel++; render(); ev.preventDefault(); }
+    if(level !== 3) return;   // the arrows scrub turns; the listings have none
+    if(ev.key === "ArrowLeft"){ if(step(-1)) ev.preventDefault(); }
+    else if(ev.key === "ArrowRight"){ if(step(1)) ev.preventDefault(); }
   });
   const root = document.documentElement;
   document.getElementById("theme-btn").addEventListener("click", () => {
@@ -703,12 +1142,26 @@ boot();
 '''
 
 
+# The two placeholders `render_page` fills, matched together so ONE pass over
+# the page consumes both. Two sequential `str.replace` calls could not: the
+# title is substituted first, and `str.replace` replaces EVERY occurrence, so a
+# project named `__CTXDIFF_DATA__` re-introduced the data marker inside
+# `<title>` and the second pass filled that too — the title became the whole
+# payload. One pass never revisits what it just wrote.
+_MARKERS = re.compile(r"__CTXDIFF_(TITLE|DATA)__")
+
+
 def render_page(project_title: str, data_json: str) -> str:
     """Fill the page's two markers and return the complete HTML document.
     `project_title` must already be HTML-escaped (it lands in `<title>`);
-    `data_json` must already be `</`-escaped for the JSON island. Title is
-    substituted before data so nothing in the data can shadow the title
-    marker."""
-    return (_PAGE
-            .replace("__CTXDIFF_TITLE__", project_title)
-            .replace("__CTXDIFF_DATA__", data_json))
+    `data_json` must already be `</`-escaped for the JSON island.
+
+    Both markers are filled in a SINGLE pass (`count=2`, the number the page
+    declares), so neither replacement can be re-scanned as part of the other —
+    a project name is user text and may contain either marker verbatim. The
+    replacement is a FUNCTION, so no backslash/group syntax in the title or the
+    payload is expanded; the JS twin uses a function replacer for the same
+    reason (there it is `$`-expansion) and stays byte-identical."""
+    return _MARKERS.sub(
+        lambda m: project_title if m.group(1) == "TITLE" else data_json,
+        _PAGE, count=2)

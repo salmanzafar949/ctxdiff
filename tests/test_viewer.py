@@ -10,7 +10,7 @@ import re
 
 from ctxdiff.models import Block, CallBlock
 from ctxdiff.store.ctrace import CTrace
-from ctxdiff.viewer import build_payload, export_html
+from ctxdiff.viewer import build_payload, build_project_payload, export_html
 
 # Regex that pulls the embedded JSON island back out of the exported HTML,
 # stopping at the FIRST literal </script> — which only works because the
@@ -376,3 +376,459 @@ def test_hostile_agent_name_stays_inside_json_island(tmp_path):
     # unescaped form the browser would parse back.
     assert evil in raw.replace("<\\/", "</")
     assert evil not in text.replace(raw, "")  # nowhere in the static document
+
+
+# --- the three-level project dashboard ------------------------------------------
+#
+# LEVEL 1 lists every agent across every session, LEVEL 2 the sessions one agent
+# appeared in, LEVEL 3 that session's turn-by-turn detail. The `project` section
+# is what the page navigates; the top level stays exactly the single-session
+# payload it always was (the focus session's detail), which is what keeps every
+# test above meaningful.
+
+
+def _write_project(path, *, sessions=2, project="pipeline"):
+    """A PROJECT trace: one file, several sessions, two agents in each, with
+    fixed UTC timestamps a day apart so 'newest first' is unambiguous and the
+    local-time column is a pure function of TZ. The writer sits out the LAST
+    session, so an agent's session count is genuinely not the project's."""
+    for i in range(sessions):
+        ct = CTrace.open_or_create_session(
+            path, project=project, provider="openai", model="gpt-4o",
+            started_at=f"2026-07-{i + 1:02d}T09:15:00+00:00")
+        ct.record_call(seq=1, params={"model": "gpt-4o"},
+                       usage={"prompt_tokens": 100, "completion_tokens": 20},
+                       latency_ms=10, error=None,
+                       call_blocks=[_cb("sys R", 0, role="system", label="system"),
+                                    _cb(f"research {i}", 1)],
+                       agent="researcher", step="gather")
+        ct.record_call(seq=2, params={"model": "gpt-4o"},
+                       usage={"prompt_tokens": 40, "completion_tokens": 8},
+                       latency_ms=10, error=None,
+                       call_blocks=[_cb("sys R", 0, role="system", label="system"),
+                                    _cb(f"research {i}", 1),
+                                    _cb("more", 2, role="assistant", label="history")],
+                       agent="researcher", step="gather")
+        if i < sessions - 1:
+            ct.record_call(seq=3, params={"model": "gpt-4o"}, usage=None,
+                           latency_ms=10, error=None,
+                           call_blocks=[_cb("sys W", 0, role="system", label="system"),
+                                        _cb(f"write {i}", 1)],
+                           agent="writer", step="compose")
+        ct.close()
+    return path
+
+
+def _project_payload(path, **kwargs):
+    """Open `path` and build its full three-level payload."""
+    ct = CTrace.open(path)
+    try:
+        return build_project_payload(ct, **kwargs)
+    finally:
+        ct.close()
+
+
+def test_project_section_sits_beside_the_untouched_session_payload(tmp_path):
+    """The project payload is a strict SUPERSET of the single-session one: the
+    focus session's detail is still the top level, verbatim, with `project`
+    appended. That is what lets one page render both shapes and every
+    single-session assertion keep its meaning."""
+    path = _write_project(str(tmp_path / "p.ctrace"))
+    payload = _project_payload(path)
+
+    for key in ("run", "calls", "diffs", "tokens", "cache", "stats", "project"):
+        assert key in payload
+    ct = CTrace.open(path)
+    try:
+        assert {k: v for k, v in payload.items() if k != "project"} == build_payload(ct)
+    finally:
+        ct.close()
+
+
+def test_level1_aggregates_each_agent_across_every_session(tmp_path):
+    """LEVEL 1: one row per agent, counting the SESSIONS it ran in and the calls
+    it made across all of them — the number that does not change when the user
+    re-runs their agent."""
+    path = _write_project(str(tmp_path / "p.ctrace"), sessions=3)
+    agents = {a["name"]: a for a in _project_payload(path)["project"]["agents"]}
+
+    assert list(agents) == ["researcher", "writer"]   # first-appearance order
+    assert agents["researcher"]["sessions"] == 3
+    assert agents["researcher"]["calls"] == 6         # 2 per session
+    assert agents["researcher"]["input"] == 3 * 140   # 100 + 40 per session
+    assert agents["researcher"]["output"] == 3 * 28
+    assert agents["researcher"]["reported"] == 6
+    # The writer sits out the newest session, and reported NO provider usage —
+    # `reported == 0` is what makes the page print "-" instead of a false 0.
+    assert agents["writer"]["sessions"] == 2
+    assert agents["writer"]["calls"] == 2
+    assert agents["writer"]["reported"] == 0
+    # first_seen/last_seen span the sessions the agent actually appeared in.
+    assert agents["researcher"]["first_seen"].startswith("2026-07-01")
+    assert agents["researcher"]["last_seen"].startswith("2026-07-03")
+    assert agents["writer"]["last_seen"].startswith("2026-07-02")
+
+
+def test_level2_lists_every_session_newest_first_with_per_agent_turns(tmp_path):
+    """LEVEL 2: every session in the project, newest first, each carrying the
+    per-agent breakdown that answers 'what did THIS agent do in that run'."""
+    path = _write_project(str(tmp_path / "p.ctrace"), sessions=3)
+    sessions = _project_payload(path)["project"]["sessions"]
+
+    assert [s["started_at"][:10] for s in sessions] == [
+        "2026-07-03", "2026-07-02", "2026-07-01"]
+    newest, middle = sessions[0], sessions[1]
+    assert newest["turn_count"] == 2                    # writer sat this one out
+    assert [a["name"] for a in newest["agents"]] == ["researcher"]
+    assert [a["name"] for a in middle["agents"]] == ["researcher", "writer"]
+    assert {a["name"]: a["turns"] for a in middle["agents"]} == {
+        "researcher": 2, "writer": 1}
+    assert newest["provider"] == "openai"
+    assert newest["models"] == ["gpt-4o"]
+
+
+def test_level2_timestamps_stay_utc_for_the_browser_to_localize(tmp_path):
+    """Timestamps are embedded as the RAW stored UTC strings, never preformatted
+    at export: the file is meant to be shared, so the conversion to a wall clock
+    has to happen in the VIEWER's zone at render time. The page's `localTime`
+    does it, and the same bytes therefore read differently in two zones —
+    which is the point."""
+    path = _write_project(str(tmp_path / "p.ctrace"))
+    project = _project_payload(path)["project"]
+
+    for s in project["sessions"]:
+        assert s["started_at"].endswith("+00:00")
+    for a in project["agents"]:
+        assert a["first_seen"].endswith("+00:00")
+        assert a["last_seen"].endswith("+00:00")
+    # ...and the page carries the renderer that converts them client-side.
+    from ctxdiff.viewer.template import _PAGE
+    assert "function localTime(value)" in _PAGE
+    assert "getTimezoneOffset()" in _PAGE
+
+
+def test_single_agent_single_session_project_opens_straight_on_level3(tmp_path):
+    """The fast path: a project with nothing to choose between at either level
+    above skips the listings entirely, so the common case never clicks twice."""
+    path = str(tmp_path / "solo.ctrace")
+    _make_trace(path)                       # one session, no agent labels
+    project = _project_payload(path)["project"]
+
+    assert project["sessions_total"] == 1
+    assert len(project["agents"]) == 1      # the (unlabeled) bucket
+    assert project["start"]["level"] == 3
+    assert project["start"]["session"] == project["focus"]
+
+
+def test_multi_agent_project_opens_on_the_agent_listing(tmp_path):
+    """More than one agent (or more than one session) means there IS a choice,
+    so the dashboard lands on level 1 rather than guessing."""
+    path = _write_project(str(tmp_path / "p.ctrace"))
+    project = _project_payload(path)["project"]
+
+    assert project["start"] == {"level": 1, "agent": None, "session": None}
+
+
+def test_selectors_preselect_the_level_the_dashboard_opens_on(tmp_path):
+    """`--agent` opens that agent's session list, `--session` opens a detail
+    view, and both together open the detail scoped to the agent. An agent that
+    ran in exactly ONE session skips its own one-row listing."""
+    path = _write_project(str(tmp_path / "p.ctrace"), sessions=3)
+
+    only_agent = _project_payload(path, agent="researcher")["project"]["start"]
+    assert only_agent == {"level": 2, "agent": "researcher", "session": None}
+
+    only_session = _project_payload(path, session_selected=True)["project"]["start"]
+    assert only_session["level"] == 3
+    assert only_session["agent"] is None
+
+    both = _project_payload(path, agent="writer", session_selected=True)["project"]
+    assert both["start"]["level"] == 3
+    assert both["start"]["agent"] == "writer"
+
+    # An agent with a single session has no listing worth showing.
+    solo = _write_project(str(tmp_path / "solo.ctrace"), sessions=1)
+    assert _project_payload(solo, agent="researcher")["project"]["start"]["level"] == 3
+
+
+def test_detail_is_embedded_only_for_the_most_recent_sessions(tmp_path):
+    """The scale decision, asserted: every session is LISTED (levels 1 and 2 are
+    aggregates and are never capped), but only the `_DETAIL_SESSIONS` most recent
+    ones carry the block-level detail that gives the artifact its size."""
+    from ctxdiff.viewer.export import _DETAIL_SESSIONS
+    total = _DETAIL_SESSIONS + 3
+    path = _write_project(str(tmp_path / "big.ctrace"), sessions=total)
+    project = _project_payload(path)["project"]
+
+    assert project["sessions_total"] == total          # nothing hidden
+    assert len(project["sessions"]) == total
+    assert project["detail_cap"] == _DETAIL_SESSIONS
+    detailed = [s for s in project["sessions"] if s["detail"]]
+    assert len(detailed) == _DETAIL_SESSIONS
+    # ...and they are the NEWEST ones, in order.
+    assert [s["id"] for s in project["sessions"][:_DETAIL_SESSIONS]] == [
+        s["id"] for s in detailed]
+    # The focus session's detail is the payload's top level; the rest hang off
+    # project.details, and it is never duplicated into them.
+    assert project["focus"] not in project["details"]
+    assert len(project["details"]) == _DETAIL_SESSIONS - 1
+
+
+def test_an_explicitly_named_old_session_always_gets_its_detail(tmp_path):
+    """`--session <a run older than the cap>` must land on a WORKING level 3, so
+    the focus session is embedded whether or not it made the recency cut."""
+    from ctxdiff.viewer.export import _DETAIL_SESSIONS
+    path = _write_project(str(tmp_path / "big.ctrace"),
+                          sessions=_DETAIL_SESSIONS + 2)
+    ct = CTrace.open(path)
+    try:
+        oldest = ct.list_sessions()[0].id
+        project = build_project_payload(ct, focus_session_id=oldest,
+                                        session_selected=True)["project"]
+    finally:
+        ct.close()
+
+    assert project["focus"] == oldest
+    row = next(s for s in project["sessions"] if s["id"] == oldest)
+    assert row["detail"] is True
+    # ...and the page OPENS on it: embedding the detail is only half the job if
+    # `start` sends the page somewhere else (see the test below).
+    assert project["start"]["session"] == oldest
+    # It is the top-level detail, so one MORE session than the cap is embedded.
+    assert len(project["details"]) == _DETAIL_SESSIONS
+
+
+def test_the_named_session_is_the_one_the_dashboard_opens_on(tmp_path):
+    """`start.session` must be the FOCUS session, not whichever session happens
+    to be listed first.
+
+    `project.sessions` is newest-first, so reading its head named the newest run
+    for every project with more than one session: the page boots with
+    `openSession(start.session)`, which repoints the whole level-3 view — the
+    breadcrumb, the header and the blocks table — at a run the user never asked
+    for, while the focus session's embedded detail sits unread. Asserted for
+    `--session` alone and for `--agent` + `--session`, which take different
+    branches to the same level 3."""
+    path = _write_project(str(tmp_path / "big.ctrace"), sessions=4)
+    ct = CTrace.open(path)
+    try:
+        sessions = ct.list_sessions()
+        oldest, newest = sessions[0].id, sessions[-1].id
+        by_session = build_project_payload(
+            ct, focus_session_id=oldest, session_selected=True)["project"]
+        by_both = build_project_payload(
+            ct, agent="researcher", focus_session_id=oldest,
+            session_selected=True)["project"]
+    finally:
+        ct.close()
+
+    assert oldest != newest
+    for project in (by_session, by_both):
+        assert project["focus"] == oldest
+        assert project["start"]["level"] == 3
+        assert project["start"]["session"] == oldest
+        # The newest session is what the buggy head-of-list read returned.
+        assert project["start"]["session"] != newest
+    assert by_both["start"]["agent"] == "researcher"
+
+
+def test_agent_spans_are_chronological_not_write_ordered(tmp_path):
+    """`first_seen`/`last_seen` are the OLDEST and NEWEST timestamps an agent
+    ran at — which is not the same as the first and last session WRITTEN once
+    two capturing machines' clocks disagree (or a session is backfilled).
+
+    Sessions written 2026-05-01, then 2026-01-01, then 2026-03-01 must report
+    the span 2026-01-01 .. 2026-05-01; taking the ends of the insertion-ordered
+    list reported `first seen 2026-05-01 ... last seen 2026-03-01`, a range
+    running backwards that also excluded its own earliest run."""
+    path = str(tmp_path / "skew.ctrace")
+    for stamp in ("2026-05-01T09:00:00+00:00", "2026-01-01T09:00:00+00:00",
+                  "2026-03-01T09:00:00+00:00"):
+        ct = CTrace.open_or_create_session(path, project="skew",
+                                           provider="openai", model="gpt-4o",
+                                           started_at=stamp)
+        ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None,
+                       latency_ms=1, error=None, call_blocks=[_cb("hi", 0)],
+                       agent="researcher")
+        ct.close()
+
+    project = _project_payload(path)["project"]
+    row = project["agents"][0]
+    assert row["first_seen"].startswith("2026-01-01")
+    assert row["last_seen"].startswith("2026-05-01")
+    assert row["first_seen"] <= row["last_seen"]
+    # Session ORDERING is a separate question and deliberately unchanged: rows
+    # stay in reverse INSERT order, which is what "newest first" means for a
+    # store whose only reliable clock is the order it was written in.
+    assert [s["started_at"][:10] for s in project["sessions"]] == [
+        "2026-03-01", "2026-01-01", "2026-05-01"]
+
+
+def test_a_project_named_like_the_data_marker_keeps_its_title(tmp_path):
+    """The two page markers are filled in ONE pass, so a project whose NAME
+    contains `__CTXDIFF_DATA__` cannot make the title swallow the payload.
+
+    Substituting the title first and then the data with `str.replace` replaced
+    EVERY occurrence of the data marker — including the one the title had just
+    introduced — so `<title>` became the entire JSON payload."""
+    path = str(tmp_path / "marker.ctrace")
+    ct = CTrace.open_or_create_session(path, project="__CTXDIFF_DATA__",
+                                       provider="openai", model="gpt-4o",
+                                       started_at="2026-05-01T09:00:00+00:00")
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None, latency_ms=1,
+                   error=None, call_blocks=[_cb("hi", 0)])
+    ct.close()
+
+    text = open(export_html(path), encoding="utf-8").read()
+    assert "<title>ctxdiff — __CTXDIFF_DATA__</title>" in text
+    # ...and the island is still the payload, parseable and complete.
+    island = _DATA_RE.search(text).group(1)
+    assert json.loads(island)["run"]["project"] == "__CTXDIFF_DATA__"
+    # No marker survives unfilled anywhere in the document (the two occurrences
+    # left are the project name, in the title and in the payload).
+    assert text.count("__CTXDIFF_TITLE__") == 0
+
+
+def test_prototype_named_agents_get_a_real_color_in_the_page(tmp_path):
+    """An agent literally named `__proto__` must still get a color dot.
+
+    The page's per-agent color map was a plain `{}`, and assigning a STRING to
+    `__proto__` on one is a silent no-op — the palette entry vanished and
+    `agentColor("__proto__")` returned `Object.prototype`, which the browser
+    ignores as a style value. A null-prototype object takes `__proto__` as an
+    ordinary own key. The same applies to the provider-usage lookup behind the
+    chip tooltip, which must ask for an OWN property rather than inheriting one.
+    (The behavior is asserted against the booted page in the JS suite, which has
+    a DOM to run it in; here we assert the shipped page carries the fix.)"""
+    from ctxdiff.viewer.template import _PAGE
+    assert "const AGENT_COLOR = Object.create(null);" in _PAGE
+    assert "Object.prototype.hasOwnProperty.call(uba, a.name)" in _PAGE
+    assert "const AGENT_COLOR = {};" not in _PAGE
+
+
+def test_a_prototype_named_block_label_gets_a_real_color_in_the_page(tmp_path):
+    """A block labeled `__proto__` must fall back to the unknown color, not to a
+    CSS variable that does not exist.
+
+    `KNOWN_LABELS` is a plain object literal, so `KNOWN_LABELS[label]` INHERITS a
+    truthy value for `__proto__` / `constructor` / `toString` — the label reads as
+    known, `labelColor` emits `var(--c-__proto__)`, and since the page's CSS
+    declares no such custom property the swatch renders with no color at all.
+    Labels are user-controlled (`tracer.tag()` takes arbitrary text), so the
+    lookup has to ask for an OWN property. (The behavior is asserted against the
+    booted page in the JS suite, which has a DOM to run it in; here we assert the
+    shipped page carries the fix — and that the fall-through it now takes names a
+    variable the stylesheet actually defines.)"""
+    from ctxdiff.viewer.template import _PAGE
+    assert "Object.prototype.hasOwnProperty.call(KNOWN_LABELS, label)" in _PAGE
+    assert "KNOWN_LABELS[label] ?" not in _PAGE
+    # Every label the guard admits, plus the fall-through, is a declared CSS
+    # custom property — the reason an inherited key is a visible bug.
+    for label in ("system", "tool_schema", "rag", "history", "user",
+                  "tool_output", "unknown"):
+        assert f"--c-{label}:" in _PAGE
+    assert "--c-__proto__" not in _PAGE
+
+    # ...and a real export carrying such a block still renders (the label reaches
+    # the DOM as text either way; only its swatch was at stake).
+    path = str(tmp_path / "protolabel.ctrace")
+    ct = CTrace.create(path, project="p", provider="openai", model="gpt-4o")
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None, latency_ms=1,
+                   error=None,
+                   call_blocks=[_cb("tagged text", 0, label="__proto__",
+                                    label_source="tagged")])
+    ct.close()
+    island = _DATA_RE.search(open(export_html(path), encoding="utf-8").read()).group(1)
+    assert json.loads(island)["calls"][0]["blocks"][0]["label"] == "__proto__"
+
+
+def test_a_reader_that_cannot_list_sessions_still_exports(tmp_path):
+    """A reader materialized for ONE session (an in-memory snapshot taken
+    without the listing) degrades to a one-session project rather than failing
+    to export — a dashboard of what it has beats no dashboard at all."""
+    path = str(tmp_path / "r.ctrace")
+    _make_trace(path)
+
+    class _NoListing:
+        """A reader with the analyzer surface and no session listing at all."""
+        def __init__(self, ct):
+            self._ct = ct
+        def get_run(self, session_id=None):
+            return self._ct.get_run(session_id)
+        def get_calls(self, session_id=None):
+            return self._ct.get_calls(session_id)
+        def get_call_blocks(self, call_id):
+            return self._ct.get_call_blocks(call_id)
+
+    ct = CTrace.open(path)
+    try:
+        project = build_project_payload(_NoListing(ct))["project"]
+    finally:
+        ct.close()
+
+    assert project["sessions_total"] == 1
+    assert project["start"]["level"] == 3
+    assert len(project["sessions"][0]["agents"]) == 1
+
+
+def test_the_unlabeled_bucket_matches_the_cli(tmp_path):
+    """The viewer must not invent a second name for calls with no agent label —
+    one project reporting '(unlabeled)' in `ctxdiff agents` and something else
+    in the dashboard would be a bug nobody could explain."""
+    from ctxdiff.cli.select import UNLABELED
+    from ctxdiff.viewer.export import _UNLABELED
+    assert _UNLABELED == UNLABELED
+
+    path = str(tmp_path / "r.ctrace")
+    _make_trace(path)                       # records no agent labels at all
+    agents = _project_payload(path)["project"]["agents"]
+    assert [a["name"] for a in agents] == [UNLABELED]
+
+
+def test_hostile_agent_and_session_labels_stay_inside_the_island(tmp_path):
+    """The XSS guarantee extended to the two NEW levels. An agent name is
+    attacker-influenced text that levels 1 and 2 and the breadcrumb all render,
+    and a session's provider/model strings are rendered by level 2 — none of
+    them may become live markup anywhere in the document."""
+    path = str(tmp_path / "evil.ctrace")
+    evil_agent = "</script><img src=x onerror=alert('L1')>"
+    evil_provider = "</script><svg onload=alert('L2')>"
+    for i, agent in enumerate([evil_agent, "plain"]):
+        ct = CTrace.open_or_create_session(
+            path, project="proj", provider=evil_provider,
+            model="</script><script>alert('model')</script>",
+            started_at=f"2026-07-0{i + 1}T00:00:00+00:00")
+        ct.record_call(seq=1, params={"model": "m"}, usage=None, latency_ms=1,
+                       error=None, call_blocks=[_cb("hi", 0)], agent=agent)
+        ct.close()
+
+    text = open(export_html(path), encoding="utf-8").read()
+    raw = _DATA_RE.search(text).group(1)
+    outside = text.replace(raw, "")
+    unescaped = raw.replace("<\\/", "</")
+
+    # Every hostile string reached the payload (levels 1/2 render them)...
+    assert evil_agent in unescaped
+    assert evil_provider in unescaped
+    # ...as inert JSON only: no `</script` survives inside the island to close
+    # it early, and no live element appears anywhere outside it.
+    assert "</script" not in raw
+    assert "onerror" not in outside
+    assert "onload" not in outside
+    assert not re.search(r"<img[^>]*onerror", outside, re.I)
+    assert not re.search(r"<svg[^>]*onload", outside, re.I)
+    # Exactly two real </script> closers: the data island and the page script.
+    assert text.count("</script>") == 2
+
+
+def test_project_dashboard_is_still_self_contained(tmp_path):
+    """The self-containment guarantee holds for the multi-session artifact too:
+    zero external requests, everything inline."""
+    path = _write_project(str(tmp_path / "p.ctrace"), sessions=3)
+    text = open(export_html(path), encoding="utf-8").read()
+
+    assert not re.search(r"https?://", text)
+    assert not re.search(r'src=["\']//', text)
+    assert not re.search(r'href=["\']//', text)
+    assert "//cdn" not in text
+    assert text.startswith("<!DOCTYPE html>")

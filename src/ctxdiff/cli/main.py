@@ -264,6 +264,61 @@ def _open_project(project: str | None) -> _OpenedProject:
                           _html_default_for_backend(backend), discovered)
 
 
+class _OpenedDashboard(NamedTuple):
+    """A project opened for the HTML dashboard: the view pinned to the FOCUS
+    session, the default output path, and whether the user actually named that
+    session — which is what decides the level the dashboard opens on."""
+    view: _SessionView
+    html_default: str | None
+    session_selected: bool
+
+
+def _project_agent_names(sessions: list[Session]) -> list[str]:
+    """Every NAMED agent anywhere in the project, in first-appearance order,
+    read from the session rows the listing already carries — so validating
+    `--agent` for the dashboard costs no extra query. Unlabeled calls contribute
+    nothing, exactly as `distinct_agent_names` does, because `--agent
+    (unlabeled)` is not a value a user types."""
+    names: list[str] = []
+    for s in sessions:
+        for n in s.agents:
+            if n not in names:
+                names.append(n)
+    return names
+
+
+def _open_dashboard(project: str | None, session: str | None,
+                    agent: str | None) -> _OpenedDashboard:
+    """Open a project for `export`/`view`, pinned to the session whose detail
+    the dashboard focuses on.
+
+    Why this is NOT `_open_session`: every other read command analyzes exactly
+    one session, so several sessions and no `--session` is a question it must
+    refuse to guess at. The dashboard is the opposite — it exists to show the
+    WHOLE project, every agent and every session, and it opens on the agent
+    listing precisely when there is more than one thing to choose from. So a
+    bare `ctxdiff view` on a many-session project is not ambiguous any more; it
+    focuses the newest session's detail and lands the user on level 1, where
+    picking is what the page is for.
+
+    `--session` still resolves through `choose_session` (unknown id, ambiguous
+    prefix -> the same `SelectionError` with the same listing), and `--agent` is
+    checked against the whole project's agents so a typo is caught here rather
+    than silently opening on a level scoped to nobody."""
+    opened = _open_project(project)
+    try:
+        chosen = (choose_session(opened.sessions, session, opened.default_id)
+                  if session is not None else opened.default_id)
+        if agent is not None:
+            require_agent(agent, _project_agent_names(opened.sessions),
+                          "this project")
+    except Exception:
+        opened.reader.close()
+        raise
+    return _OpenedDashboard(_SessionView(opened.reader, chosen),
+                            opened.html_default, session is not None)
+
+
 def _open_session(project: str | None, session: str | None) -> _OpenedSession:
     """Open the resolved project store bound to ONE session — the entry point
     every single-session command (`tokens`, `cache`, `export`, `view`, and the
@@ -329,6 +384,18 @@ _AGENT_HELP = "restrict to one agent's calls (default: all agents)"
 
 _AGENT_HELP_DIFF = _AGENT_HELP + (". Pass TWICE, optionally as NAME:TURN, to "
                                   "diff two agents within one session")
+
+# The dashboard's own selector help. Both flags are OPTIONAL there and mean
+# something different than they do for the analysis commands: the HTML always
+# covers the whole project, and these only PRESELECT which of its three levels
+# it opens on (see `_open_dashboard`).
+_DASHBOARD_SESSION_HELP = ("open the dashboard on this session's turn-by-turn "
+                           "view (id or unambiguous prefix; default: land on "
+                           "the agent listing and pick there)")
+
+_DASHBOARD_AGENT_HELP = ("open the dashboard scoped to this agent — its session "
+                         "list, or its turns when combined with --session "
+                         "(default: land on the agent listing)")
 
 
 # The `--turn` grammar, stated ONCE: optional surrounding whitespace, an
@@ -455,13 +522,14 @@ def _add_agents_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_export_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Register `ctxdiff export [--out FILE.html]`: emit a self-contained HTML
-    dashboard for one session. `--out` overrides the destination; by default the
-    file is written as `<trace-stem>.html` beside the trace."""
+    """Register `ctxdiff export [--out FILE.html]`: emit the self-contained HTML
+    dashboard for the whole project. `--out` overrides the destination; by
+    default the file is written as `<trace-stem>.html` beside the trace."""
     p = subparsers.add_parser(
-        "export", help="write a self-contained HTML dashboard for a session")
+        "export", help="write a self-contained HTML dashboard for the project")
     _add_project_flags(p)
-    p.add_argument("--session", default=None, help=_SESSION_HELP)
+    p.add_argument("--session", default=None, help=_DASHBOARD_SESSION_HELP)
+    p.add_argument("--agent", default=None, help=_DASHBOARD_AGENT_HELP)
     p.add_argument("--out", default=None,
                     help="output .html path (default: <trace-stem>.html next to the trace)")
     p.set_defaults(func=_cmd_export)
@@ -490,14 +558,15 @@ def _add_demo_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Register `ctxdiff view [--no-open]`: export one session's dashboard to a
+    """Register `ctxdiff view [--no-open]`: export the project's dashboard to a
     temp file and open it in the default browser. `--no-open` skips the browser
     launch (used by tests and headless/CI environments) but still writes and
     prints the file path."""
     p = subparsers.add_parser(
         "view", help="open a self-contained HTML dashboard in your browser")
     _add_project_flags(p)
-    p.add_argument("--session", default=None, help=_SESSION_HELP)
+    p.add_argument("--session", default=None, help=_DASHBOARD_SESSION_HELP)
+    p.add_argument("--agent", default=None, help=_DASHBOARD_AGENT_HELP)
     p.add_argument("--no-open", action="store_true", dest="no_open",
                     help="write and print the HTML path but do not open a browser")
     p.set_defaults(func=_cmd_view)
@@ -1031,21 +1100,24 @@ def _cmd_agents(args: argparse.Namespace) -> int:
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
-    """Implements `ctxdiff export`. How: resolves and opens ONE session
-    (unresolvable selector -> exit 2 with the listing; nothing found -> exit 1,
-    same convention as the other subcommands), exports it to HTML (any build/
-    write failure -> exit 1 with a message), and prints the written path on
-    success. With no `--out`, a file-backed trace writes `<stem>.html` beside
-    itself and a database-backed one has no filename to borrow, so `--out` is
-    required there."""
+    """Implements `ctxdiff export`. How: opens the project focused on one
+    session (unresolvable `--session`/`--agent` -> exit 2 with the listing;
+    nothing found -> exit 1, same convention as the other subcommands), exports
+    the whole project's three-level dashboard to HTML (any build/write failure
+    -> exit 1 with a message), and prints the written path on success. With no
+    `--out`, a file-backed trace writes `<stem>.html` beside itself and a
+    database-backed one has no filename to borrow, so `--out` is required
+    there."""
     try:
-        ct, default_out, _ = _open_session(args.project, args.session)
+        ct, default_out, selected = _open_dashboard(args.project, args.session,
+                                                    args.agent)
     except SelectionError as exc:
         return _report_selection_error(exc)
     except Exception as exc:  # noqa: BLE001 — any open failure is reported, not crashed
         return _report_open_failure(exc)
     try:
-        out = export_store(ct, args.out or default_out)
+        out = export_store(ct, args.out or default_out, agent=args.agent,
+                           session_selected=selected)
     except Exception as exc:  # noqa: BLE001 — any export failure is reported, not crashed
         print(f"ctxdiff: {exc}", file=sys.stderr)
         return 1
@@ -1056,15 +1128,15 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_view(args: argparse.Namespace) -> int:
-    """Implements `ctxdiff view`. How: resolves and opens ONE session
+    """Implements `ctxdiff view`. How: opens the project focused on one session
     (unresolvable selector -> exit 2, nothing found -> exit 1), exports the
-    dashboard to a temp `.html` file, prints its path, and opens it in the
-    default browser via a `file://` URL unless `--no-open` is set. The browser
-    launch is wrapped so a failing/absent browser NEVER crashes the command —
-    the path is already printed, so the user can always open the file
+    three-level dashboard to a temp `.html` file, prints its path, and opens it
+    in the default browser via a `file://` URL unless `--no-open` is set. The
+    browser launch is wrapped so a failing/absent browser NEVER crashes the
+    command — the path is already printed, so the user can always open the file
     themselves."""
     try:
-        ct, _, _ = _open_session(args.project, args.session)
+        ct, _, selected = _open_dashboard(args.project, args.session, args.agent)
     except SelectionError as exc:
         return _report_selection_error(exc)
     except Exception as exc:  # noqa: BLE001 — any open failure is reported, not crashed
@@ -1075,7 +1147,7 @@ def _cmd_view(args: argparse.Namespace) -> int:
     fd, tmp = tempfile.mkstemp(suffix=".html")
     os.close(fd)
     try:
-        out = export_store(ct, tmp)
+        out = export_store(ct, tmp, agent=args.agent, session_selected=selected)
     except Exception as exc:  # noqa: BLE001 — any export failure is reported, not crashed
         print(f"ctxdiff: {exc}", file=sys.stderr)
         return 1

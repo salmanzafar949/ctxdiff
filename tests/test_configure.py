@@ -365,6 +365,37 @@ def test_cli_export_from_the_configured_database(tmp_path, monkeypatch, capsys):
     assert "ctxdiff — dash" in open(out, encoding="utf-8").read()
 
 
+def test_cli_export_builds_the_whole_project_dashboard_from_a_database(
+        tmp_path, monkeypatch, capsys):
+    """BOTH STORAGE KINDS, on the dashboard's own terms: a database-backed
+    project produces the same three-level artifact a `.ctrace` does — every
+    session of it, every agent of it — even though the reader is an in-memory
+    project snapshot of a networked store rather than an open file.
+
+    Two sessions and two agents is the shape that makes the difference visible:
+    a single-session read would have looked identical whether or not the project
+    index was built at all."""
+    fakedb.install(monkeypatch, "psycopg", str(tmp_path / "pg.sqlite"))
+    monkeypatch.chdir(tmp_path)
+    ctxdiff.configure(store=PostgresStore(dsn=PG_DSN))
+
+    for agent in ("researcher", "writer"):
+        t = trace.init("fleet")
+        _call(t.wrap(_FakeOpenAI()), f"{agent} says hi")
+        t.close()
+
+    out = str(tmp_path / "fleet.html")
+    assert cli_main(["export", "--out", out]) == 0
+    page = open(out, encoding="utf-8").read()
+    # Both sessions' texts are in the one artifact — the project index and the
+    # embedded details, not just the focus session.
+    assert "researcher says hi" in page
+    assert "writer says hi" in page
+    assert '"sessions_total": 2' in page
+    # ...and it is still self-contained.
+    assert "https://" not in page
+
+
 def test_cli_reads_the_env_var_ctrace_file(tmp_path, monkeypatch, capsys):
     """`CTXDIFF_STORE=<a file>` is honoured on the READ side too: the CLI
     analyzes that file even when the working directory holds other traces."""

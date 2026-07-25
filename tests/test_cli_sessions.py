@@ -201,11 +201,9 @@ def test_agents_reports_dash_not_zero_when_no_usage_was_reported(tmp_path, capsy
     ["tokens"],
     ["cache"],
     ["diff", "--turn", "1", "--turn", "3"],
-    ["export"],
-    ["view", "--no-open"],
 ])
 def test_ambiguous_session_exits_2_and_lists_the_sessions(project, argv, capsys):
-    """Every command that reads ONE session refuses to guess between two, and
+    """Every command that ANALYZES one session refuses to guess between two, and
     prints the listing the user needs to pick — usage error, exit 2."""
     path, good, bad = project
 
@@ -218,6 +216,48 @@ def test_ambiguous_session_exits_2_and_lists_the_sessions(project, argv, capsys)
         "ctxdiff: this project holds 2 sessions — pass --session to pick one:")
     assert good[:12] in captured.err
     assert bad[:12] in captured.err
+
+
+@pytest.mark.parametrize("argv", [["export"], ["view", "--no-open"]])
+def test_dashboard_commands_do_not_need_a_session(project, tmp_path, argv, capsys):
+    """The DASHBOARD is the one read surface a many-session project is not
+    ambiguous for: the HTML covers every session, so `export`/`view` focus the
+    newest one and land the user on the agent listing rather than refusing to
+    guess. This is the behavior change the three-level dashboard introduced —
+    these two commands used to exit 2 here."""
+    path, good, bad = project
+
+    exit_code = main([*argv, "--project", path])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    html = open(captured.out.strip(), encoding="utf-8").read()
+    # Both sessions are described by the one artifact.
+    assert good in html
+    assert bad in html
+
+
+@pytest.mark.parametrize("extra", [[], ["--agent", "researcher"]])
+def test_dashboard_opens_on_the_session_that_was_named(project, extra, capsys):
+    """`--session <id>` must make the dashboard OPEN on that run.
+
+    The page boots with `openSession(start.session)`, so a `start` naming any
+    other session silently repoints the level-3 view — breadcrumb, header and
+    blocks table — at a run nobody asked for. Checked on the OLDER of the two
+    sessions, since the bug read the newest one and only an older `--session`
+    can tell the two apart."""
+    path, good, bad = project
+
+    exit_code = main(["export", "--project", path, "--session", good, *extra])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    html = open(captured.out.strip(), encoding="utf-8").read()
+    agent = f'"{extra[1]}"' if extra else "null"
+    assert f'"start": {{"level": 3, "agent": {agent}, "session": "{good}"}}' in html
+    assert f'"focus": "{good}"' in html
+    assert bad in html      # the other session is still described by the file
 
 
 def test_single_session_needs_no_flag(tmp_path, capsys):

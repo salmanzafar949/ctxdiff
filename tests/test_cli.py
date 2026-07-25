@@ -707,3 +707,27 @@ def test_demo_prints_a_nudge_toward_tracing_a_real_agent(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "trace.init" in out
     assert "tracer.wrap" in out
+
+
+def test_export_agent_preselects_the_level_and_a_bad_one_exits_2(tmp_path, capsys):
+    """`--agent` on the dashboard commands PRESELECTS which of the three levels
+    the page opens on rather than filtering what the file contains — the HTML
+    still covers the whole project either way. A name nobody answers to is a
+    usage error (exit 2) carrying the listing, exactly like every other
+    selector."""
+    path = str(tmp_path / "multi.ctrace")
+    _make_multi_agent_trace(path)
+    out_file = str(tmp_path / "dash.html")
+
+    assert main(["export", "--run", path, "--agent", "researcher",
+                 "--out", out_file]) == 0
+    capsys.readouterr()
+    page = open(out_file, encoding="utf-8").read()
+    assert '"start": {"level": 3, "agent": "researcher"' in page
+    # ...and the OTHER agent is still fully described by the same artifact.
+    assert '"name": "writer"' in page
+
+    assert main(["view", "--run", path, "--agent", "nobody", "--no-open"]) == 2
+    err = capsys.readouterr().err
+    assert "no agent 'nobody' in this project" in err
+    assert "researcher" in err
