@@ -97,7 +97,7 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 - 🧬 **[Content-hashed block storage](#the-block-model)** — every message, content part, and tool schema is a deduplicated block; a stable system prompt across 40 turns is stored once.
 - 🌐 **[Eight provider surfaces](#supported-providers)** — OpenAI, Azure OpenAI, Anthropic, Google Gemini (AI Studio **and Vertex AI**), AWS Bedrock (Converse, streaming included), any OpenAI-compatible OSS endpoint (Ollama/vLLM/…), and **[LangChain/LangGraph via a callback handler](#langchain--langgraph)**.
 - 🟩🟥🟨 **[Git-style turn diffing](#ctxdiff-diff---turn-n---turn-m)** — `ctxdiff diff --turn 7 --turn 8`: exactly which blocks were added, evicted, or modified (with char-level inline diffs) between any two turns.
-- 📊 **[Token attribution](#ctxdiff-tokens---turn-n)** — `ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
+- 📊 **[Token attribution](#ctxdiff-tokens---turn-n---context-window-n)** — `ctxdiff tokens`: where the budget goes per turn (system / rag / history / schemas…), reconciled against provider-reported usage, plus **schema-bloat detection** — tools you registered but never call, taxing every request.
 - 💸 **[Prompt-cache profiling](#ctxdiff-cache)** — `ctxdiff cache`: finds exactly what breaks your cache prefix (down to the changed characters), counts re-billed tokens, and suggests the fix.
 - 📐 **[Percent of the context window](#percent-of-the-context-window)** — `18,400 / 200,000 tok · 9.2%`, with a `⚠` past 80%. Proximity to the limit is what causes the silent truncation you are debugging; the window is yours to state, because ctxdiff ships no model→window table it could get wrong.
 
@@ -113,11 +113,13 @@ It's built to sit **alongside** your observability stack, not replace it. Use th
 - 🔒 **[Privacy first](#redaction)** — local-first (no network, no telemetry), a redaction hook that runs before anything touches disk, and HTML exports that strip request params down to the model name.
 - ✅ **[Honest numbers](#token-counting)** — exact `tiktoken` counts for OpenAI; estimates are always *marked* as estimates, never passed off as precise.
 
+- 🧵 **[Concurrency-safe](#multi-agent-runs)** — parallel tool calls, `asyncio.gather` fan-outs and thread pools each keep their own tags and step labels, so nothing is mislabelled; writes leave the call path on a single background writer, so capture costs your agent almost nothing.
+- 🗄️ **[Your database, optionally](#storage-backends)** — a local single-file `.ctrace` by default; point it at **Postgres or MySQL** with one `configure()` call and it creates its own tables and writes there instead. Local-first stays the default.
+
 **What it doesn't do (yet):**
 
 - ⏳ **Live tail** — the dashboard is post-run; it doesn't update while the agent is still running.
-- ⏳ **Background recording** — capture is synchronous on the call path (fast, but not zero-cost; threaded agents aren't recorded).
-- ⏳ **VS Code extension** — the dashboard will be embeddable in an editor panel.
+- ⏳ **A JS Bedrock adapter** — Bedrock (`converse` and `converse_stream`) is Python-only; the JS SDK returns a Bedrock client unwrapped, with a warning, rather than guessing.
 
 See [The CLI](#the-cli) below for every subcommand, with real sample output.
 
@@ -368,7 +370,7 @@ Four things it will **not** say, each on purpose:
 | a block that comes back | Absent for one turn and back the next was crowded out, not forgotten. A block that leaves twice is reported once, for the departure it did not return from. |
 | a block whose text was *edited* | A same-slot content change is `modified`, not `evicted` — whatever `ctxdiff diff` calls it, this report calls it. (This is the one blind spot: a tagged block swapped in place for different text of the same role reads as an edit.) |
 
-The same finding is available as a CI assertion — [`ctxdiff check --no-tagged-eviction`](#ctxdiff-check) — and as a panel in the [dashboard](#the-dashboard).
+The same finding is available as a CI assertion — [`ctxdiff check --no-tagged-eviction`](#ctxdiff-check) — and as a panel in the [dashboard](#html-dashboard).
 
 ### `ctxdiff cache`
 
@@ -1376,7 +1378,9 @@ Because blocks are content-addressed and stored once, a long run with a stable p
 
 ## Roadmap
 
-Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: live tail, background recording, and the VS Code extension — plus smaller items tracked in the issues (e.g. a Bedrock adapter for the JS SDK, rolling per-call model ids up onto `run.models`).
+Everything under [What it doesn't do (yet)](#features) is the roadmap, in rough priority order: **live tail** (a dashboard that updates while the agent is still running) and a **Bedrock adapter for the JS SDK** — plus smaller items tracked in the issues (e.g. rolling per-call model ids up onto `run.models`, and an opt-in exact pre-flight token count via Anthropic's and Gemini's `count_tokens` endpoints).
+
+Anything else you need is worth [opening an issue](https://github.com/salmanzafar949/ctxdiff/issues) for — the roadmap is short on purpose, and what real users hit beats what the maintainer guessed.
 
 ---
 
