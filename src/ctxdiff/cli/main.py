@@ -23,12 +23,14 @@ import webbrowser
 from typing import NamedTuple
 
 from ctxdiff.analyze.cache import analyze_cache
+from ctxdiff.analyze.check import Thresholds, analyze_check
 from ctxdiff.analyze.differ import diff_calls, diff_turns
 from ctxdiff.analyze.tokens import analyze_run, registered_tool_names, usage_totals
 from ctxdiff.cli.render import (
     render_agent_summary,
     render_agents_list,
     render_cache_report,
+    render_check_report,
     render_run_tokens,
     render_sessions_list,
     render_turn_diff,
@@ -424,6 +426,26 @@ def _turn_int(value: str) -> int:
     return int(value)
 
 
+# The `--max-*-pct` grammar: optional whitespace, optional sign, then ASCII
+# decimal digits with an optional fractional part (or a bare fraction). Narrower
+# than `float()` on purpose — `float()` also accepts `inf`, `nan`, `1e4`,
+# underscores and non-ASCII decimal digits, none of which are a percentage
+# anyone means to type, and all of which the JS twin's parser would have to
+# reproduce exactly for the two CLIs to reject the same strings.
+_FLOAT_RE = re.compile(r"^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)\s*$")
+
+
+def _pct_float(value: str) -> float:
+    """argparse `type=` for every percentage flag: `float()` NARROWED to plain
+    ASCII decimals (see `_FLOAT_RE`). Failures carry argparse's OWN wording for
+    a bad float (`invalid float value: '...'`) rather than naming this function,
+    exactly as `_turn_int` does for ints — an internal name in user-facing
+    output is a difference the JS CLI would have to mirror for no benefit."""
+    if not _FLOAT_RE.match(value):
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}")
+    return float(value)
+
+
 def _add_project_flags(p: argparse.ArgumentParser) -> None:
     """Register `--project` plus its hidden `--run` alias. Both write the same
     `project` dest, so every existing `--run PATH` invocation and script keeps
@@ -483,6 +505,40 @@ def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
         "cache", help="prefix-stability report + wasted-spend estimate")
     _add_selector_flags(p)
     p.set_defaults(func=_cmd_cache)
+
+
+def _add_check_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register `ctxdiff check`: the CI gate. Every assertion is OPT-IN — the
+    command asserts exactly what it was asked to and nothing else — and no
+    assertion at all is a usage error rather than a pass (see `_check_thresholds`).
+
+    No `--turn`: a budget is a property of a whole run, and a check scoped to a
+    single turn could not answer "did any turn blow the budget", which is the
+    question. `--agent` still narrows the run, so one pipeline can gate each of
+    its agents against a different budget."""
+    p = subparsers.add_parser(
+        "check", help="assert context budgets and fail the build (CI gate)")
+    p.add_argument("--max-context", type=_turn_int, default=None, metavar="N",
+                   help="fail if any turn's context exceeds N tokens (the same "
+                        "total 'ctxdiff tokens' prints for that turn)")
+    p.add_argument("--context-window", type=_turn_int, default=None, metavar="N",
+                   help="the model's context window, in tokens — the denominator "
+                        "--max-context-pct is a percentage of. Required by it, and "
+                        "supplied by you: ctxdiff ships no model→window table")
+    p.add_argument("--max-context-pct", type=_pct_float, default=None, metavar="P",
+                   help="fail if any turn's context exceeds P%% of --context-window")
+    p.add_argument("--require-stable-prefix", action="store_true",
+                   help="fail if the prompt-cache prefix breaks anywhere in the run")
+    p.add_argument("--no-dead-schemas", action="store_true",
+                   help="fail if a tool schema is registered but never invoked")
+    p.add_argument("--max-growth", type=_turn_int, default=None, metavar="N",
+                   help="fail if the context grows by more than N tokens between "
+                        "two consecutive turns of the same agent")
+    p.add_argument("--max-growth-pct", type=_pct_float, default=None, metavar="P",
+                   help="fail if the context grows by more than P%% between two "
+                        "consecutive turns of the same agent")
+    _add_selector_flags(p)
+    p.set_defaults(func=_cmd_check)
 
 
 def _add_sessions_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -577,13 +633,14 @@ def _add_view_parser(subparsers: argparse._SubParsersAction) -> None:
 # list but registers itself with help=SUPPRESS, so it dispatches without
 # appearing.
 _SUBCOMMANDS = [_add_diff_parser, _add_tokens_parser, _add_cache_parser,
-                _add_sessions_parser, _add_agents_parser, _add_runs_parser,
-                _add_export_parser, _add_view_parser, _add_demo_parser]
+                _add_check_parser, _add_sessions_parser, _add_agents_parser,
+                _add_runs_parser, _add_export_parser, _add_view_parser,
+                _add_demo_parser]
 
 # The commands help ADVERTISES, in listing order. `runs` is deliberately absent:
 # it still dispatches (see `_add_runs_parser`), it just isn't offered to anyone
 # reading the help for the first time.
-_VISIBLE_COMMANDS = ["diff", "tokens", "cache", "sessions", "agents",
+_VISIBLE_COMMANDS = ["diff", "tokens", "cache", "check", "sessions", "agents",
                      "export", "view", "demo"]
 
 
@@ -925,6 +982,143 @@ def _cmd_cache(args: argparse.Namespace) -> int:
     finally:
         ct.close()
     return 0
+
+
+# --- check ------------------------------------------------------------------------
+
+# The assertion flags, in the order the "you asked for nothing" error lists
+# them — the same order the report prints its rows in, so the message reads as
+# a menu of what the command can do rather than an arbitrary list.
+_ASSERTION_FLAGS = ("--max-context", "--max-context-pct", "--require-stable-prefix",
+                    "--no-dead-schemas", "--max-growth", "--max-growth-pct")
+
+
+def _check_thresholds(args: argparse.Namespace) -> Thresholds:
+    """Turn `check`'s flags into a `Thresholds`, rejecting every combination
+    that cannot mean what it says. Raises `SelectionError` (exit 2) — these are
+    usage errors in argparse's sense: the flags as given cannot be acted on.
+
+    The four rules, and why each is an error rather than a shrug:
+
+    1. NO assertion at all is refused. `ctxdiff check` with no thresholds would
+       otherwise exit 0 having verified nothing — a green tick in CI that means
+       "nobody asked a question", which is the exact failure this command
+       exists to prevent.
+    2. `--max-context-pct` without `--context-window` is refused, because the
+       percentage has no denominator. ctxdiff deliberately ships no
+       model→window table (windows differ per model and per provider and change
+       under you; a stale table would silently move everyone's threshold), so
+       the window is the user's to supply.
+    3. `--context-window` without `--max-context-pct` is refused too — nothing
+       would consume it, and silently ignoring a flag someone typed is how a CI
+       gate ends up asserting less than its author believes.
+    4. A limit outside its legal range is refused: the two absolute budgets and
+       the percentage must be POSITIVE (a zero context window is a division by
+       zero, and a zero-token budget is not an assertion anyone means), while
+       the two growth limits may legitimately be zero — "this context must not
+       grow at all" is a real thing to assert."""
+    # Built first so "was anything asked for?" is answered by the value object's
+    # own `any_requested` — the single definition of that question, shared with
+    # the analyzer instead of restated as a second `any([...])` that could fall
+    # out of step with it the next time a flag is added.
+    thresholds = Thresholds(
+        max_context=args.max_context,
+        context_window=args.context_window,
+        max_context_pct=args.max_context_pct,
+        require_stable_prefix=args.require_stable_prefix,
+        no_dead_schemas=args.no_dead_schemas,
+        max_growth=args.max_growth,
+        max_growth_pct=args.max_growth_pct,
+    )
+    if not thresholds.any_requested:
+        raise SelectionError(
+            "ctxdiff check: nothing to assert — pass at least one of "
+            + ", ".join(_ASSERTION_FLAGS))
+    if args.max_context_pct is not None and args.context_window is None:
+        raise SelectionError(
+            "ctxdiff check: --max-context-pct needs a denominator — pass "
+            "--context-window N (ctxdiff ships no model→window table by design, "
+            "so the window is yours to state)")
+    if args.context_window is not None and args.max_context_pct is None:
+        raise SelectionError(
+            "ctxdiff check: --context-window is only used by --max-context-pct "
+            "— pass that too, or use --max-context N for an absolute budget")
+    # Integer and percentage limits are reported back in their own spelling —
+    # a bare integer for the token budgets, one decimal for the percentages,
+    # the same way every percentage in the report itself is written — so the
+    # error echoes what the user typed without either CLI having to reproduce
+    # the other's general-purpose float formatting.
+    for flag, value in (("--max-context", args.max_context),
+                        ("--context-window", args.context_window)):
+        if value is not None and value <= 0:
+            raise SelectionError(
+                f"ctxdiff check: {flag} must be greater than 0 (got {value})")
+    if args.max_context_pct is not None and args.max_context_pct <= 0:
+        raise SelectionError("ctxdiff check: --max-context-pct must be greater "
+                             f"than 0 (got {args.max_context_pct:.1f})")
+    if args.max_growth is not None and args.max_growth < 0:
+        raise SelectionError("ctxdiff check: --max-growth cannot be negative "
+                             f"(got {args.max_growth})")
+    if args.max_growth_pct is not None and args.max_growth_pct < 0:
+        raise SelectionError("ctxdiff check: --max-growth-pct cannot be negative "
+                             f"(got {args.max_growth_pct:.1f})")
+    return thresholds
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    """Implements `ctxdiff check`: assert a context budget, and exit non-zero
+    when it is blown so CI fails the build.
+
+    Exit codes, matching the convention every other subcommand follows —
+    **0** every requested assertion passed; **1** at least one was violated (or
+    the trace could not be read, or the session held nothing to check); **2** a
+    usage error (an impossible flag combination, an unresolvable
+    `--session`/`--agent`).
+
+    Order matters: the flags are validated BEFORE any store is opened, so a
+    malformed check fails the same way whether or not a trace happens to exist
+    — otherwise the same command would report a flag problem on one machine and
+    a missing `.ctrace` on another.
+
+    An EMPTY session (or an `--agent` slice with no calls) exits 1 rather than
+    reporting a table of vacuous passes: a check that examined zero turns has
+    proved nothing, and a CI gate that greens on "there was no trace" is worse
+    than no gate at all — it would keep passing forever the day capture
+    silently broke."""
+    try:
+        thresholds = _check_thresholds(args)
+    except SelectionError as exc:
+        return _report_selection_error(exc)
+
+    try:
+        ct, _, discovered = _open_session(args.project, args.session)
+    except SelectionError as exc:
+        return _report_selection_error(exc)
+    except Exception as exc:  # noqa: BLE001 — any open failure is reported, not crashed
+        return _report_open_failure(exc)
+
+    try:
+        try:
+            _check_agent_filter(ct, args.agent, discovered)
+        except SelectionError as exc:
+            return _report_selection_error(exc)
+        report = analyze_check(ct, thresholds, agent=args.agent)
+        if report.turns_analyzed == 0:
+            where = (f"agent '{args.agent}'" if args.agent is not None
+                     else "this session")
+            print(f"ctxdiff check: no calls in {where} — nothing to check "
+                  f"(did the run capture?)", file=sys.stderr)
+            return 1
+        # The header names the session (and, when the project was DISCOVERED
+        # rather than named, the file it came from) with the same
+        # `_session_where` spelling every selector error uses — so a CI log
+        # records which trace produced the verdict, and the newest-.ctrace
+        # default can never green a build on a file nobody meant to check.
+        print(render_check_report(
+            report, _session_where(ct.session_id, discovered)))
+        return 0 if report.passed else 1
+    finally:
+        ct.close()
 
 
 # --- discovery: sessions / agents ------------------------------------------------

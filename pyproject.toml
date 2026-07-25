@@ -37,7 +37,13 @@ authors = [{ name = "Salman Zafar" }]
 dependencies = ["tiktoken==0.13.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# `PyYAML` is a TEST-only dependency: `tests/test_action.py` parses `action.yml`
+# (ctxdiff's published GitHub Action) and asserts its inputs still match the
+# `ctxdiff check` flags. A hand-rolled scan would pass on a file YAML itself
+# rejects — which is the exact failure a smoke test for an Action must catch,
+# since a syntax error there only surfaces when someone else's workflow run
+# fails. Runtime deps stay tiktoken-only; nothing under src/ imports yaml.
+dev = ["pytest>=8", "PyYAML>=6"]
 # Storage backends. The core stays dependency-light (tiktoken only) and both
 # drivers are imported LAZILY, at connect time, so these extras are optional in
 # the real sense: without them ctxdiff still runs, and a store configured for a
@@ -50,7 +56,7 @@ mysql = ["PyMySQL>=1.1"]
 eval = ["openai>=1.0", "anthropic>=0.30", "langchain-openai", "langchain-core", "respx>=0.21", "httpx", "google-genai>=1.0", "boto3>=1.34"]
 
 [project.scripts]
-ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · view · export · runs)
+ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · check · view · export · sessions · agents · demo)
 
 [tool.hatch.build.targets.sdist]
 # Keep the source tarball lean — no 2.4MB demo GIF, no tests/CI in the pip download.
@@ -58,7 +64,7 @@ ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · vie
 # the test suites that assert against it (tests/test_golden.py here,
 # js/test/golden.test.ts there), and neither ships. `spec/ctrace-schema.md` is
 # NOT excluded — the on-disk format is documentation a downloader may want.
-exclude = ["assets", "tests", ".github", "docs", "spec/golden"]
+exclude = ["assets", "tests", ".github", "docs", "spec/golden", "action.yml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ctxdiff"]

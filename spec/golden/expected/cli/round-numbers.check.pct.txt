@@ -1,0 +1,7 @@
+ctxdiff check · 3 turns · session c10000000000
+FAIL  max-context-pct        1 turn over limit · peak 27.0% of 100 tok window at turn 3 · limit 25.0% (25 tok)
+  turn 3 [agent:solo] · 27 tok · 27.0% of 100 tok window · limit 25.0% (25 tok)
+FAIL  max-growth-pct         1 turn over limit · peak growth 69.2% at turn 2 · limit 30.0%
+  turn 1 → turn 2 [agent:solo] · +69.2% (13 → 22 tok) · limit 30.0%
+
+check FAILED · 2 of 2 assertions failed

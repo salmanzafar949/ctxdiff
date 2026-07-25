@@ -52,7 +52,12 @@ export interface Manifest {
   ctxdiff_version: string;
   tokenizers: Record<string, { package: string; pinned_version: string; encoding: string }>;
   fixtures: { id: string; corpus: string; ctrace: string }[];
-  cli_cases: { name: string; fixture: string; argv: string[] }[];
+  /** `exit` is the status the case is EXPECTED to return, defaulting to 0.
+   * Almost every case is a success path, but `ctxdiff check` reports a violated
+   * budget on stdout and exits 1 — and that status is the whole point of the
+   * command, since CI turns a build red on the code, not on the text. So it is
+   * part of the frozen expectation rather than something the harness assumes. */
+  cli_cases: { name: string; fixture: string; argv: string[]; exit?: number }[];
   html_cases: { name: string; fixture: string }[];
 }
 

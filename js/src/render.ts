@@ -1,7 +1,7 @@
 /**
  * Git-style colored rendering of analyzer output. A faithful port of Python
  * `ctxdiff.cli.render` — every line, separator, glyph, padding and number
- * format matches so `ctxdiff diff|tokens|cache|runs` output is byte-identical to
+ * format matches so `ctxdiff diff|tokens|cache|check|runs` output is byte-identical to
  * the Python CLI's (with color auto-disabled off a TTY, exactly as Python does).
  * Kept separate from the analyzers so they never depend on ANSI/terminal code.
  */
@@ -12,8 +12,14 @@ import type {
   RunTokens,
   UsageTotals,
 } from "./analyze/tokens.js";
-import type { CacheReport, PrefixBreak } from "./analyze/cache.js";
-import { pyRoundHalfEven } from "./analyze/pyround.js";
+import { groupBreaks, pairsDenominator, type CacheReport } from "./analyze/cache.js";
+import {
+  checkPassed,
+  failedAssertions,
+  NAME_WIDTH,
+  type CheckReport,
+} from "./analyze/check.js";
+import { pyComma as comma, pyRoundHalfEven } from "./analyze/pyround.js";
 
 // Bare ANSI SGR constants — no color library, matching Python's render.py.
 const RESET = "\x1b[0m";
@@ -36,14 +42,6 @@ function colorEnabled(): boolean {
 /** Wrap `text` in `color`'s SGR codes, or return it bare when disabled. */
 function paint(text: string, color: string, enabled: boolean): string {
   return enabled ? `${color}${text}${RESET}` : text;
-}
-
-/** Integer thousands-separator formatting, matching Python's `{n:,}`. */
-function comma(n: number): string {
-  const neg = n < 0;
-  const s = Math.abs(Math.trunc(n)).toString();
-  const grouped = s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return neg ? "-" + grouped : grouped;
 }
 
 // A code point is non-printable (in Python's `str.isprintable` sense) when its
@@ -301,24 +299,6 @@ export function renderRunTokens(
   return sections.join("\n\n");
 }
 
-/** Group PrefixBreaks by (agent, culpritKind, culpritLabel, divergentPosition)
- * in first-seen order. Mirrors Python `_group_breaks`. */
-function groupBreaks(breaks: PrefixBreak[]): PrefixBreak[][] {
-  const groups = new Map<string, PrefixBreak[]>();
-  const order: string[] = [];
-  for (const b of breaks) {
-    const key = JSON.stringify([b.agent, b.culpritKind, b.culpritLabel, b.divergentPosition]);
-    let arr = groups.get(key);
-    if (!arr) {
-      arr = [];
-      groups.set(key, arr);
-      order.push(key);
-    }
-    arr.push(b);
-  }
-  return order.map((k) => groups.get(k)!);
-}
-
 /** Render `ctxdiff cache`'s full output. Mirrors Python `render_cache_report`. */
 export function renderCacheReport(report: CacheReport): string {
   const enabled = colorEnabled();
@@ -349,10 +329,10 @@ export function renderCacheReport(report: CacheReport): string {
   for (const group of groupBreaks(report.breaks)) {
     const rep = group[0];
     const count = group.length;
-    let denom = report.pairsAnalyzed;
-    if (rep.agent !== null && report.pairsByAgent) {
-      denom = report.pairsByAgent.get(rep.agent) ?? report.pairsAnalyzed;
-    }
+    // Denominator: THAT agent's own pair count when the break is attributed to
+    // one and the run was analyzed per-agent, else the run-wide count. Shared
+    // with `ctxdiff check` so both report the same frequency.
+    const denom = pairsDenominator(report, rep);
     const frequency =
       count === denom
         ? `breaks the prefix on every turn (${count}/${denom} pairs)`
@@ -376,6 +356,60 @@ export function renderCacheReport(report: CacheReport): string {
   lines.push(report.estimatedWasteNote);
 
   if (report.fixHint) lines.push(paint(`hint: ${report.fixHint}`, DIM, enabled));
+
+  return lines.join("\n");
+}
+
+/**
+ * Render `ctxdiff check`'s PASS/FAIL table — the thing a CI log shows and a
+ * reviewer reads without opening the trace. Mirrors Python
+ * `render_check_report`.
+ *
+ * Layout, top to bottom: a scope header naming how many turns were checked,
+ * which agent (when scoped to one) and WHAT WAS READ — `source`, the caller's
+ * `session <short id>` label, qualified by the filename when the trace was
+ * discovered rather than named. That last part is not decoration: with no
+ * `--project` the CLI reads the most recently modified `*.ctrace` in the working
+ * directory (the GitHub Action's default), so an unrelated newer trace can be
+ * checked, pass, and leave a report indistinguishable from one over the intended
+ * run. A verdict that does not say what it read cannot be audited. Then one
+ * status line per REQUESTED assertion, in
+ * the analyzer's fixed order, as `PASS`/`FAIL` (green/red) + the name padded to
+ * a common column + a summary that always carries the actual value beside the
+ * threshold — a passing check that reports its high-water mark is what lets
+ * someone watch a budget approach its limit over successive PRs, instead of only
+ * finding out on the day it breaks; then, beneath each FAILING assertion, its
+ * violation lines indented two spaces; then a blank line and a verdict.
+ *
+ * Every string below the status column is composed by `analyze/check.ts`; this
+ * function only decides columns and color, exactly as the other renderers do.
+ */
+export function renderCheckReport(report: CheckReport, source: string | null = null): string {
+  const enabled = colorEnabled();
+  const lines: string[] = [];
+
+  const scope = report.agent !== null ? ` · agent ${report.agent}` : "";
+  const origin = source ? ` · ${source}` : "";
+  const turnWord = report.turnsAnalyzed === 1 ? "turn" : "turns";
+  lines.push(`ctxdiff check · ${report.turnsAnalyzed} ${turnWord}${scope}${origin}`);
+
+  for (const a of report.assertions) {
+    const status = a.passed ? paint("PASS", GREEN, enabled) : paint("FAIL", RED, enabled);
+    lines.push(`${status}  ${ljust(a.name, NAME_WIDTH)}  ${a.summary}`);
+    for (const detail of a.details) lines.push(`  ${detail}`);
+  }
+
+  lines.push("");
+  const total = report.assertions.length;
+  const suffix = total === 1 ? "" : "s";
+  if (checkPassed(report)) {
+    lines.push(paint(`check passed · ${total} assertion${suffix}`, GREEN, enabled));
+  } else {
+    const failed = failedAssertions(report).length;
+    lines.push(
+      paint(`check FAILED · ${failed} of ${total} assertion${suffix} failed`, RED, enabled),
+    );
+  }
 
   return lines.join("\n");
 }

@@ -53,9 +53,17 @@ function flattenSnippet(text: string, limit = 80): string {
 }
 
 /** Shorter truncation for a differing substring inside a 'modified' break's
- * detail. Mirrors Python `_truncate`. Slices by code point (like Python). */
+ * detail. Mirrors Python `_truncate`. Slices by code point (like Python).
+ *
+ * Flattened first, exactly like `flattenSnippet`: this substring is CAPTURED
+ * TEXT, and `detail` is a single line of a report that ends up inside a
+ * markdown fence in the GitHub Action's job summary. A prompt (or a tool schema,
+ * or a diff hunk) carrying a newline followed by a run of backticks would close
+ * that fence and render contributor-controlled markdown — on a fork pull
+ * request, outside-contributor markdown. */
 function truncate(text: string, limit = 40): string {
-  const chars = Array.from(text);
+  const flat = text.split(/\s+/u).filter((s) => s.length > 0).join(" ");
+  const chars = Array.from(flat);
   return chars.slice(0, limit).join("") + (chars.length > limit ? "…" : "");
 }
 
@@ -206,6 +214,52 @@ function attributeBreak(
   const label = side ? side.label : "unknown";
   const detail = `context diverges at position ${position} (not a simple modify/insert/evict/reorder)`;
   return ["changed", label, flattenSnippet(text), detail, false];
+}
+
+// --- break grouping (shared by `cache` and `check`) ------------------------------
+
+/**
+ * Group PrefixBreaks that describe the "same" underlying culprit — (agent,
+ * culpritKind, culpritLabel, divergentPosition) — into one list per distinct
+ * culprit, in first-seen order. `agent` is part of the key so two agents
+ * breaking the same way at the same slot stay SEPARATE warnings. Grouping
+ * deliberately ignores the per-pair `detail`/`culpritSnippet` text (a changing
+ * timestamp's before/after values differ every pair by definition): what makes
+ * two breaks "the same warning" is that the same agent's same slot keeps
+ * breaking the same way. Mirrors Python `group_breaks`.
+ *
+ * Public and living beside the analyzer rather than inside the renderer,
+ * because it is pure data reduction over CacheReport with no formatting in it,
+ * and BOTH consumers need exactly this reduction: `ctxdiff cache`'s warning
+ * list and `ctxdiff check --require-stable-prefix`'s violation list.
+ */
+export function groupBreaks(breaks: PrefixBreak[]): PrefixBreak[][] {
+  const groups = new Map<string, PrefixBreak[]>();
+  const order: string[] = [];
+  for (const b of breaks) {
+    const key = JSON.stringify([b.agent, b.culpritKind, b.culpritLabel, b.divergentPosition]);
+    let arr = groups.get(key);
+    if (!arr) {
+      arr = [];
+      groups.set(key, arr);
+      order.push(key);
+    }
+    arr.push(b);
+  }
+  return order.map((k) => groups.get(k)!);
+}
+
+/** The pair count a break's frequency should be reported AGAINST: when the
+ * break is attributed to a named agent and the run was analyzed per-agent, that
+ * agent's own pair count — a researcher breaking on both of its 2 pairs is
+ * "2/2", not "2/3" of a run that also includes a stable writer. Falls back to
+ * the run-wide count for an unlabeled break or a single-timeline run. Mirrors
+ * Python `pairs_denominator`. */
+export function pairsDenominator(report: CacheReport, brk: PrefixBreak): number {
+  if (brk.agent !== null && report.pairsByAgent) {
+    return report.pairsByAgent.get(brk.agent) ?? report.pairsAnalyzed;
+  }
+  return report.pairsAnalyzed;
 }
 
 // --- waste note + fix hint ------------------------------------------------------

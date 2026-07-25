@@ -82,6 +82,18 @@
     {"name": "image-blocks.cache", "fixture": "image-blocks", "argv": ["cache", "--project", "{trace}"]},
     {"name": "image-blocks.agents", "fixture": "image-blocks", "argv": ["agents", "--project", "{trace}"]},
 
+    {"name": "special-tokens.check.pass", "fixture": "special-tokens", "argv": ["check", "--max-context", "1000", "--require-stable-prefix", "--no-dead-schemas", "--max-growth", "200", "--project", "{trace}"]},
+    {"name": "code-and-schemas.check.fail", "fixture": "code-and-schemas", "exit": 1, "argv": ["check", "--max-context", "500", "--no-dead-schemas", "--max-growth", "100", "--project", "{trace}"]},
+    {"name": "code-and-schemas.check.mixed", "fixture": "code-and-schemas", "exit": 1, "argv": ["check", "--max-context", "1000", "--require-stable-prefix", "--no-dead-schemas", "--project", "{trace}"]},
+    {"name": "round-numbers.check.pct", "fixture": "round-numbers", "exit": 1, "argv": ["check", "--context-window", "100", "--max-context-pct", "25", "--max-growth-pct", "30", "--project", "{trace}"]},
+    {"name": "round-numbers.check.pct.pass", "fixture": "round-numbers", "argv": ["check", "--context-window", "1000", "--max-context-pct", "12.5", "--max-growth-pct", "99.5", "--project", "{trace}"]},
+    {"name": "image-blocks.check.prefix", "fixture": "image-blocks", "exit": 1, "argv": ["check", "--require-stable-prefix", "--max-context", "1000", "--project", "{trace}"]},
+    {"name": "image-blocks.check.agent", "fixture": "image-blocks", "exit": 1, "argv": ["check", "--agent", "driver", "--require-stable-prefix", "--max-growth", "500", "--project", "{trace}"]},
+    {"name": "multiagent-project.check.session2", "fixture": "multiagent-project", "exit": 1, "argv": ["check", "--session", "e7f8a9b0c1d2", "--max-context", "200", "--require-stable-prefix", "--max-growth", "50", "--project", "{trace}"]},
+    {"name": "multiagent-project.check.researcher", "fixture": "multiagent-project", "exit": 1, "argv": ["check", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--max-context", "200", "--require-stable-prefix", "--project", "{trace}"]},
+    {"name": "multiagent-project.check.writer", "fixture": "multiagent-project", "argv": ["check", "--session", "e7f8a9b0c1d2", "--agent", "writer", "--max-context", "200", "--require-stable-prefix", "--max-growth", "0", "--project", "{trace}"]},
+    {"name": "image-blocks.check.unmeasured", "fixture": "image-blocks", "exit": 1, "argv": ["check", "--max-context", "5000", "--context-window", "100000", "--max-context-pct", "50", "--max-growth", "5000", "--project", "{trace}"]},
+
     {"name": "round-numbers.tokens", "fixture": "round-numbers", "argv": ["tokens", "--project", "{trace}"]},
     {"name": "round-numbers.tokens.turn1", "fixture": "round-numbers", "argv": ["tokens", "--turn", "1", "--project", "{trace}"]},
     {"name": "round-numbers.diff.1-2", "fixture": "round-numbers", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},

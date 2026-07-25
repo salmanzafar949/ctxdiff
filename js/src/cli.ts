@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * ctxdiff's command-line entry point (`npx ctxdiff <cmd>`). Matches the Python
- * CLI's command surface — `diff`, `tokens`, `cache` (analysis), `sessions`,
+ * CLI's command surface — `diff`, `tokens`, `cache`, `check` (analysis), `sessions`,
  * `agents` (discovery, with `runs` kept as a hidden alias of `sessions`), plus
  * `view`, `export`, `demo` (the HTML dashboard) — with the same flags
  * (`--project`/`--run`, `--session`, `--agent`, `--turn`, `--out`, `--no-open`,
@@ -40,6 +40,8 @@ import { snapshotProject, snapshotStore } from "./store/snapshot.js";
 import { diffCalls, diffTurns } from "./analyze/diff.js";
 import { analyzeRun, registeredToolNames, usageTotals } from "./analyze/tokens.js";
 import { analyzeCache } from "./analyze/cache.js";
+import { analyzeCheck, anyRequested, checkPassed, type Thresholds } from "./analyze/check.js";
+import { pyComma as comma } from "./analyze/pyround.js";
 import { isTraceFile, listFileCalls, listFileSessions } from "./analyze/sessions.js";
 import { detailSessionIds, exportHtml, exportStore, type ProjectReader } from "./viewer/export.js";
 import { buildDemoTrace } from "./demo.js";
@@ -47,6 +49,7 @@ import {
   renderTurnDiff,
   renderRunTokens,
   renderCacheReport,
+  renderCheckReport,
   renderSessionsList,
   renderAgentsList,
   renderUsageSummary,
@@ -514,6 +517,10 @@ interface ParsedArgs {
   sessions: string[];
   /** `--project`, its `--run` alias, or a leading positional path. */
   project: string | undefined;
+  /** Every parsed flag, verbatim — how a command reads the extra options it
+   * registered through `parseCommon`'s `extra` (see `cmdCheck`), without every
+   * command's private flags having to grow a field on this shared shape. */
+  values: Record<string, unknown>;
 }
 
 /** A usage error (bad flags/values). Carries the one-line `ctxdiff: error: …`
@@ -529,18 +536,18 @@ function pyIntList(arr: number[]): string {
   return "[" + arr.join(", ") + "]";
 }
 
-/** Integer thousands-separator formatting, matching Python's `{n:,}` — used for
- * the `agents` table's token column. */
-function comma(n: number): string {
-  return String(Math.trunc(Math.abs(n)))
-    .replace(/\B(?=(\d{3})+(?!\d))/g, ",")
-    .replace(/^/, n < 0 ? "-" : "");
-}
-
 /** Python `int(str)` acceptance: optional surrounding whitespace, optional
  * sign, then decimal digits. Rejects "abc", "1.5", "", "0x10" — matching
  * argparse's `type=int`. */
 const INT_RE = /^\s*[+-]?\d+\s*$/;
+
+/** The `--max-*-pct` grammar: optional whitespace, optional sign, then ASCII
+ * decimal digits with an optional fractional part (or a bare fraction).
+ * Narrower than `Number()`/`float()` on purpose — both also accept `Infinity`,
+ * `NaN`, `1e4` and (in Python) non-ASCII decimal digits, none of which is a
+ * percentage anyone means to type, and each of which the two CLIs would then
+ * have to agree about. Mirrors Python `_FLOAT_RE`. */
+const FLOAT_RE = /^\s*[+-]?(\d+(\.\d*)?|\.\d+)\s*$/;
 
 /** Reformat a `node:util` parseArgs error into a Python-style
  * `ctxdiff: error: …` message. Unknown options mirror argparse's top-level
@@ -571,28 +578,34 @@ const ALL_SELECTORS: SelectorFlag[] = ["turn", "agent", "session"];
 const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
 
 /**
- * Rewrite `--turn -1` into `--turn=-1` before parsing.
+ * Rewrite `--turn -1` (and `--max-growth -5`, and every other numeric flag
+ * named in `flags`) into the `--flag=value` form before parsing.
  *
  * Why: `parseArgs` treats ANY token starting with `-` as an option, so a
- * negative turn value fails with "expected one argument" (exit 2) where
- * argparse — which, having no options that look like negative numbers, applies
- * its negative-number heuristic — accepts `-1` as the value and reports
- * "turn -1 not found" (exit 1). The `=` form is the same thing `parseArgs`
- * would have done had the value not begun with a dash. Using argparse's own
- * matcher also routes `--turn -1.5` to the int check, so it fails with Python's
- * "invalid int value: '-1.5'" rather than a parser error about a missing value.
+ * negative value fails with "expected one argument" (exit 2) where argparse —
+ * which, having no options that look like negative numbers, applies its
+ * negative-number heuristic — accepts `-1` as the VALUE and goes on to report
+ * what is actually wrong with it ("turn -1 not found", "--max-growth cannot be
+ * negative"). The `=` form is the same thing `parseArgs` would have done had
+ * the value not begun with a dash. Using argparse's own matcher also routes
+ * `--turn -1.5` to the int check, so it fails with Python's "invalid int
+ * value: '-1.5'" rather than a parser error about a missing value.
+ *
+ * Every numeric flag gets this treatment rather than just `--turn`, because a
+ * negative number is exactly as typable — and exactly as worth a real error
+ * message — on `--max-context -1` as it is on `--turn -1`.
  *
  * Scanning stops at a bare `--`, exactly as argparse's does.
  */
-function joinNegativeTurnValues(args: string[]): string[] {
+function joinNegativeNumberValues(args: string[], flags: string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--") {
       out.push(...args.slice(i));
       break;
     }
-    if (args[i] === "--turn" && i + 1 < args.length && NEGATIVE_NUMBER.test(args[i + 1])) {
-      out.push(`--turn=${args[i + 1]}`);
+    if (flags.includes(args[i]) && i + 1 < args.length && NEGATIVE_NUMBER.test(args[i + 1])) {
+      out.push(`${args[i]}=${args[i + 1]}`);
       i++;
       continue;
     }
@@ -623,27 +636,62 @@ function joinNegativeTurnValues(args: string[]): string[] {
  */
 function parseCommon(
   rest: string[],
-  opts: { repeatable?: boolean; only?: SelectorFlag[] } = {},
+  opts: {
+    repeatable?: boolean;
+    only?: SelectorFlag[];
+    /** Flags THIS command adds on top of the shared selectors (`check`'s
+     * thresholds). Registered here rather than in a private parser so those
+     * commands still get `--project`/`--run`/positional resolution and the
+     * shared unknown-flag → exit 2 path for free. */
+    extra?: Record<string, { type: "string" | "boolean" }>;
+    /** Which of `extra`'s flags take a NUMBER, and so may legitimately be
+     * given a negative value — see `joinNegativeNumberValues`. `--turn` is
+     * added automatically when this command registers it. */
+    numeric?: string[];
+    /** Whether a leading positional is accepted as the project path. Default
+     * true, matching the commands whose Python subparser registers one.
+     *
+     * `check` sets it false because Python's `check` subparser registers NO
+     * positional, so `ctxdiff check --require-stable-prefix false` is exit 2
+     * there ("unrecognized arguments: false"). Adopting the stray token as
+     * `--project` instead — which is what a shared positional rule does —
+     * makes the two CLIs disagree on both the exit code and the report, and
+     * silently swallows a typo'd boolean in exactly the command whose job is to
+     * not swallow things. */
+    positional?: boolean;
+  } = {},
 ): ParsedArgs {
   const repeatable = opts.repeatable === true;
   const only = opts.only ?? ALL_SELECTORS;
-  const options: Record<string, { type: "string"; multiple?: boolean }> = {
+  const options: Record<string, { type: "string" | "boolean"; multiple?: boolean }> = {
     project: { type: "string" },
     run: { type: "string" },
+    ...(opts.extra ?? {}),
   };
   if (only.includes("turn")) options.turn = { type: "string", multiple: true };
   if (only.includes("agent")) options.agent = { type: "string", multiple: repeatable };
   if (only.includes("session")) options.session = { type: "string", multiple: repeatable };
 
+  const numericFlags = [
+    ...(only.includes("turn") ? ["--turn"] : []),
+    ...(opts.numeric ?? []).map((f) => `--${f}`),
+  ];
   let parsed;
   try {
     parsed = parseArgs({
-      args: only.includes("turn") ? joinNegativeTurnValues(rest) : rest,
+      args: numericFlags.length ? joinNegativeNumberValues(rest, numericFlags) : rest,
       options,
       allowPositionals: true,
     });
   } catch (err) {
     throw usageErrorFromParse(err);
+  }
+  if (opts.positional === false && parsed.positionals.length) {
+    // argparse's own wording for a token no parser claimed, joined the way
+    // argparse joins several of them.
+    throw new UsageError(
+      `ctxdiff: error: unrecognized arguments: ${parsed.positionals.join(" ")}`,
+    );
   }
   const rawTurns = (parsed.values.turn as string[] | undefined) ?? [];
   const turns: TurnArg[] = [];
@@ -663,6 +711,7 @@ function parseCommon(
       (parsed.values.project as string | undefined) ??
       (parsed.values.run as string | undefined) ??
       (parsed.positionals[0] as string | undefined),
+    values: parsed.values as Record<string, unknown>,
   };
 }
 
@@ -1076,6 +1125,218 @@ async function cmdCache(rest: string[]): Promise<number> {
   }
 }
 
+// --- check ------------------------------------------------------------------------
+
+// The assertion flags, in the order the "you asked for nothing" error lists
+// them — the same order the report prints its rows in, so the message reads as
+// a menu of what the command can do rather than an arbitrary list. Mirrors
+// Python `_ASSERTION_FLAGS`.
+const ASSERTION_FLAGS = [
+  "--max-context",
+  "--max-context-pct",
+  "--require-stable-prefix",
+  "--no-dead-schemas",
+  "--max-growth",
+  "--max-growth-pct",
+];
+
+/** Read one integer threshold flag, or null when it was not passed. Rejects
+ * anything Python's narrowed `_turn_int` rejects, with the same wording, so a
+ * typo fails the same way in both CLIs. */
+function intFlag(values: Record<string, unknown>, name: string): number | null {
+  const raw = values[name] as string | undefined;
+  if (raw === undefined) return null;
+  if (!INT_RE.test(raw)) {
+    throw new UsageError(`ctxdiff: error: argument --${name}: invalid int value: '${raw}'`);
+  }
+  return parseInt(raw.trim(), 10);
+}
+
+/** Read one percentage threshold flag, or null when it was not passed. Mirrors
+ * Python's `_pct_float` narrowing (see `FLOAT_RE`). */
+function pctFlag(values: Record<string, unknown>, name: string): number | null {
+  const raw = values[name] as string | undefined;
+  if (raw === undefined) return null;
+  if (!FLOAT_RE.test(raw)) {
+    throw new UsageError(`ctxdiff: error: argument --${name}: invalid float value: '${raw}'`);
+  }
+  return parseFloat(raw.trim());
+}
+
+/**
+ * Turn `check`'s flags into a `Thresholds`, rejecting every combination that
+ * cannot mean what it says. Throws `SelectionError` (→ exit 2, message printed
+ * verbatim) — these are usage errors: the flags as given cannot be acted on.
+ * Mirrors Python `_check_thresholds`, message for message.
+ *
+ * The four rules, and why each is an error rather than a shrug:
+ *
+ * 1. NO assertion at all is refused. `ctxdiff check` with no thresholds would
+ *    otherwise exit 0 having verified nothing — a green tick in CI that means
+ *    "nobody asked a question", which is the exact failure this command exists
+ *    to prevent.
+ * 2. `--max-context-pct` without `--context-window` is refused: the percentage
+ *    has no denominator. ctxdiff deliberately ships no model→window table
+ *    (windows differ per model and per provider and change under you), so the
+ *    window is the user's to supply.
+ * 3. `--context-window` without `--max-context-pct` is refused too — nothing
+ *    would consume it, and silently ignoring a flag someone typed is how a CI
+ *    gate ends up asserting less than its author believes.
+ * 4. A limit outside its legal range is refused: the two absolute budgets and
+ *    the percentage must be POSITIVE (a zero window is a division by zero),
+ *    while the two growth limits may legitimately be zero — "this context must
+ *    not grow at all" is a real thing to assert.
+ */
+function checkThresholds(values: Record<string, unknown>): Thresholds {
+  // Built first so "was anything asked for?" is answered by the analyzer's own
+  // `anyRequested` — the single definition of that question, rather than a
+  // second copy here that could fall out of step the next time a flag is added.
+  const thresholds: Thresholds = {
+    maxContext: intFlag(values, "max-context"),
+    contextWindow: intFlag(values, "context-window"),
+    maxContextPct: pctFlag(values, "max-context-pct"),
+    requireStablePrefix: values["require-stable-prefix"] === true,
+    noDeadSchemas: values["no-dead-schemas"] === true,
+    maxGrowth: intFlag(values, "max-growth"),
+    maxGrowthPct: pctFlag(values, "max-growth-pct"),
+  };
+  const { maxContext, contextWindow, maxContextPct, maxGrowth, maxGrowthPct } = thresholds;
+
+  if (!anyRequested(thresholds)) {
+    throw new SelectionError(
+      "ctxdiff check: nothing to assert — pass at least one of " + ASSERTION_FLAGS.join(", "),
+    );
+  }
+  if (maxContextPct !== null && contextWindow === null) {
+    throw new SelectionError(
+      "ctxdiff check: --max-context-pct needs a denominator — pass " +
+        "--context-window N (ctxdiff ships no model→window table by design, " +
+        "so the window is yours to state)",
+    );
+  }
+  if (contextWindow !== null && maxContextPct === null) {
+    throw new SelectionError(
+      "ctxdiff check: --context-window is only used by --max-context-pct " +
+        "— pass that too, or use --max-context N for an absolute budget",
+    );
+  }
+  // Integer and percentage limits are reported back in their own spelling — a
+  // bare integer for the token budgets, one decimal for the percentages, the
+  // same way every percentage in the report itself is written.
+  for (const [flag, value] of [
+    ["--max-context", maxContext],
+    ["--context-window", contextWindow],
+  ] as [string, number | null][]) {
+    if (value !== null && value <= 0) {
+      throw new SelectionError(`ctxdiff check: ${flag} must be greater than 0 (got ${value})`);
+    }
+  }
+  if (maxContextPct !== null && maxContextPct <= 0) {
+    throw new SelectionError(
+      `ctxdiff check: --max-context-pct must be greater than 0 (got ${maxContextPct.toFixed(1)})`,
+    );
+  }
+  if (maxGrowth !== null && maxGrowth < 0) {
+    throw new SelectionError(`ctxdiff check: --max-growth cannot be negative (got ${maxGrowth})`);
+  }
+  if (maxGrowthPct !== null && maxGrowthPct < 0) {
+    throw new SelectionError(
+      `ctxdiff check: --max-growth-pct cannot be negative (got ${maxGrowthPct.toFixed(1)})`,
+    );
+  }
+  return thresholds;
+}
+
+/**
+ * `ctxdiff check [assertions] [--project P] [--session S] [--agent A]`: assert a
+ * context budget, and exit non-zero when it is blown so CI fails the build.
+ *
+ * Exit codes, matching the convention every other subcommand follows — **0**
+ * every requested assertion passed; **1** at least one was violated (or the
+ * trace could not be read, or the session held nothing to check); **2** a usage
+ * error (an impossible flag combination, an unresolvable `--session`/`--agent`).
+ *
+ * Order matters: the flags are validated BEFORE any store is opened, so a
+ * malformed check fails the same way whether or not a trace happens to exist.
+ *
+ * An EMPTY session (or an `--agent` slice with no calls) exits 1 rather than
+ * reporting a table of vacuous passes: a check that examined zero turns has
+ * proved nothing, and a CI gate that greens on "there was no trace" is worse
+ * than no gate at all. Mirrors Python `_cmd_check`.
+ */
+async function cmdCheck(rest: string[]): Promise<number> {
+  // No `--turn`: a budget is a property of a whole run, and a check scoped to a
+  // single turn could not answer "did ANY turn blow the budget". Python's
+  // subparser registers none either, so passing one is exit 2 in both.
+  const args = parseCommon(rest, {
+    only: ["agent", "session"],
+    // Python's `check` subparser takes no positional, so a stray token here is
+    // a usage error in both CLIs rather than a silently adopted project path.
+    positional: false,
+    extra: {
+      "max-context": { type: "string" },
+      "context-window": { type: "string" },
+      "max-context-pct": { type: "string" },
+      "require-stable-prefix": { type: "boolean" },
+      "no-dead-schemas": { type: "boolean" },
+      "max-growth": { type: "string" },
+      "max-growth-pct": { type: "string" },
+    },
+    numeric: [
+      "max-context",
+      "context-window",
+      "max-context-pct",
+      "max-growth",
+      "max-growth-pct",
+    ],
+  });
+
+  let thresholds: Thresholds;
+  try {
+    thresholds = checkThresholds(args.values);
+  } catch (err) {
+    if (err instanceof SelectionError) return reportSelectionError(err);
+    throw err; // a UsageError: `main` turns it into exit 2 with its own message
+  }
+
+  const session = args.sessions.length ? args.sessions[args.sessions.length - 1] : null;
+  const agent = args.agents.length ? args.agents[args.agents.length - 1] : null;
+  let opened;
+  try {
+    opened = await openSession(args.project, session);
+  } catch (err) {
+    return reportCommandFailure(err);
+  }
+  const { reader: ct, sessionId, handle } = opened;
+  try {
+    try {
+      checkAgentFilter(ct, sessionId, agent, handle.discovered);
+    } catch (err) {
+      return reportCommandFailure(err);
+    }
+    const report = analyzeCheck(ct, thresholds, agent);
+    if (report.turnsAnalyzed === 0) {
+      const where = agent !== null ? `agent '${agent}'` : "this session";
+      process.stderr.write(
+        `ctxdiff check: no calls in ${where} — nothing to check (did the run capture?)\n`,
+      );
+      return 1;
+    }
+    // The header names the session (and, when the project was DISCOVERED rather
+    // than named, the file it came from) with the same `sessionWhere` spelling
+    // every selector error uses — so a CI log records which trace produced the
+    // verdict, and the newest-.ctrace default can never green a build on a file
+    // nobody meant to check.
+    process.stdout.write(
+      renderCheckReport(report, sessionWhere(sessionId, handle.discovered)) + "\n",
+    );
+    return checkPassed(report) ? 0 : 1;
+  } finally {
+    ct.close();
+    await handle.close();
+  }
+}
+
 // --- discovery: sessions / agents ------------------------------------------------
 
 const EMPTY_CWD = "no .ctrace files in the current directory";
@@ -1474,6 +1735,7 @@ const USAGE =
   "  diff --turn N --turn M   git-style block diff between two turns\n" +
   "  tokens [--turn N]        token heatmap + schema-bloat report\n" +
   "  cache                    prefix-stability report + wasted-spend estimate\n" +
+  "  check [assertions]       assert context budgets and fail the build (CI gate)\n" +
   "  sessions                 list the sessions ctxdiff can see\n" +
   "  agents                   list every agent in the project, across all sessions\n" +
   "  view                     open a self-contained HTML dashboard in your browser\n" +
@@ -1495,6 +1757,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdTokens(rest);
       case "cache":
         return await cmdCache(rest);
+      case "check":
+        return await cmdCheck(rest);
       case "sessions":
       // `runs` is the HIDDEN alias of `sessions`. The command was renamed once a
       // `.ctrace` became a project holding many runs, but every existing script,

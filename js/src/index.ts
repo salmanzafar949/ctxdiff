@@ -80,8 +80,16 @@ export type {
   UsageTotals,
   RunTokens,
 } from "./analyze/tokens.js";
-export { analyzeCache } from "./analyze/cache.js";
+export { analyzeCache, groupBreaks, pairsDenominator } from "./analyze/cache.js";
 export type { PrefixBreak, CacheReport } from "./analyze/cache.js";
+export {
+  analyzeCheck,
+  checkPassed,
+  failedAssertions,
+  anyRequested,
+  ASSERTION_ORDER,
+} from "./analyze/check.js";
+export type { Thresholds, AssertionResult, CheckReport } from "./analyze/check.js";
 export { listFileSessions, listFileCalls } from "./analyze/sessions.js";
 export type { FileSessions } from "./analyze/sessions.js";
 export {
@@ -92,6 +100,7 @@ export {
   renderUsageSummary,
   renderAgentSummary,
   renderCacheReport,
+  renderCheckReport,
   renderSessionsList,
   renderAgentsList,
 } from "./render.js";

@@ -8,7 +8,8 @@ from __future__ import annotations
 import os
 import sys
 
-from ctxdiff.analyze.cache import CacheReport, PrefixBreak
+from ctxdiff.analyze.cache import CacheReport, group_breaks, pairs_denominator
+from ctxdiff.analyze.check import NAME_WIDTH, CheckReport
 from ctxdiff.analyze.differ import TurnDiff
 from ctxdiff.analyze.tokens import BloatReport, CallTokens, RunTokens, UsageTotals
 
@@ -268,23 +269,6 @@ def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
     return "\n\n".join(sections)
 
 
-def _group_breaks(breaks: list[PrefixBreak]) -> list[list[PrefixBreak]]:
-    """Group PrefixBreaks that describe the "same" underlying culprit —
-    (agent, culprit_kind, culprit_label, divergent_position) — into one list
-    per distinct culprit, in first-seen order. `agent` is part of the key so
-    two agents breaking the same way at the same slot stay SEPARATE warnings
-    (each carries its own agent chip). Grouping deliberately ignores the
-    per-pair `detail`/`culprit_snippet` text (a changing timestamp's exact
-    before/after values differ every pair by definition) — what makes two
-    breaks "the same warning" is that the same agent's same slot keeps
-    breaking the same way, not that the literal diff text is identical."""
-    groups: dict[tuple[str | None, str, str, int], list[PrefixBreak]] = {}
-    for b in breaks:
-        key = (b.agent, b.culprit_kind, b.culprit_label, b.divergent_position)
-        groups.setdefault(key, []).append(b)
-    return list(groups.values())
-
-
 def render_cache_report(report: CacheReport) -> str:
     """Render `ctxdiff cache`'s full output (spec §6.4/§7.1):
 
@@ -316,17 +300,13 @@ def render_cache_report(report: CacheReport) -> str:
             lines.append(report.estimated_waste_note)
         return "\n".join(lines)
 
-    for group in _group_breaks(report.breaks):
+    for group in group_breaks(report.breaks):
         rep = group[0]
         count = len(group)
-        # Denominator: when the break is attributed to a specific agent and the
-        # run was analyzed per-agent, use THAT agent's own pair count (a
-        # researcher breaking on both of its 2 pairs is "2/2", not "2/3" of a
-        # run that also includes a stable writer). Fall back to the run-wide
-        # count for an unlabeled break or a single-timeline run.
-        denom = report.pairs_analyzed
-        if rep.agent is not None and report.pairs_by_agent:
-            denom = report.pairs_by_agent.get(rep.agent, report.pairs_analyzed)
+        # Denominator: THAT agent's own pair count when the break is attributed
+        # to one and the run was analyzed per-agent, else the run-wide count.
+        # Shared with `ctxdiff check` so both report the same frequency.
+        denom = pairs_denominator(report, rep)
         frequency = (
             f"breaks the prefix on every turn ({count}/{denom} pairs)"
             if count == denom else
@@ -350,6 +330,63 @@ def render_cache_report(report: CacheReport) -> str:
 
     if report.fix_hint:
         lines.append(_paint(f"hint: {report.fix_hint}", _DIM, enabled))
+
+    return "\n".join(lines)
+
+
+def render_check_report(report: CheckReport, source: str | None = None) -> str:
+    """Render `ctxdiff check`'s PASS/FAIL table — the thing a CI log shows and
+    a reviewer reads without opening the trace.
+
+    Layout, top to bottom:
+
+    - a scope header naming how many turns were checked, which agent (when the
+      check was scoped to one), and WHAT WAS READ — `source`, the caller's
+      `session <short id>` label, qualified by the filename when the trace was
+      discovered rather than named. That last part is not decoration: with no
+      `--project` the CLI reads the most recently modified `*.ctrace` in the
+      working directory (the GitHub Action's default), so an unrelated newer
+      trace can be checked, pass, and leave a report indistinguishable from one
+      over the intended run. A verdict that does not say what it read cannot be
+      audited;
+    - one status line per REQUESTED assertion, in the analyzer's fixed order,
+      as `PASS`/`FAIL` (green/red) + the assertion's name padded to a common
+      column + its summary, which always carries the actual value beside the
+      threshold — a passing check that reports its high-water mark is what lets
+      someone watch a budget approach its limit over successive PRs, instead of
+      only finding out on the day it breaks;
+    - beneath each FAILING assertion, its violation lines indented two spaces,
+      one per offending turn/agent/block;
+    - a blank line, then a verdict line (green on a clean pass, red otherwise).
+
+    Every string below the status column is composed by `analyze/check.py`;
+    this function only decides columns and color, exactly as the other
+    renderers do."""
+    enabled = _color_enabled()
+    lines: list[str] = []
+
+    scope = f" · agent {report.agent}" if report.agent is not None else ""
+    origin = f" · {source}" if source else ""
+    turn_word = "turn" if report.turns_analyzed == 1 else "turns"
+    lines.append(
+        f"ctxdiff check · {report.turns_analyzed} {turn_word}{scope}{origin}")
+
+    for a in report.assertions:
+        status = _paint("PASS", _GREEN, enabled) if a.passed else _paint("FAIL", _RED, enabled)
+        lines.append(f"{status}  {a.name:<{NAME_WIDTH}}  {a.summary}")
+        for detail in a.details:
+            lines.append(f"  {detail}")
+
+    lines.append("")
+    total = len(report.assertions)
+    if report.passed:
+        verdict = f"check passed · {total} assertion{'' if total == 1 else 's'}"
+        lines.append(_paint(verdict, _GREEN, enabled))
+    else:
+        failed = len(report.failed)
+        verdict = (f"check FAILED · {failed} of {total} "
+                   f"assertion{'' if total == 1 else 's'} failed")
+        lines.append(_paint(verdict, _RED, enabled))
 
     return "\n".join(lines)
 

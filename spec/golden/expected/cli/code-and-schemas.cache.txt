@@ -1,6 +1,6 @@
 ⚠ warning: [agent:reviewer] [system·modified] breaks the prefix on 1/2 turn pairs
   'You are a senior code reviewer. Point at the defect, name the mechanism, and pro…'
-  modified system block — first difference at char 154: '' → ' Always show a runnable diff.'
+  modified system block — first difference at char 154: '' → 'Always show a runnable diff.'
 
 stable prefix (min): 369 tokens
 re-billed: 388 tokens

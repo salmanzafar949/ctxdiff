@@ -1,0 +1,7 @@
+ctxdiff check · 3 turns · session a20000000000
+PASS  max-context            peak 361 tok at turn 3 · limit 1,000
+PASS  require-stable-prefix  prefix stable across all 2 turn pairs · min stable prefix 97 tok
+PASS  no-dead-schemas        no tool schemas registered
+PASS  max-growth             peak growth 171 tok at turn 2 · limit 200
+
+check passed · 4 assertions

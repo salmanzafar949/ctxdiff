@@ -1,0 +1,16 @@
+ctxdiff check · 6 turns · session c10000000000
+FAIL  max-context            4 turns unmeasured · peak 2,936 tok (~approx) at turn 2 · limit 5,000
+  turn 1 [agent:driver] · 896 tok (~approx) · 1 block of unknown token cost — a floor, not a measurement · limit 5,000
+  turn 2 [agent:driver] · 2,936 tok (~approx) · 2 blocks of unknown token cost — a floor, not a measurement · limit 5,000
+  turn 3 [agent:reviewer] · 672 tok (~approx) · 2 blocks of unknown token cost — a floor, not a measurement · limit 5,000
+  turn 4 [agent:reviewer] · 1,093 tok (~approx) · 1 block of unknown token cost — a floor, not a measurement · limit 5,000
+FAIL  max-context-pct        4 turns unmeasured · peak 2.9% (~approx) of 100,000 tok window at turn 2 · limit 50.0% (50,000 tok)
+  turn 1 [agent:driver] · 896 tok (~approx) · 0.9% of 100,000 tok window · 1 block of unknown token cost — a floor, not a measurement · limit 50.0% (50,000 tok)
+  turn 2 [agent:driver] · 2,936 tok (~approx) · 2.9% of 100,000 tok window · 2 blocks of unknown token cost — a floor, not a measurement · limit 50.0% (50,000 tok)
+  turn 3 [agent:reviewer] · 672 tok (~approx) · 0.7% of 100,000 tok window · 2 blocks of unknown token cost — a floor, not a measurement · limit 50.0% (50,000 tok)
+  turn 4 [agent:reviewer] · 1,093 tok (~approx) · 1.1% of 100,000 tok window · 1 block of unknown token cost — a floor, not a measurement · limit 50.0% (50,000 tok)
+FAIL  max-growth             2 turns unmeasured · peak growth 2,040 tok (~approx) at turn 2 · limit 5,000
+  turn 1 → turn 2 [agent:driver] · +2,040 tok (~approx) (896 → 2,936) · 3 blocks of unknown token cost — a floor, not a measurement · limit 5,000
+  turn 3 → turn 4 [agent:reviewer] · +421 tok (~approx) (672 → 1,093) · 3 blocks of unknown token cost — a floor, not a measurement · limit 5,000
+
+check FAILED · 3 of 3 assertions failed

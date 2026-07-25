@@ -100,7 +100,12 @@ beforeAll(() => {
   process.env.NO_COLOR = "1";
 });
 
-const CASES: { name: string; argv: string[] }[] = [];
+/** One success-path case. `code` is the exit status BOTH CLIs must return —
+ * still 0 for every read command, but `ctxdiff check` exits 1 on a violated
+ * budget while printing its report to stdout, so the expected status has to be
+ * stated rather than assumed. A case that exits differently in the two SDKs is
+ * a failure even when the text matches: CI reads the exit code, not the text. */
+const CASES: { name: string; argv: string[]; code?: number }[] = [];
 beforeAll(() => {
   CASES.push(
     { name: "diff turn 1→2 (append growth)", argv: ["diff", "--turn", "1", "--turn", "2", "--run", fx.multiturn] },
@@ -147,6 +152,45 @@ beforeAll(() => {
     { name: "tokens --turn ' 2 '", argv: ["tokens", "--turn", " 2 ", "--run", fx.multiturn] },
     { name: "tokens --turn +2", argv: ["tokens", "--turn", "+2", "--run", fx.multiturn] },
     { name: "tokens --turn 002", argv: ["tokens", "--turn", "002", "--run", fx.multiturn] },
+
+    // --- `ctxdiff check`: the CI gate ----------------------------------------
+    // Both the REPORT and the EXIT CODE are compared. A workflow's build turns
+    // red on the exit code and its reviewer reads the report, so the two SDKs
+    // disagreeing about either would mean the same trace passing in one
+    // language's CI and failing in the other's.
+    { name: "check all-pass (three assertions)", argv: ["check", "--run", fx.multiagent, "--max-context", "1000000", "--require-stable-prefix", "--no-dead-schemas"] },
+    { name: "check max-context violation", code: 1, argv: ["check", "--run", fx.multiturn, "--max-context", "1"] },
+    { name: "check max-context-pct violation", code: 1, argv: ["check", "--run", fx.multiturn, "--context-window", "100", "--max-context-pct", "12.5"] },
+    { name: "check max-context-pct pass", argv: ["check", "--run", fx.multiturn, "--context-window", "1000000", "--max-context-pct", "12.5"] },
+    { name: "check require-stable-prefix violation (grouped culprit)", code: 1, argv: ["check", "--run", fx.dynamic, "--require-stable-prefix"] },
+    { name: "check require-stable-prefix pass", argv: ["check", "--run", fx.multiagent, "--require-stable-prefix"] },
+    { name: "check no-dead-schemas violation", code: 1, argv: ["check", "--run", fx.multiturn, "--no-dead-schemas"] },
+    { name: "check no-dead-schemas pass (no schemas at all)", argv: ["check", "--run", fx.multiagent, "--no-dead-schemas"] },
+    { name: "check max-growth violation", code: 1, argv: ["check", "--run", fx.multiturn, "--max-growth", "0"] },
+    { name: "check max-growth-pct violation", code: 1, argv: ["check", "--run", fx.multiturn, "--max-growth-pct", "0"] },
+    // Per-agent growth pairing: the interleaved timeline must pair within each
+    // agent, never across the hand-off, in both SDKs.
+    { name: "check max-growth multiagent (per-agent pairing)", code: 1, argv: ["check", "--run", fx.multiagent, "--max-growth", "0"] },
+    { name: "check --agent scoping (fails)", code: 1, argv: ["check", "--run", fx.multiagent, "--agent", "researcher", "--max-context", "1"] },
+    { name: "check --agent scoping (passes)", argv: ["check", "--run", fx.multiagent, "--agent", "writer", "--max-context", "1000000"] },
+    { name: "check --session --agent", code: 1, argv: ["check", "--project", fx.project, "--session", good, "--agent", "researcher", "--max-context", "1", "--max-growth", "0"] },
+    // Every assertion at once, so the fixed report ORDER is compared too.
+    { name: "check every assertion at once", code: 1, argv: ["check", "--run", fx.multiturn, "--max-context", "1", "--context-window", "100", "--max-context-pct", "10", "--require-stable-prefix", "--no-dead-schemas", "--max-growth", "0", "--max-growth-pct", "0"] },
+    // A one-turn run: no pairs to check, no growth to measure — both SDKs must
+    // say so rather than claiming a stability they never measured.
+    { name: "check single-turn run (nothing to pair)", argv: ["check", "--project", fx.project, "--session", good, "--agent", "writer", "--require-stable-prefix", "--max-growth", "0"] },
+    // UNMEASURED turns: every turn holds a remote-URL image whose cost cannot
+    // be known, so the stored totals (4 and 8 tok against a provider-reported
+    // 800 and 1,600) are floors. Both SDKs must REFUSE the comparison — exit 1
+    // with the same violation lines — rather than passing a 1,600-token turn
+    // under a 500-token budget.
+    { name: "check unmeasured turns refuse a max-context budget", code: 1, argv: ["check", "--run", fx.unmeasured, "--max-context", "500"] },
+    { name: "check unmeasured turns refuse a percentage budget", code: 1, argv: ["check", "--run", fx.unmeasured, "--context-window", "10000", "--max-context-pct", "50"] },
+    { name: "check unmeasured turns refuse a growth budget", code: 1, argv: ["check", "--run", fx.unmeasured, "--max-growth", "1000", "--max-growth-pct", "500"] },
+    // A four-agent fan-out: nothing can be paired, and both SDKs must say WHY
+    // in the same words — "fewer than 2 turns" over four turns is the wording
+    // that hides a no-op assertion.
+    { name: "check fan-out (4 agents, 1 turn each) — no pairs", argv: ["check", "--run", fx.fanout, "--require-stable-prefix", "--max-growth", "0", "--max-growth-pct", "0"] },
   );
 });
 
@@ -318,16 +362,105 @@ beforeAll(() => {
       core: "SQLiteStore has no single file to read",
       exactStderr: true,
     },
+    // --- `ctxdiff check`'s usage errors --------------------------------------
+    // Every one of these is a message ctxdiff composes itself (not argparse
+    // chrome), so stderr is compared byte for byte: a CI gate that refuses to
+    // run must explain itself identically in both SDKs, or a workflow debugged
+    // against one is undebuggable against the other.
+    {
+      name: "check with no assertions → exit 2, lists every flag",
+      argv: ["check", "--run", fx.multiturn],
+      core: "nothing to assert — pass at least one of",
+      exactStderr: true,
+    },
+    {
+      name: "check --max-context-pct with no window → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--max-context-pct", "80"],
+      core: "--max-context-pct needs a denominator",
+      exactStderr: true,
+    },
+    {
+      name: "check --context-window with no percentage → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--max-context", "10", "--context-window", "80"],
+      core: "--context-window is only used by --max-context-pct",
+      exactStderr: true,
+    },
+    {
+      name: "check --max-context 0 → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--max-context", "0"],
+      core: "--max-context must be greater than 0 (got 0)",
+      exactStderr: true,
+    },
+    {
+      name: "check --max-context-pct 0 → exit 2, one-decimal echo",
+      argv: ["check", "--run", fx.multiturn, "--max-context-pct", "0", "--context-window", "10"],
+      core: "--max-context-pct must be greater than 0 (got 0.0)",
+      exactStderr: true,
+    },
+    {
+      name: "check a NEGATIVE --max-growth is a value, not an option → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--max-growth", "-5"],
+      core: "--max-growth cannot be negative (got -5)",
+      exactStderr: true,
+    },
+    {
+      name: "check --max-growth-pct -2.5 → exit 2, one-decimal echo",
+      argv: ["check", "--run", fx.multiturn, "--max-growth-pct", "-2.5"],
+      core: "--max-growth-pct cannot be negative (got -2.5)",
+      exactStderr: true,
+    },
+    {
+      name: "check non-int threshold → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--max-context", "abc"],
+      core: "argument --max-context: invalid int value: 'abc'",
+    },
+    {
+      name: "check exponent-notation percentage → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--max-context-pct", "1e5", "--context-window", "10"],
+      core: "argument --max-context-pct: invalid float value: '1e5'",
+    },
+    {
+      name: "check --turn → exit 2 (a budget is a whole-run property)",
+      argv: ["check", "--run", fx.multiturn, "--turn", "1", "--max-context", "10"],
+      core: "unrecognized arguments: --turn",
+    },
+    {
+      name: "check unknown agent → exit 2 + agent listing",
+      argv: ["check", "--project", fx.project, "--session", good, "--agent", "nope", "--max-context", "10"],
+      core: "available agents:",
+      exactStderr: true,
+    },
+    {
+      name: "check ambiguous session → exit 2 + session listing",
+      argv: ["check", "--project", fx.project, "--max-context", "10"],
+      core: "this project holds 2 sessions — pass --session to pick one:",
+      exactStderr: true,
+    },
+    // A stray positional. Python's `check` subparser registers none, so this is
+    // argparse's "unrecognized arguments" — and the JS CLI must not quietly
+    // adopt it as `--project`, which turned a mistyped boolean into a full
+    // report over a different (or nonexistent) trace.
+    {
+      name: "check stray positional (a value for a store_true flag) → exit 2",
+      argv: ["check", "--run", fx.multiturn, "--require-stable-prefix", "false"],
+      core: "unrecognized arguments: false",
+    },
+    {
+      name: "check two stray positionals → exit 2, both named",
+      argv: ["check", "--run", fx.multiturn, "--no-dead-schemas", "yes", "please"],
+      core: "unrecognized arguments: yes please",
+    },
   );
 });
 
 describe.skipIf(!hasVenv)("cross-language analyzer conformance (JS output === Python output)", () => {
-  it("diff / tokens / cache produce byte-identical output to the Python CLI", async () => {
+  it("diff / tokens / cache / check produce byte-identical output to the Python CLI", async () => {
     for (const c of CASES) {
+      const expected = c.code ?? 0;
       const js = await runJs(c.argv);
       const py = runPy(c.argv);
-      expect(py.code, `python failed for ${c.name}`).toBe(0);
-      expect(js.code, `js failed for ${c.name}`).toBe(0);
+      expect(py.code, `python exited ${py.code} for ${c.name}\n${py.err}`).toBe(expected);
+      expect(js.code, `js exited ${js.code} for ${c.name}\n${js.err}`).toBe(expected);
       expect(js.out, `mismatch for: ${c.name}`).toBe(py.out);
     }
   });

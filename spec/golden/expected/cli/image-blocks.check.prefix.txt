@@ -1,0 +1,12 @@
+ctxdiff check · 6 turns · session c10000000000
+FAIL  max-context            2 turns over limit · 2 turns unmeasured · peak 2,936 tok (~approx) at turn 2 · limit 1,000
+  turn 2 [agent:driver] · 2,936 tok (~approx) · 1,936 over limit
+  turn 4 [agent:reviewer] · 1,093 tok (~approx) · 93 over limit
+  turn 1 [agent:driver] · 896 tok (~approx) · 1 block of unknown token cost — a floor, not a measurement · limit 1,000
+  turn 3 [agent:reviewer] · 672 tok (~approx) · 2 blocks of unknown token cost — a floor, not a measurement · limit 1,000
+FAIL  require-stable-prefix  3 breaks across 3 turn pairs · 3,965 tok re-billed
+  turn 1 → turn 2 [agent:driver] [user·modified] breaks 1/1 pairs — modified user block — a different image at the same position: sha 53097b… → 51c707…
+  turn 3 → turn 4 [agent:reviewer] [user·modified] breaks 1/1 pairs — modified user block — a different image at the same position: sha ee1b26… → b1d3bc…
+  turn 5 → turn 6 [agent:auditor] [user·modified] breaks 1/1 pairs — modified user block — a different image at the same position: sha 46bf52… → bf121f…
+
+check FAILED · 2 of 2 assertions failed

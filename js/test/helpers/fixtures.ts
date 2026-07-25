@@ -6,6 +6,8 @@
  * feed the cross-language comparison against the Python CLI.
  */
 import { CTrace } from "../../src/store/ctrace.js";
+import { buildBlock } from "../../src/capture/recorder.js";
+import { imageRawBlock } from "../../src/images.js";
 import { contentHash, basicLabel, type CallBlock } from "../../src/models.js";
 import { countTokens } from "../../src/tokenize.js";
 import { join } from "node:path";
@@ -212,6 +214,85 @@ export function writeEdgeTimestamps(dir: string): string {
   return path;
 }
 
+/**
+ * A trace whose every turn carries an image of UNKNOWABLE cost — a remote URL,
+ * which ctxdiff must never fetch — so each call's stored block total is a FLOOR
+ * rather than a measurement.
+ *
+ * This is the false-pass shape in the flesh: the provider bills 800 then 1,600
+ * prompt tokens (recorded verbatim in `usage`), while the blocks sum to 4 and 8,
+ * because the two pictures are stored as zero-token estimates. A `check
+ * --max-context 500` that compared those sums to the budget would print PASS and
+ * exit 0 over a run that used three times the budget. The block is built through
+ * the REAL `imageRawBlock`/`buildBlock` path, so the fixture is evidence about
+ * capture rather than about a hand-written zero.
+ */
+export function writeUnmeasured(dir: string): string {
+  const path = join(dir, "unmeasured.ctrace");
+  const ct = CTrace.create(path, "vision", "openai", "", "2026-07-06T00:00:00Z");
+  const remoteImage = (n: number): CallBlock => {
+    const rb = imageRawBlock(
+      "user",
+      { type: "image_url", image_url: { url: `https://cdn.example.com/shot-${n}.png` } },
+      "openai",
+    )!;
+    const block = buildBlock(rb, "openai");
+    return { block, position: 0, label: "user", labelSource: "heuristic" };
+  };
+  const reposition = (list: CallBlock[]): CallBlock[] =>
+    list.map((cb, position) => ({ ...cb, position }));
+  const turn1 = reposition([...blocks([["user", "message", "look"]]), remoteImage(1)]);
+  const turn2 = reposition([
+    ...turn1,
+    ...blocks([["assistant", "message", "ok"]]),
+    remoteImage(2),
+  ]);
+  ct.recordCall({
+    seq: 1, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 800, completion_tokens: 10, total_tokens: 810 },
+    latencyMs: 100, error: null, callBlocks: turn1, provider: "openai",
+  });
+  ct.recordCall({
+    seq: 2, params: { model: "gpt-4o" },
+    usage: { prompt_tokens: 1600, completion_tokens: 12, total_tokens: 1612 },
+    latencyMs: 110, error: null, callBlocks: turn2, provider: "openai",
+  });
+  ct.close();
+  return path;
+}
+
+/**
+ * A FAN-OUT trace: four turns, four agents, one turn each — a supervisor
+ * dispatching four workers, which is an ordinary agent topology and not an
+ * edge case.
+ *
+ * Nothing here can be paired: pairing is per-agent by design (a hand-off is not
+ * growth and not a cache break), so every adjacent pair is cross-agent and both
+ * `--require-stable-prefix` and `--max-growth` have nothing to measure. The
+ * fixture exists to pin what they SAY about that — reporting "fewer than 2
+ * turns" over a four-turn run is how an assertion that verified nothing goes
+ * unnoticed.
+ */
+export function writeFanout(dir: string): string {
+  const path = join(dir, "fanout.ctrace");
+  const ct = CTrace.create(path, "fanout", "openai", "", "2026-07-07T00:00:00Z");
+  const agents = ["scout", "planner", "coder", "critic"];
+  agents.forEach((agent, i) => {
+    ct.recordCall({
+      seq: i + 1, params: { model: "gpt-4o" },
+      usage: { prompt_tokens: 20 + i, completion_tokens: 4, total_tokens: 24 + i },
+      latencyMs: 100, error: null,
+      callBlocks: blocks([
+        ["system", "message", `You are the ${agent.toUpperCase()}.`],
+        ["user", "message", `Task for the ${agent}.`],
+      ]),
+      agent, step: "work", provider: "openai",
+    });
+  });
+  ct.close();
+  return path;
+}
+
 export function makeFixtures(dir: string): {
   multiturn: string;
   multiagent: string;
@@ -219,6 +300,8 @@ export function makeFixtures(dir: string): {
   bidi: string;
   project: string;
   edge: string;
+  unmeasured: string;
+  fanout: string;
 } {
   return {
     multiturn: writeMultiturn(dir),
@@ -227,5 +310,7 @@ export function makeFixtures(dir: string): {
     bidi: writeBidi(dir),
     project: writeProject(dir),
     edge: writeEdgeTimestamps(dir),
+    unmeasured: writeUnmeasured(dir),
+    fanout: writeFanout(dir),
   };
 }

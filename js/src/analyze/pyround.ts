@@ -1,5 +1,6 @@
 /**
- * CPython-compatible rounding for the two shapes the analyzers/renderers need.
+ * CPython-compatible rounding — and one CPython-compatible number FORMAT — for
+ * the shapes the analyzers/renderers need.
  * Parity requires matching Python's `round`, which is round-HALF-TO-EVEN on the
  * true value of the double (JS `Math.round` is half-up, so it diverges on ties).
  *
@@ -34,4 +35,24 @@ export function pyRoundHalfEven(x: number): number {
   if (frac < 0.5) return floor;
   if (frac > 0.5) return floor + 1;
   return floor % 2 === 0 ? floor : floor + 1;
+}
+
+/**
+ * Integer thousands-separator formatting, matching Python's `{n:,}` — `1234` →
+ * `"1,234"`, `-1234` → `"-1,234"`. The magnitude is truncated toward zero
+ * first, so a float that reached here by arithmetic renders as the integer
+ * Python's `:,` on an int would.
+ *
+ * Lives here, beside the rounding helpers, because it is the same KIND of thing
+ * — a CPython number-formatting rule reproduced once — and because three
+ * separate copies of it (the renderer, the CLI's agent table and now the check
+ * report) is three chances for one of them to drift on the negative branch and
+ * break byte-identity in exactly one command.
+ */
+export function pyComma(n: number): string {
+  const neg = n < 0;
+  const grouped = Math.abs(Math.trunc(n))
+    .toString()
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return neg ? "-" + grouped : grouped;
 }

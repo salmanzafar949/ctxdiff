@@ -249,18 +249,30 @@ def case_argv(case: dict, traces: dict[str, str]) -> list[str]:
     return [arg.replace("{trace}", traces[case["fixture"]]) for arg in case["argv"]]
 
 
-def render_cli_case(case: dict, traces: dict[str, str]) -> str:
-    """Produce one CLI case's stdout, failing loudly on a non-zero exit.
+def case_exit(case: dict) -> int:
+    """The exit code a CLI case is EXPECTED to produce — 0 unless the case says
+    otherwise.
 
-    Every committed case is a SUCCESS path, so a non-zero exit means the case
-    is malformed (or the CLI regressed) — surfacing that as an exception rather
-    than silently golden-ing an error message is what stops a broken case from
-    being frozen into the expectations by the next regeneration."""
+    Almost every case is a success path, but `ctxdiff check` reports a violated
+    budget on stdout and exits 1, and that exit code is the entire point of the
+    command: CI turns a build red on the status, not on the text. So the status
+    is part of the frozen expectation, not something the harness assumes."""
+    return int(case.get("exit", 0))
+
+
+def render_cli_case(case: dict, traces: dict[str, str]) -> str:
+    """Produce one CLI case's stdout, failing loudly on an UNEXPECTED exit.
+
+    A case that exits differently than the manifest declares is malformed (or
+    the CLI regressed) — surfacing that as an exception rather than silently
+    golden-ing whatever came out is what stops a broken case from being frozen
+    into the expectations by the next regeneration."""
+    expected = case_exit(case)
     result = run_cli(case_argv(case, traces))
-    if result.code != 0:
+    if result.code != expected:
         raise RuntimeError(
-            f"golden case {case['name']!r} exited {result.code}\n"
-            f"argv: {case_argv(case, traces)}\nstderr:\n{result.err}")
+            f"golden case {case['name']!r} exited {result.code}, expected "
+            f"{expected}\nargv: {case_argv(case, traces)}\nstderr:\n{result.err}")
     return result.out
 
 

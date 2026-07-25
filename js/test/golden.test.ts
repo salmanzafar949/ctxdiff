@@ -139,7 +139,10 @@ describe("golden corpus — CLI stdout matches the committed expectations", () =
   for (const c of manifest.cli_cases) {
     it(`${c.name}`, async () => {
       const { code, out, err } = await runCli(caseArgv(c, traces));
-      expect(code, `case exited ${code}\nstderr:\n${err}`).toBe(0);
+      // The exit STATUS is part of the expectation, not an assumption: a
+      // `check` case that stopped exiting 1 would still print an identical
+      // report while quietly ceasing to fail anybody's build.
+      expect(code, `case exited ${code}\nstderr:\n${err}`).toBe(c.exit ?? 0);
       expect(out).toBe(readCliGolden(c.name));
     });
   }

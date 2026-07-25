@@ -37,7 +37,17 @@ class CallTokens:
     usage dict from the call's response (provider-shaped, may be None).
     `reconciliation_delta` is provider-reported prompt-side tokens minus our
     own summed total, when a recognizable prompt-token key is present in
-    `provider_usage`; None when there's no usage or no recognizable key."""
+    `provider_usage`; None when there's no usage or no recognizable key.
+
+    `unmeasured_blocks` counts the blocks in this call whose cost is not merely
+    estimated but UNKNOWN: non-empty content that the 'estimate' method priced
+    at zero. The estimator never returns zero for non-empty text (it rounds up
+    to at least one token), so the only way to land here is a block that
+    declined to guess at all — an image whose bytes we refused to fetch, a
+    `file_id` reference, a format the sniffer does not recognize. Those cost the
+    provider real tokens that this total does not contain, which makes
+    `total_tokens` a FLOOR rather than a measurement for such a call. Kept as a
+    count rather than a bool so a report can say how many blocks are missing."""
     seq: int
     total_tokens: int
     approximate: bool
@@ -46,6 +56,9 @@ class CallTokens:
     reconciliation_delta: int | None
     agent: str | None = None  # v2 attribution passthrough from the Call, so the
     step: str | None = None   # CLI/viewer can label a turn's panels [agent·step]
+    unmeasured_blocks: int = 0  # blocks priced at 0 by the estimator despite
+    # carrying content — see the class docstring; `check` refuses to certify a
+    # budget from a total that contains one
 
 
 @dataclass(frozen=True)
@@ -202,15 +215,27 @@ def analyze_call(call: Call, call_blocks: list[CallBlock]) -> CallTokens:
     against provider usage when available. How: a single pass over
     `call_blocks` accumulates per-label token/count totals and notes whether
     any block used the 'estimate' token method; slices are then built from
-    those totals and sorted biggest-first."""
+    those totals and sorted biggest-first.
+
+    The same pass counts UNMEASURED blocks — an 'estimate' block that priced
+    non-empty content at zero tokens. `_estimate_count` rounds any non-empty
+    text up to at least one token, so a zero there is never a small estimate:
+    it is the image pipeline saying "this cost cannot be known" (a remote URL
+    we refused to fetch, a `file_id`, an unrecognized format). Counting them
+    here, in the one place a call's blocks are already walked, is what lets
+    `ctxdiff check` refuse to certify a budget against a total it knows is a
+    floor."""
     label_tokens: dict[str, int] = {}
     label_counts: dict[str, int] = {}
     approximate = False
+    unmeasured = 0
     for cb in call_blocks:
         label_tokens[cb.label] = label_tokens.get(cb.label, 0) + cb.block.token_count
         label_counts[cb.label] = label_counts.get(cb.label, 0) + 1
         if cb.block.token_method == "estimate":
             approximate = True
+            if cb.block.token_count == 0 and cb.block.text:
+                unmeasured += 1
 
     total_tokens = sum(label_tokens.values())
     slices = [
@@ -233,6 +258,7 @@ def analyze_call(call: Call, call_blocks: list[CallBlock]) -> CallTokens:
         reconciliation_delta=_reconciliation_delta(call.usage, total_tokens),
         agent=call.agent,
         step=call.step,
+        unmeasured_blocks=unmeasured,
     )
 
 

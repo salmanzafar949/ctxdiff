@@ -113,8 +113,17 @@ def _truncate(text: str, limit: int = 40) -> str:
     """Shorter truncation for the differing substring embedded in a
     'modified' break's `detail` string — the point there is to show just
     enough of the change to recognize it (e.g. a timestamp), not the whole
-    block."""
-    return text[:limit] + ("…" if len(text) > limit else "")
+    block.
+
+    Flattened first, exactly like `_flatten_snippet`: this substring is
+    CAPTURED TEXT, and `detail` is a single line of a report that ends up
+    inside a markdown fence in the GitHub Action's job summary. A prompt (or a
+    tool schema, or a diff hunk) carrying a newline followed by a run of
+    backticks would close that fence and render contributor-controlled markdown
+    — on a fork pull request, outside-contributor markdown. One line in, one
+    line out, at the source rather than at each display."""
+    flat = " ".join(text.split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
 # --- first-difference extraction (from the differ's inline diff) --------------
@@ -286,6 +295,41 @@ def _attribute_break(
 
 
 # --- waste note + fix hint ------------------------------------------------------
+
+
+def group_breaks(breaks: list[PrefixBreak]) -> list[list[PrefixBreak]]:
+    """Group PrefixBreaks that describe the "same" underlying culprit —
+    (agent, culprit_kind, culprit_label, divergent_position) — into one list
+    per distinct culprit, in first-seen order. `agent` is part of the key so
+    two agents breaking the same way at the same slot stay SEPARATE warnings
+    (each carries its own agent chip). Grouping deliberately ignores the
+    per-pair `detail`/`culprit_snippet` text (a changing timestamp's exact
+    before/after values differ every pair by definition) — what makes two
+    breaks "the same warning" is that the same agent's same slot keeps
+    breaking the same way, not that the literal diff text is identical.
+
+    Public and living beside the analyzer rather than inside a renderer,
+    because it is pure data reduction over CacheReport with no formatting in
+    it, and BOTH consumers need exactly this reduction: `ctxdiff cache`'s
+    warning list and `ctxdiff check --require-stable-prefix`'s violation list.
+    Two copies could drift into collapsing different things and reporting
+    different break counts for one trace."""
+    groups: dict[tuple[str | None, str, str, int], list[PrefixBreak]] = {}
+    for b in breaks:
+        key = (b.agent, b.culprit_kind, b.culprit_label, b.divergent_position)
+        groups.setdefault(key, []).append(b)
+    return list(groups.values())
+
+
+def pairs_denominator(report: CacheReport, brk: PrefixBreak) -> int:
+    """The pair count a break's frequency should be reported AGAINST: when the
+    break is attributed to a named agent and the run was analyzed per-agent,
+    that agent's own pair count — a researcher breaking on both of its 2 pairs
+    is "2/2", not "2/3" of a run that also includes a stable writer. Falls back
+    to the run-wide count for an unlabeled break or a single-timeline run."""
+    if brk.agent is not None and report.pairs_by_agent:
+        return report.pairs_by_agent.get(brk.agent, report.pairs_analyzed)
+    return report.pairs_analyzed
 
 
 def _waste_note(rebilled_tokens_total: int, pairs_analyzed: int) -> str:
