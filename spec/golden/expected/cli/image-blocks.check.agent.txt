@@ -1,0 +1,7 @@
+ctxdiff check · 2 turns · agent driver · session c10000000000
+FAIL  require-stable-prefix  1 break across 1 turn pair · 2,125 tok re-billed
+  turn 1 → turn 2 [agent:driver] [user·modified] breaks 1/1 pairs — modified user block — a different image at the same position: sha 53097b… → 51c707…
+FAIL  max-growth             1 turn over limit · peak growth 2,040 tok (~approx) at turn 2 · limit 500
+  turn 1 → turn 2 [agent:driver] · +2,040 tok (~approx) (896 → 2,936) · limit 500
+
+check FAILED · 2 of 2 assertions failed

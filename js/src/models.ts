@@ -14,12 +14,33 @@ import { createHash } from "node:crypto";
 /**
  * One context unit as an adapter extracts it from a request payload, before
  * token counting or hashing. `kind` is 'message' | 'content_part' |
- * 'tool_schema'; `role` is 'system' | 'user' | 'assistant' | 'tool'.
+ * 'tool_schema' | 'image'; `role` is 'system' | 'user' | 'assistant' | 'tool'.
+ *
+ * The three optional fields exist for blocks whose stored text is a STAND-IN
+ * rather than the content itself — today that means image blocks (see
+ * `src/images.ts`), whose `text` is a descriptor like
+ * `[image 1024×768 · ~765 tok]`. For those, hashing the descriptor would make
+ * two different images collide whenever they happened to share a size, and
+ * tokenizing it would measure the descriptor instead of the picture. So an
+ * adapter may override both:
+ *
+ *   - `hashInput` — what to hash INSTEAD of `text` for identity (for an image, a
+ *     digest of the image bytes, so the same picture is one block however it was
+ *     wrapped and however many turns it survives);
+ *   - `tokenCount` / `tokenMethod` — a pre-computed count INSTEAD of running the
+ *     tokenizer over `text` (for an image, the provider's documented
+ *     vision-token formula, always marked `'estimate'`).
+ *
+ * All three are optional, and absent means "behave exactly as before": hash the
+ * text, tokenize the text. Every pre-existing adapter call site is unchanged.
  */
 export interface RawBlock {
   role: string;
   kind: string;
   text: string;
+  hashInput?: string;
+  tokenCount?: number;
+  tokenMethod?: string;
 }
 
 /**
@@ -55,6 +76,24 @@ export interface Run {
   provider: string;
   models: string[];
   ctxdiffVersion: string;
+}
+
+/**
+ * A one-line summary of one session (one `run` row) in a project `.ctrace`, as
+ * returned by `CTrace.listSessions()` — the shape a session picker lists from.
+ * `agents` is the set of distinct agent labels seen on this session's calls, in
+ * first-appearance order (`[]` for a single-agent/pre-v2 session); `turnCount`
+ * is how many calls it holds. `startedAt` is the raw stored string — use
+ * `parseStartedAt()` for a tz-aware Date. Mirrors Python's `Session`.
+ */
+export interface Session {
+  id: string;
+  project: string;
+  startedAt: string;
+  provider: string;
+  models: string[];
+  agents: string[];
+  turnCount: number;
 }
 
 /** One LLM request/response ('turn'), as stored in the `call` table. */

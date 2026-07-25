@@ -1,0 +1,8 @@
+ctxdiff check · 3 turns · session b00000000000
+PASS  max-context            peak 757 tok at turn 3 · limit 1,000
+FAIL  require-stable-prefix  1 break across 2 turn pairs · 388 tok re-billed
+  turn 2 → turn 3 [agent:reviewer] [system·modified] breaks 1/2 pairs — modified system block — first difference at char 154: '' → 'Always show a runnable diff.'
+FAIL  no-dead-schemas        1 of 2 registered tools never used · 220 tok/call (35.2% of avg context)
+  tool schema 'deploy_to_production' registered but never invoked
+
+check FAILED · 2 of 3 assertions failed

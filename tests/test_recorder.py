@@ -73,3 +73,30 @@ def test_record_stores_error_calls(tmp_path):
     call = ct.get_calls()[0]
     assert call.error == "RateLimitError" and call.usage is None
     ct.close()
+
+
+def test_build_deep_copies_mutable_params_before_deferred_write(tmp_path):
+    """Regression: build() must SNAPSHOT (deep-copy) params on the calling
+    thread. extract_params is a shallow comprehension whose values still alias
+    the host's kwargs objects, and params is only serialized later on the writer
+    thread — so a host that passes a mutable param and mutates it before that
+    deferred write would corrupt the stored row. Here we mutate a nested
+    `metadata` dict AFTER build() returns; the built job's params must still hold
+    the value AT CALL TIME (turn==0), not the mutated one (turn==999)."""
+    ct = _trace(tmp_path)
+    rec = Recorder(ct, OpenAIAdapter(), redact=None)
+    metadata = {"turn": 0}
+    kwargs = {"model": "gpt-4o", "metadata": metadata,
+              "messages": [{"role": "user", "content": "hi"}]}
+    job = rec.build(seq=1, kwargs=kwargs, response=_Resp(), latency_ms=1,
+                    error=None, tagged=[])
+    # Host mutates its own param object after the call returns (the agent-loop
+    # pattern) — the snapshot must be immune.
+    metadata["turn"] = 999
+    assert job is not None
+    assert job.params["metadata"] == {"turn": 0}
+    # And once persisted, the stored row reflects the snapshot, not the mutation.
+    rec.persist(job)
+    stored = ct.get_calls()[0]
+    assert stored.params["metadata"] == {"turn": 0}
+    ct.close()

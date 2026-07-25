@@ -1,0 +1,5 @@
+ctxdiff check · 5 turns · session e90000000000
+FAIL  no-tagged-eviction     1 tagged block evicted of 4 across 4 turn pairs
+  the block you tagged 'rag' at turn 1 [agent:solo] was evicted at turn 3 · 19 tok
+
+check FAILED · 1 of 1 assertion failed

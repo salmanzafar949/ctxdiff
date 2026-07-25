@@ -1,0 +1,152 @@
+{
+  "manifest_version": 1,
+  "doc": "The shared contract for ctxdiff's cross-SDK golden corpus. BOTH SDKs read this file: the Python harness (spec/golden/harness.py, driven by tests/test_golden.py) and the JS harness (js/test/helpers/golden.ts, driven by js/test/golden.test.ts). Each SDK rebuilds every fixture from spec/golden/corpus/*.json with ITS OWN tokenizer, hasher and labeler, renders the cases below with ITS OWN CLI and viewer, and compares against the committed expectations in spec/golden/expected/. A drift in either SDK fails; a drift in both still fails until `python spec/golden/regenerate.py` is run deliberately and the diff is reviewed.",
+
+  "tz": "UTC",
+  "no_color": true,
+
+  "ctxdiff_version": "0.0.0-golden",
+  "ctxdiff_version_note": "The `ctxdiff_version` written into every golden run row is PINNED to this literal rather than taken from each SDK's own version constant. The two packages version independently (PyPI `ctxdiff` and npm `ctxdiff` are separate release trains), and that field is embedded verbatim in the HTML payload — so without this pin the HTML hash could never be shared between the SDKs and the strongest half of the check would be lost. The field itself is covered by tests/test_store.py and js/test/store.test.ts; nothing else in the golden depends on it.",
+
+  "tokenizers": {
+    "python": {
+      "package": "tiktoken",
+      "pinned_version": "0.13.0",
+      "encoding": "o200k_base"
+    },
+    "javascript": {
+      "package": "gpt-tokenizer",
+      "pinned_version": "3.4.0",
+      "encoding": "o200k_base"
+    },
+    "note": "Both are pinned to an EXACT version (pyproject.toml / js/package.json). These two libraries are independent reimplementations of the same BPE encoding on independent release cadences, so a floating bump on either side could change a rendered token number without a single line of ctxdiff changing. Re-pinning is a deliberate act: bump the pin, run `python spec/golden/regenerate.py`, and review the resulting diff — a non-empty diff is the tokenizer changing its mind, and must be understood before merging."
+  },
+
+  "fixtures": [
+    {"id": "special-tokens", "corpus": "corpus/special-tokens.json", "ctrace": "special-tokens.ctrace"},
+    {"id": "unicode", "corpus": "corpus/unicode.json", "ctrace": "unicode.ctrace"},
+    {"id": "code-and-schemas", "corpus": "corpus/code-and-schemas.json", "ctrace": "code-and-schemas.ctrace"},
+    {"id": "multiagent-project", "corpus": "corpus/multiagent-project.json", "ctrace": "multiagent-project.ctrace"},
+    {"id": "multipart-content", "corpus": "corpus/multipart-content.json", "ctrace": "multipart-content.ctrace"},
+    {"id": "round-numbers", "corpus": "corpus/round-numbers.json", "ctrace": "round-numbers.ctrace"},
+    {"id": "image-blocks", "corpus": "corpus/image-blocks.json", "ctrace": "image-blocks.ctrace"},
+    {"id": "tagged-eviction", "corpus": "corpus/tagged-eviction.json", "ctrace": "tagged-eviction.ctrace"},
+    {"id": "astral-estimate", "corpus": "corpus/astral-estimate.json", "ctrace": "astral-estimate.ctrace"}
+  ],
+  "fixtures_order_note": "`special-tokens` is FIRST on purpose. Both harnesses build the fixtures in this order inside ONE process, so every other fixture is tokenized after a block containing a literal `<|endoftext|>`. That makes the 'no silent estimate fallback' assertion (tests/test_golden.py::test_fixtures_really_run_the_exact_tokenizer and its JS twin) a live regression test for the process-wide latch this corpus once had to route around: if a per-text tokenizer refusal ever leaks back into the encoder, every fixture below turns into estimates and the suite fails immediately. Nothing else depends on the order — each fixture is an independent file with its own cases.",
+
+  "cli_cases": [
+    {"name": "special-tokens.diff.1-2", "fixture": "special-tokens", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "special-tokens.diff.2-3", "fixture": "special-tokens", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "special-tokens.tokens", "fixture": "special-tokens", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "special-tokens.tokens.turn3", "fixture": "special-tokens", "argv": ["tokens", "--turn", "3", "--project", "{trace}"]},
+    {"name": "special-tokens.cache", "fixture": "special-tokens", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "special-tokens.sessions", "fixture": "special-tokens", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "special-tokens.agents", "fixture": "special-tokens", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "unicode.diff.1-2", "fixture": "unicode", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "unicode.diff.2-3", "fixture": "unicode", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "unicode.tokens", "fixture": "unicode", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "unicode.tokens.turn3", "fixture": "unicode", "argv": ["tokens", "--turn", "3", "--project", "{trace}"]},
+    {"name": "unicode.cache", "fixture": "unicode", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "unicode.sessions", "fixture": "unicode", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "unicode.agents", "fixture": "unicode", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "code-and-schemas.diff.1-2", "fixture": "code-and-schemas", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "code-and-schemas.diff.2-3", "fixture": "code-and-schemas", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "code-and-schemas.tokens", "fixture": "code-and-schemas", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "code-and-schemas.cache", "fixture": "code-and-schemas", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "code-and-schemas.sessions", "fixture": "code-and-schemas", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "code-and-schemas.agents", "fixture": "code-and-schemas", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "multiagent-project.sessions", "fixture": "multiagent-project", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "multiagent-project.agents", "fixture": "multiagent-project", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "multiagent-project.tokens.session1", "fixture": "multiagent-project", "argv": ["tokens", "--session", "e1a2b3c4d5e6", "--project", "{trace}"]},
+    {"name": "multiagent-project.tokens.session2", "fixture": "multiagent-project", "argv": ["tokens", "--session", "e7f8a9b0c1d2", "--project", "{trace}"]},
+    {"name": "multiagent-project.tokens.researcher", "fixture": "multiagent-project", "argv": ["tokens", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--project", "{trace}"]},
+    {"name": "multiagent-project.cache.session2", "fixture": "multiagent-project", "argv": ["cache", "--session", "e7f8a9b0c1d2", "--project", "{trace}"]},
+    {"name": "multiagent-project.cache.researcher", "fixture": "multiagent-project", "argv": ["cache", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--project", "{trace}"]},
+    {"name": "multiagent-project.diff.1-2", "fixture": "multiagent-project", "argv": ["diff", "--session", "e7f8a9b0c1d2", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "multiagent-project.diff.cross-session", "fixture": "multiagent-project", "argv": ["diff", "--session", "e1a2b3c4d5e6", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--turn", "2", "--project", "{trace}"]},
+    {"name": "multiagent-project.diff.cross-agent", "fixture": "multiagent-project", "argv": ["diff", "--agent", "researcher:2", "--agent", "writer:4", "--session", "e7f8a9b0c1d2", "--project", "{trace}"]},
+
+    {"name": "multipart-content.diff.1-2", "fixture": "multipart-content", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "multipart-content.tokens", "fixture": "multipart-content", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "multipart-content.cache", "fixture": "multipart-content", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "multipart-content.sessions", "fixture": "multipart-content", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "multipart-content.agents", "fixture": "multipart-content", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens", "fixture": "image-blocks", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens.turn1", "fixture": "image-blocks", "argv": ["tokens", "--turn", "1", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens.agent-reviewer", "fixture": "image-blocks", "argv": ["tokens", "--agent", "reviewer", "--project", "{trace}"]},
+    {"name": "image-blocks.diff.1-2", "fixture": "image-blocks", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "image-blocks.diff.2-3", "fixture": "image-blocks", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "image-blocks.diff.5-6", "fixture": "image-blocks", "argv": ["diff", "--turn", "5", "--turn", "6", "--project", "{trace}"]},
+    {"name": "image-blocks.cache", "fixture": "image-blocks", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "image-blocks.agents", "fixture": "image-blocks", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "special-tokens.check.pass", "fixture": "special-tokens", "argv": ["check", "--max-context", "1000", "--require-stable-prefix", "--no-dead-schemas", "--max-growth", "200", "--project", "{trace}"]},
+    {"name": "code-and-schemas.check.fail", "fixture": "code-and-schemas", "exit": 1, "argv": ["check", "--max-context", "500", "--no-dead-schemas", "--max-growth", "100", "--project", "{trace}"]},
+    {"name": "code-and-schemas.check.mixed", "fixture": "code-and-schemas", "exit": 1, "argv": ["check", "--max-context", "1000", "--require-stable-prefix", "--no-dead-schemas", "--project", "{trace}"]},
+    {"name": "round-numbers.check.pct", "fixture": "round-numbers", "exit": 1, "argv": ["check", "--context-window", "100", "--max-context-pct", "25", "--max-growth-pct", "30", "--project", "{trace}"]},
+    {"name": "round-numbers.check.pct.pass", "fixture": "round-numbers", "argv": ["check", "--context-window", "1000", "--max-context-pct", "12.5", "--max-growth-pct", "99.5", "--project", "{trace}"]},
+    {"name": "image-blocks.check.prefix", "fixture": "image-blocks", "exit": 1, "argv": ["check", "--require-stable-prefix", "--max-context", "1000", "--project", "{trace}"]},
+    {"name": "image-blocks.check.agent", "fixture": "image-blocks", "exit": 1, "argv": ["check", "--agent", "driver", "--require-stable-prefix", "--max-growth", "500", "--project", "{trace}"]},
+    {"name": "multiagent-project.check.session2", "fixture": "multiagent-project", "exit": 1, "argv": ["check", "--session", "e7f8a9b0c1d2", "--max-context", "200", "--require-stable-prefix", "--max-growth", "50", "--project", "{trace}"]},
+    {"name": "multiagent-project.check.researcher", "fixture": "multiagent-project", "exit": 1, "argv": ["check", "--session", "e7f8a9b0c1d2", "--agent", "researcher", "--max-context", "200", "--require-stable-prefix", "--project", "{trace}"]},
+    {"name": "multiagent-project.check.writer", "fixture": "multiagent-project", "argv": ["check", "--session", "e7f8a9b0c1d2", "--agent", "writer", "--max-context", "200", "--require-stable-prefix", "--max-growth", "0", "--project", "{trace}"]},
+    {"name": "image-blocks.check.unmeasured", "fixture": "image-blocks", "exit": 1, "argv": ["check", "--max-context", "5000", "--context-window", "100000", "--max-context-pct", "50", "--max-growth", "5000", "--project", "{trace}"]},
+
+    {"name": "round-numbers.tokens", "fixture": "round-numbers", "argv": ["tokens", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.turn1", "fixture": "round-numbers", "argv": ["tokens", "--turn", "1", "--project", "{trace}"]},
+    {"name": "round-numbers.diff.1-2", "fixture": "round-numbers", "argv": ["diff", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "round-numbers.diff.2-3", "fixture": "round-numbers", "argv": ["diff", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "round-numbers.cache", "fixture": "round-numbers", "argv": ["cache", "--project", "{trace}"]},
+    {"name": "round-numbers.sessions", "fixture": "round-numbers", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "round-numbers.agents", "fixture": "round-numbers", "argv": ["agents", "--project", "{trace}"]},
+
+    {"name": "round-numbers.tokens.window", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "1000", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.window.below", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "34", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.window.alarm", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "33", "--project", "{trace}"]},
+    {"name": "round-numbers.tokens.window.tie", "fixture": "round-numbers", "argv": ["tokens", "--context-window", "400", "--project", "{trace}"]},
+    {"name": "special-tokens.tokens.window.turn3", "fixture": "special-tokens", "argv": ["tokens", "--turn", "3", "--context-window", "250", "--project", "{trace}"]},
+    {"name": "image-blocks.tokens.window", "fixture": "image-blocks", "argv": ["tokens", "--context-window", "500", "--project", "{trace}"]},
+
+    {"name": "tagged-eviction.sessions", "fixture": "tagged-eviction", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "tagged-eviction.agents", "fixture": "tagged-eviction", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000001", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.window", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000001", "--context-window", "120", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.multiagent", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000002", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.writer", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000002", "--agent", "writer", "--project", "{trace}"]},
+    {"name": "tagged-eviction.diff.2-3", "fixture": "tagged-eviction", "argv": ["diff", "--session", "e9000000000000000000000000000001", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction", "fixture": "tagged-eviction", "exit": 1, "argv": ["check", "--session", "e9000000000000000000000000000001", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction.multiagent", "fixture": "tagged-eviction", "exit": 1, "argv": ["check", "--session", "e9000000000000000000000000000002", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction.writer", "fixture": "tagged-eviction", "argv": ["check", "--session", "e9000000000000000000000000000002", "--agent", "writer", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.tag-once", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000003", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.tag-once.turn1", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000003", "--turn", "1", "--project", "{trace}"]},
+    {"name": "tagged-eviction.tokens.tag-once.turn5", "fixture": "tagged-eviction", "argv": ["tokens", "--session", "e9000000000000000000000000000003", "--turn", "5", "--project", "{trace}"]},
+    {"name": "tagged-eviction.check.eviction.tag-once", "fixture": "tagged-eviction", "exit": 1, "argv": ["check", "--session", "e9000000000000000000000000000003", "--no-tagged-eviction", "--project", "{trace}"]},
+    {"name": "special-tokens.check.eviction.untagged", "fixture": "special-tokens", "argv": ["check", "--max-context", "1000", "--no-dead-schemas", "--no-tagged-eviction", "--max-growth", "200", "--project", "{trace}"]},
+
+    {"name": "astral-estimate.sessions", "fixture": "astral-estimate", "argv": ["sessions", "--project", "{trace}"]},
+    {"name": "astral-estimate.agents", "fixture": "astral-estimate", "argv": ["agents", "--project", "{trace}"]},
+    {"name": "astral-estimate.tokens.bedrock", "fixture": "astral-estimate", "argv": ["tokens", "--session", "b1a2c3d4e5f6", "--project", "{trace}"]},
+    {"name": "astral-estimate.tokens.bedrock.turn3", "fixture": "astral-estimate", "argv": ["tokens", "--session", "b1a2c3d4e5f6", "--turn", "3", "--project", "{trace}"]},
+    {"name": "astral-estimate.tokens.anthropic", "fixture": "astral-estimate", "argv": ["tokens", "--session", "b7e8f9a0b1c2", "--project", "{trace}"]},
+    {"name": "astral-estimate.tokens.gemini", "fixture": "astral-estimate", "argv": ["tokens", "--session", "b3c4d5e6a7f8", "--project", "{trace}"]},
+    {"name": "astral-estimate.diff.1-2", "fixture": "astral-estimate", "argv": ["diff", "--session", "b1a2c3d4e5f6", "--turn", "1", "--turn", "2", "--project", "{trace}"]},
+    {"name": "astral-estimate.diff.2-3", "fixture": "astral-estimate", "argv": ["diff", "--session", "b1a2c3d4e5f6", "--turn", "2", "--turn", "3", "--project", "{trace}"]},
+    {"name": "astral-estimate.cache", "fixture": "astral-estimate", "argv": ["cache", "--session", "b1a2c3d4e5f6", "--project", "{trace}"]}
+  ],
+
+  "html_cases": [
+    {"name": "special-tokens", "fixture": "special-tokens"},
+    {"name": "unicode", "fixture": "unicode"},
+    {"name": "code-and-schemas", "fixture": "code-and-schemas"},
+    {"name": "multiagent-project", "fixture": "multiagent-project"},
+    {"name": "multipart-content", "fixture": "multipart-content"},
+    {"name": "round-numbers", "fixture": "round-numbers"},
+    {"name": "image-blocks", "fixture": "image-blocks"},
+    {"name": "tagged-eviction", "fixture": "tagged-eviction"},
+    {"name": "astral-estimate", "fixture": "astral-estimate"}
+  ]
+}

@@ -1,0 +1,9 @@
+── e1a2b3c4d5e6 · researcher · turn 2  →  e7f8a9b0c1d2 · researcher · turn 2 ──
+── turn 2 → turn 2 · 4 blocks changed · +134 −131 tokens ──
++ [system·system] 'Current session time: 2026-03-04T14:22:48Z'  +18 tok
+~ [user·user] [-Ho-]{+Re-run last +}w[- do th-]e[- major provid-]e[-r-]{+k'+}s pric{+ing qu+}e{+stion+} [-promp-]{+agains+}t[--cac-]{+ t+}he {+cur+}re[-ads relative to full i-]n[-pu-]t [-t-]{+d+}o[-ken-]{+c+}s[-?-]{+.+}
+~ [history·assistant] {"function": {"arguments": "{\"query\": \"prompt cache read pricing{+ 2026+}\", \"top_k\": 5}", "name": "search_web"}, "id": "call_[-a-]{+b+}1", "type": "function"}
+~ [tool_output·tool] 1. Provider docs: cached prefix reads are billed at a fraction of the standard input rate; the exact fraction varies by provider and tier.
+2. Provider docs: a cache entry is keyed on an exact prefix match, so a single changed byte early in the prompt invalidates the whole entry.[-
+3. Provider docs: cache entries expire after a short idle window.-]
+= 2 unchanged blocks · 104 tok

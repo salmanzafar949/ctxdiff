@@ -12,10 +12,33 @@ from dataclasses import dataclass
 class RawBlock:
     """One context unit as an adapter extracts it from a request payload,
     before token counting or hashing. `kind` is 'message' | 'content_part' |
-    'tool_schema'; `role` is 'system' | 'user' | 'assistant' | 'tool'."""
+    'tool_schema' | 'image'; `role` is 'system' | 'user' | 'assistant' |
+    'tool'.
+
+    The three optional fields exist for blocks whose stored text is a STAND-IN
+    rather than the content itself — today that means image blocks (see
+    `ctxdiff.images`), whose `text` is a descriptor like
+    `[image 1024×768 · ~765 tok]`. For those, hashing the descriptor would make
+    two different images collide whenever they happened to share a size, and
+    tokenizing it would measure the descriptor instead of the picture. So an
+    adapter may override both:
+
+      * `hash_input` — what to hash INSTEAD of `text` for identity (for an
+        image, a digest of the image bytes, so the same picture is one block
+        however it was wrapped and however many turns it survives);
+      * `token_count` / `token_method` — a pre-computed count INSTEAD of
+        running the tokenizer over `text` (for an image, the provider's
+        documented vision-token formula, always marked `'estimate'`).
+
+    All three default to None, which means "behave exactly as before": hash the
+    text, tokenize the text. Every pre-existing adapter call site is therefore
+    unchanged."""
     role: str
     kind: str
     text: str
+    hash_input: str | None = None
+    token_count: int | None = None
+    token_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -27,7 +50,7 @@ class Block:
     kind: str
     text: str
     token_count: int
-    token_method: str  # 'tiktoken' | 'estimate'
+    token_method: str  # 'tiktoken' | 'estimate'  ('estimate' for every image)
 
 
 @dataclass(frozen=True)

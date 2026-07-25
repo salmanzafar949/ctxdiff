@@ -1,0 +1,78 @@
+{
+  "id": "code-and-schemas",
+  "title": "Fenced code blocks and long tool schemas",
+  "why": "Source code and JSON tool schemas are dense in punctuation, indentation runs and repeated keys — exactly the region of a BPE merge table that changes most between tokenizer releases, and the region where a whitespace-run merge revision would silently shift every number in `ctxdiff tokens`. The fixture also registers a tool that is never invoked so the schema-bloat detector (which reports both a token cost and a percentage) is on the compared surface.",
+  "sessions": [
+    {
+      "run_id": "b0000000000000000000000000000001",
+      "project": "code-review-corpus",
+      "started_at": "2026-03-02T11:40:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "d0000000000000000000000000000001",
+          "seq": 1,
+          "agent": "reviewer",
+          "step": "analyze",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.2},
+          "usage": {"prompt_tokens": 640, "completion_tokens": 90, "total_tokens": 730},
+          "latency_ms": 310,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Execute a Python snippet in a sandboxed interpreter and return stdout, stderr and the exit status. The sandbox has no network access and a 5 second wall-clock limit.\", \"name\": \"run_python\", \"parameters\": {\"properties\": {\"source\": {\"description\": \"The Python source to execute. Must be a complete module; the last expression is not echoed.\", \"type\": \"string\"}, \"timeout_s\": {\"default\": 5, \"description\": \"Wall-clock limit in seconds, 1-5.\", \"maximum\": 5, \"minimum\": 1, \"type\": \"integer\"}}, \"required\": [\"source\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Promote the current build to the production environment. Requires a signed release manifest and a green canary window. This schema is large, is re-sent on every single turn, and is never invoked in this trace.\", \"name\": \"deploy_to_production\", \"parameters\": {\"properties\": {\"canary_minutes\": {\"default\": 30, \"description\": \"How long the canary must have been green before promotion.\", \"type\": \"integer\"}, \"manifest\": {\"description\": \"A signed release manifest, base64 encoded.\", \"type\": \"string\"}, \"regions\": {\"description\": \"Which regions to promote into, in order.\", \"items\": {\"enum\": [\"us-east-1\", \"us-west-2\", \"eu-central-1\", \"ap-southeast-1\"], \"type\": \"string\"}, \"type\": \"array\"}, \"rollback_on_error\": {\"default\": true, \"type\": \"boolean\"}}, \"required\": [\"manifest\", \"regions\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are a senior code reviewer. Point at the defect, name the mechanism, and propose the smallest correct fix. Never rewrite code that is already correct."],
+            ["user", "message", "Review this and tell me why it returns the wrong value for n=0:\n\n```python\ndef fib(n: int) -> int:\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n    a, b = 1, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n```\n\nThe test that fails is `assert fib(0) == 0`."]
+          ]
+        },
+        {
+          "call_id": "d0000000000000000000000000000002",
+          "seq": 2,
+          "agent": "reviewer",
+          "step": "analyze",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.2},
+          "usage": {"prompt_tokens": 980, "completion_tokens": 140, "total_tokens": 1120},
+          "latency_ms": 402,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Execute a Python snippet in a sandboxed interpreter and return stdout, stderr and the exit status. The sandbox has no network access and a 5 second wall-clock limit.\", \"name\": \"run_python\", \"parameters\": {\"properties\": {\"source\": {\"description\": \"The Python source to execute. Must be a complete module; the last expression is not echoed.\", \"type\": \"string\"}, \"timeout_s\": {\"default\": 5, \"description\": \"Wall-clock limit in seconds, 1-5.\", \"maximum\": 5, \"minimum\": 1, \"type\": \"integer\"}}, \"required\": [\"source\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Promote the current build to the production environment. Requires a signed release manifest and a green canary window. This schema is large, is re-sent on every single turn, and is never invoked in this trace.\", \"name\": \"deploy_to_production\", \"parameters\": {\"properties\": {\"canary_minutes\": {\"default\": 30, \"description\": \"How long the canary must have been green before promotion.\", \"type\": \"integer\"}, \"manifest\": {\"description\": \"A signed release manifest, base64 encoded.\", \"type\": \"string\"}, \"regions\": {\"description\": \"Which regions to promote into, in order.\", \"items\": {\"enum\": [\"us-east-1\", \"us-west-2\", \"eu-central-1\", \"ap-southeast-1\"], \"type\": \"string\"}, \"type\": \"array\"}, \"rollback_on_error\": {\"default\": true, \"type\": \"boolean\"}}, \"required\": [\"manifest\", \"regions\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are a senior code reviewer. Point at the defect, name the mechanism, and propose the smallest correct fix. Never rewrite code that is already correct."],
+            ["user", "message", "Review this and tell me why it returns the wrong value for n=0:\n\n```python\ndef fib(n: int) -> int:\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n    a, b = 1, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n```\n\nThe test that fails is `assert fib(0) == 0`."],
+            ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"source\\\": \\\"print([fib(i) for i in range(6)])\\\"}\", \"name\": \"run_python\"}, \"id\": \"call_01\", \"type\": \"function\"}"],
+            ["tool", "message", "stdout:\n[1, 1, 2, 3, 5, 8]\nstderr:\n(empty)\nexit: 0"],
+            ["user", "message", "Right — so the seed is wrong. Show me the one-line fix and the SQL we use to backfill the cached values:\n\n```sql\nSELECT u.id, u.email\nFROM users u\nJOIN orders o ON o.user_id = u.id\nWHERE o.total > 100.0\nGROUP BY u.id\nHAVING COUNT(*) >= 3;\n```"]
+          ]
+        },
+        {
+          "call_id": "d0000000000000000000000000000003",
+          "seq": 3,
+          "agent": "reviewer",
+          "step": "verify",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.2},
+          "usage": {"prompt_tokens": 1240, "completion_tokens": 76, "total_tokens": 1316},
+          "latency_ms": 355,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Execute a Python snippet in a sandboxed interpreter and return stdout, stderr and the exit status. The sandbox has no network access and a 5 second wall-clock limit.\", \"name\": \"run_python\", \"parameters\": {\"properties\": {\"source\": {\"description\": \"The Python source to execute. Must be a complete module; the last expression is not echoed.\", \"type\": \"string\"}, \"timeout_s\": {\"default\": 5, \"description\": \"Wall-clock limit in seconds, 1-5.\", \"maximum\": 5, \"minimum\": 1, \"type\": \"integer\"}}, \"required\": [\"source\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Promote the current build to the production environment. Requires a signed release manifest and a green canary window. This schema is large, is re-sent on every single turn, and is never invoked in this trace.\", \"name\": \"deploy_to_production\", \"parameters\": {\"properties\": {\"canary_minutes\": {\"default\": 30, \"description\": \"How long the canary must have been green before promotion.\", \"type\": \"integer\"}, \"manifest\": {\"description\": \"A signed release manifest, base64 encoded.\", \"type\": \"string\"}, \"regions\": {\"description\": \"Which regions to promote into, in order.\", \"items\": {\"enum\": [\"us-east-1\", \"us-west-2\", \"eu-central-1\", \"ap-southeast-1\"], \"type\": \"string\"}, \"type\": \"array\"}, \"rollback_on_error\": {\"default\": true, \"type\": \"boolean\"}}, \"required\": [\"manifest\", \"regions\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are a senior code reviewer. Point at the defect, name the mechanism, and propose the smallest correct fix. Never rewrite code that is already correct. Always show a runnable diff."],
+            ["user", "message", "Review this and tell me why it returns the wrong value for n=0:\n\n```python\ndef fib(n: int) -> int:\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n    a, b = 1, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n```\n\nThe test that fails is `assert fib(0) == 0`."],
+            ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"source\\\": \\\"print([fib(i) for i in range(6)])\\\"}\", \"name\": \"run_python\"}, \"id\": \"call_01\", \"type\": \"function\"}"],
+            ["tool", "message", "stdout:\n[1, 1, 2, 3, 5, 8]\nstderr:\n(empty)\nexit: 0"],
+            ["user", "message", "Right — so the seed is wrong. Show me the one-line fix and the SQL we use to backfill the cached values:\n\n```sql\nSELECT u.id, u.email\nFROM users u\nJOIN orders o ON o.user_id = u.id\nWHERE o.total > 100.0\nGROUP BY u.id\nHAVING COUNT(*) >= 3;\n```"],
+            ["assistant", "message", "The seed should be `a, b = 0, 1`. Diff:\n\n```diff\n-    a, b = 1, 1\n+    a, b = 0, 1\n```"],
+            ["user", "message", "Good. Now port it to TypeScript with the same tests:\n\n```ts\nexport function fib(n: number): number {\n  let [a, b] = [0, 1];\n  for (let i = 0; i < n; i++) [a, b] = [b, a + b];\n  return a;\n}\n```"]
+          ]
+        }
+      ]
+    }
+  ]
+}

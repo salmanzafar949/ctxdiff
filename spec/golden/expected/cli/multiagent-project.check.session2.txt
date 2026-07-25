@@ -1,0 +1,10 @@
+ctxdiff check · 4 turns · session e7f8a9b0c1d2
+FAIL  max-context            2 turns over limit · peak 244 tok at turn 3 · limit 200
+  turn 2 [agent:researcher] · 238 tok · 38 over limit
+  turn 3 [agent:researcher] · 244 tok · 44 over limit
+FAIL  require-stable-prefix  2 breaks across 2 turn pairs · 482 tok re-billed
+  turn 1 → turn 2 [agent:researcher] [system·modified] breaks 2/2 pairs — modified system block — first difference at char 39: '31' → '48'
+FAIL  max-growth             1 turn over limit · peak growth 105 tok at turn 2 · limit 50
+  turn 1 → turn 2 [agent:researcher] · +105 tok (133 → 238) · limit 50
+
+check FAILED · 3 of 3 assertions failed

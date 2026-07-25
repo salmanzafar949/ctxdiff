@@ -155,3 +155,23 @@ def test_diff_turns_across_an_agent_handoff(tmp_path):
     assert diff.seq_old == 2
     assert diff.seq_new == 3
     assert len(diff.entries) > 0
+
+
+def test_demo_dashboard_opens_on_the_agent_listing(tmp_path, capsys):
+    """`ctxdiff demo` still works end to end, and — because the sample run has
+    TWO agents — its dashboard lands on level 1, the agent listing, which is the
+    first thing the demo is meant to show off."""
+    from ctxdiff.cli.main import main as cli_main
+
+    ctrace = str(tmp_path / "demo.ctrace")
+    assert cli_main(["demo", "--no-open", "--out", ctrace]) == 0
+
+    out = capsys.readouterr().out
+    html = next(line.split("->", 1)[1].strip()
+                for line in out.splitlines() if line.startswith("dashboard"))
+    page = open(html, encoding="utf-8").read()
+    assert '"start": {"level": 1, "agent": null, "session": null}' in page
+    assert '"name": "researcher"' in page
+    assert '"name": "writer"' in page
+    # Still one self-contained file with nothing to fetch.
+    assert "https://" not in page

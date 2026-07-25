@@ -1,0 +1,3 @@
+astral-estimate.ctrace#b1a2c3d4e5f6  2026-03-05 07:40:00 +00:00  project=astral-estimate  provider=bedrock  turns=3  agents=translator
+astral-estimate.ctrace#b7e8f9a0b1c2  2026-03-05 09:12:00 +00:00  project=astral-estimate  provider=anthropic  turns=2  agents=reviewer
+astral-estimate.ctrace#b3c4d5e6a7f8  2026-03-05 11:03:00 +00:00  project=astral-estimate  provider=gemini  turns=2  agents=captioner

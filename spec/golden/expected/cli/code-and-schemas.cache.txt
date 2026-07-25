@@ -1,0 +1,8 @@
+⚠ warning: [agent:reviewer] [system·modified] breaks the prefix on 1/2 turn pairs
+  'You are a senior code reviewer. Point at the defect, name the mechanism, and pro…'
+  modified system block — first difference at char 154: '' → 'Always show a runnable diff.'
+
+stable prefix (min): 369 tokens
+re-billed: 388 tokens
+388 tokens re-billed across 2 turns that a stable prefix would have served from cache (cached input is typically billed at a fraction of the full input price — check your provider's current rates)
+hint: a dynamic value inside an early system block breaks the prefix every turn — move volatile content below the stable blocks

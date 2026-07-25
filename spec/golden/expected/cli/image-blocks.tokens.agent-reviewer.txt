@@ -1,0 +1,11 @@
+reviewer total · in 2,910 tok · out 236 tok (2/2 calls reported usage)
+
+turn 3 · 672 tokens (~approx) [reviewer·critique]
+  █████████████████████████████  user              654 tok   97.3%
+  █                              system             18 tok    2.7%
+  provider reports 1,490 prompt tokens · Δ +818
+
+turn 4 · 1,093 tokens (~approx) [reviewer·critique]
+  ██████████████████████████████ user            1,075 tok   98.4%
+                                 system             18 tok    1.6%
+  provider reports 1,420 prompt tokens · Δ +327

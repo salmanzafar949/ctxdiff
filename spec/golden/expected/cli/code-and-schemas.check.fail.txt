@@ -1,0 +1,11 @@
+ctxdiff check · 3 turns · session b00000000000
+FAIL  max-context            2 turns over limit · peak 757 tok at turn 3 · limit 500
+  turn 2 [agent:reviewer] · 633 tok · 133 over limit
+  turn 3 [agent:reviewer] · 757 tok · 257 over limit
+FAIL  no-dead-schemas        1 of 2 registered tools never used · 220 tok/call (35.2% of avg context)
+  tool schema 'deploy_to_production' registered but never invoked
+FAIL  max-growth             2 turns over limit · peak growth 147 tok at turn 2 · limit 100
+  turn 1 → turn 2 [agent:reviewer] · +147 tok (486 → 633) · limit 100
+  turn 2 → turn 3 [agent:reviewer] · +124 tok (633 → 757) · limit 100
+
+check FAILED · 3 of 3 assertions failed

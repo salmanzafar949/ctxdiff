@@ -1,0 +1,3 @@
+── turn 5 → turn 6 · 1 blocks changed · +765 −765 tokens ──
+~ [user·user] [image 1024×768 · ~765 tok]
+= 1 unchanged blocks · 12 tok

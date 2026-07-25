@@ -8,9 +8,12 @@ from __future__ import annotations
 import os
 import sys
 
-from ctxdiff.analyze.cache import CacheReport, PrefixBreak
+from ctxdiff.analyze.cache import CacheReport, group_breaks, pairs_denominator
+from ctxdiff.analyze.check import NAME_WIDTH, CheckReport
 from ctxdiff.analyze.differ import TurnDiff
+from ctxdiff.analyze.evictions import EvictionReport
 from ctxdiff.analyze.tokens import BloatReport, CallTokens, RunTokens, UsageTotals
+from ctxdiff.analyze.window import format_window_share
 
 # Bare ANSI SGR constants — no colorama/rich, per CLAUDE.md's "runtime deps:
 # tiktoken only" rule. Codes are terminated per-segment by _RESET.
@@ -146,7 +149,7 @@ def _bar(pct: float) -> str:
     return "█" * length
 
 
-def render_call_tokens(ct: CallTokens) -> str:
+def render_call_tokens(ct: CallTokens, context_window: int | None = None) -> str:
     """Render one call's token attribution (spec §6.3/§7.1): a header line
     naming the turn, its total tokens (thousands-separated), and a `~approx`
     marker IFF `ct.approximate` — the spec's "always marked approximate,
@@ -155,13 +158,27 @@ def render_call_tokens(ct: CallTokens) -> str:
     label slice, biggest spender first (already sorted by the analyzer).
     When provider usage is available and reconciles to a known prompt-token
     key, a dim line beneath reports it alongside the delta from our own
-    count — omitted entirely when there's nothing to reconcile against."""
+    count — omitted entirely when there's nothing to reconcile against.
+
+    `context_window`, when the user has stated one (`--context-window` or
+    `CTXDIFF_CONTEXT_WINDOW`), turns the bare total into a SHARE — `18,400 /
+    200,000 tok · 9.2%`, warning-marked past `CONTEXT_WINDOW_ALARM_PCT` — which
+    is the form that answers the question people open this command with. With no
+    window the header is byte-for-byte what it always was: ctxdiff ships no
+    model→window table, so it renders no percentage it cannot back up.
+
+    The `(~approx)` marker stays where it has always been, immediately after the
+    numbers it qualifies, so it keeps qualifying the percentage too: a share
+    computed from a partly-estimated total is exactly as approximate as the
+    total."""
     enabled = _color_enabled()
     lines: list[str] = []
 
     approx_marker = " (~approx)" if ct.approximate else ""
     agent_step = _agent_step_tag(ct.agent, ct.step)
-    lines.append(f"turn {ct.seq} · {ct.total_tokens:,} tokens{approx_marker}{agent_step}")
+    total = (f"{ct.total_tokens:,} tokens" if context_window is None
+             else format_window_share(ct.total_tokens, context_window))
+    lines.append(f"turn {ct.seq} · {total}{approx_marker}{agent_step}")
 
     for s in ct.slices:
         bar = _bar(s.pct).ljust(_BAR_WIDTH)
@@ -201,6 +218,47 @@ def render_bloat(bloat: BloatReport, total_tools: int | None) -> str:
         f"every call"
     )
     return _paint(line, _YELLOW, enabled)
+
+
+def render_evictions(report: EvictionReport) -> str | None:
+    """Render the tagged-eviction warning block for `ctxdiff tokens`, or None
+    when there is nothing to warn about (the overwhelmingly common case, and the
+    reason this returns None rather than a reassuring line: a report that says
+    "no evictions" on every run trains people to stop reading it).
+
+    One three-line stanza per eviction, in the analyzer's timeline order:
+
+    - a yellow headline in the words the bug is usually described in — "the
+      block you tagged 'rag' at turn 3 was evicted at turn 6" — prefixed with an
+      `[agent:NAME]` chip on a multi-agent run, spelled exactly as
+      `ctxdiff cache` spells its own. The turn in it is `tagged_seq`, the turn
+      the TAG was applied, because that is what the sentence claims happened
+      there;
+    - the block's snippet, repr-quoted like every other snippet the CLI prints,
+      so control characters in captured text are visible rather than acting on
+      the terminal;
+    - a facts line: the block's cost, the turn the CONTENT entered the context
+      (`entered_seq`, which is not always the turn it was tagged on), the last
+      turn that still carried it, and the standing reminder that this report only
+      ever names blocks that never came back (see `analyze.evictions`).
+
+    Only TAGGED blocks appear here. Every agent loop evicts heuristically
+    labeled history by design, so including those would bury this line in the
+    ordinary behaviour of every framework there is."""
+    if not report.evictions:
+        return None
+    enabled = _color_enabled()
+    lines: list[str] = []
+    for e in report.evictions:
+        chip = f"[agent:{e.agent}] " if e.agent is not None else ""
+        headline = (f"⚠ {chip}the block you tagged '{e.label}' at turn "
+                    f"{e.tagged_seq} was evicted at turn {e.evicted_seq}")
+        lines.append(_paint(headline, _YELLOW, enabled))
+        lines.append(f"  {repr(e.snippet)}")
+        lines.append(f"  [{e.label}·{e.role}] {e.tokens:,} tok · entered at "
+                     f"turn {e.entered_seq} · last present at turn "
+                     f"{e.last_seen_seq} · never returned")
+    return "\n".join(lines)
 
 
 def render_usage_summary(usage: UsageTotals, agent: str | None = None) -> str:
@@ -247,14 +305,24 @@ def render_agent_summary(run_tokens: RunTokens) -> str | None:
 def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
                        total_tools: int | None,
                        agent_summary: str | None = None,
-                       usage_summary: str | None = None) -> str:
+                       usage_summary: str | None = None,
+                       context_window: int | None = None,
+                       evictions: EvictionReport | None = None) -> str:
     """Render `ctxdiff tokens`' full output: the run-level provider-usage rollup
     FIRST (when supplied), then an optional per-agent block-token summary (when
     the run is multi-agent and unfiltered), then one block per selected call
     (already filtered to a single turn by the caller when `--turn` is given),
-    then the bloat warning appended when there is one AND it actually names
-    unused tools (a BloatReport with an empty unused list — every registered
-    tool got used — has nothing worth printing)."""
+    then the tagged-eviction warnings, then the bloat warning appended when
+    there is one AND it actually names unused tools (a BloatReport with an empty
+    unused list — every registered tool got used — has nothing worth printing).
+
+    `context_window` is threaded down to every turn header (see
+    `render_call_tokens`); None means no window was stated and every header
+    renders exactly as it did before percentages existed.
+
+    Evictions print BEFORE bloat because they are the more expensive fact: dead
+    schemas cost tokens, an evicted tagged block cost the agent something it was
+    told to remember. Both are omitted entirely when empty."""
     if not calls:
         return "no calls in this run"
     sections: list[str] = []
@@ -262,27 +330,14 @@ def render_run_tokens(calls: list[CallTokens], bloat: BloatReport | None,
         sections.append(usage_summary)
     if agent_summary:
         sections.append(agent_summary)
-    sections.extend(render_call_tokens(c) for c in calls)
+    sections.extend(render_call_tokens(c, context_window) for c in calls)
+    if evictions is not None:
+        eviction_block = render_evictions(evictions)
+        if eviction_block:
+            sections.append(eviction_block)
     if bloat is not None and bloat.unused_tools:
         sections.append(render_bloat(bloat, total_tools))
     return "\n\n".join(sections)
-
-
-def _group_breaks(breaks: list[PrefixBreak]) -> list[list[PrefixBreak]]:
-    """Group PrefixBreaks that describe the "same" underlying culprit —
-    (agent, culprit_kind, culprit_label, divergent_position) — into one list
-    per distinct culprit, in first-seen order. `agent` is part of the key so
-    two agents breaking the same way at the same slot stay SEPARATE warnings
-    (each carries its own agent chip). Grouping deliberately ignores the
-    per-pair `detail`/`culprit_snippet` text (a changing timestamp's exact
-    before/after values differ every pair by definition) — what makes two
-    breaks "the same warning" is that the same agent's same slot keeps
-    breaking the same way, not that the literal diff text is identical."""
-    groups: dict[tuple[str | None, str, str, int], list[PrefixBreak]] = {}
-    for b in breaks:
-        key = (b.agent, b.culprit_kind, b.culprit_label, b.divergent_position)
-        groups.setdefault(key, []).append(b)
-    return list(groups.values())
 
 
 def render_cache_report(report: CacheReport) -> str:
@@ -316,17 +371,13 @@ def render_cache_report(report: CacheReport) -> str:
             lines.append(report.estimated_waste_note)
         return "\n".join(lines)
 
-    for group in _group_breaks(report.breaks):
+    for group in group_breaks(report.breaks):
         rep = group[0]
         count = len(group)
-        # Denominator: when the break is attributed to a specific agent and the
-        # run was analyzed per-agent, use THAT agent's own pair count (a
-        # researcher breaking on both of its 2 pairs is "2/2", not "2/3" of a
-        # run that also includes a stable writer). Fall back to the run-wide
-        # count for an unlabeled break or a single-timeline run.
-        denom = report.pairs_analyzed
-        if rep.agent is not None and report.pairs_by_agent:
-            denom = report.pairs_by_agent.get(rep.agent, report.pairs_analyzed)
+        # Denominator: THAT agent's own pair count when the break is attributed
+        # to one and the run was analyzed per-agent, else the run-wide count.
+        # Shared with `ctxdiff check` so both report the same frequency.
+        denom = pairs_denominator(report, rep)
         frequency = (
             f"breaks the prefix on every turn ({count}/{denom} pairs)"
             if count == denom else
@@ -354,17 +405,108 @@ def render_cache_report(report: CacheReport) -> str:
     return "\n".join(lines)
 
 
-def render_runs_list(rows: list[tuple[str, str, str, int, str]]) -> str:
-    """Render `ctxdiff runs`' listing. Each row is
-    (filename, project, provider, turn_count, agents); prints one line per row,
-    or a friendly message when the working directory has no `.ctrace` files.
-    `agents` is a comma-joined list of the distinct agent names in the trace,
-    or '-' when the run has no named agents (a single-agent/pre-v2 run)."""
+def render_check_report(report: CheckReport, source: str | None = None) -> str:
+    """Render `ctxdiff check`'s PASS/FAIL table — the thing a CI log shows and
+    a reviewer reads without opening the trace.
+
+    Layout, top to bottom:
+
+    - a scope header naming how many turns were checked, which agent (when the
+      check was scoped to one), and WHAT WAS READ — `source`, the caller's
+      `session <short id>` label, qualified by the filename when the trace was
+      discovered rather than named. That last part is not decoration: with no
+      `--project` the CLI reads the most recently modified `*.ctrace` in the
+      working directory (the GitHub Action's default), so an unrelated newer
+      trace can be checked, pass, and leave a report indistinguishable from one
+      over the intended run. A verdict that does not say what it read cannot be
+      audited;
+    - one status line per REQUESTED assertion, in the analyzer's fixed order,
+      as `PASS`/`FAIL` (green/red) + the assertion's name padded to a common
+      column + its summary, which always carries the actual value beside the
+      threshold — a passing check that reports its high-water mark is what lets
+      someone watch a budget approach its limit over successive PRs, instead of
+      only finding out on the day it breaks;
+    - beneath each FAILING assertion, its violation lines indented two spaces,
+      one per offending turn/agent/block;
+    - a blank line, then a verdict line (green on a clean pass, red otherwise).
+
+    Every string below the status column is composed by `analyze/check.py`;
+    this function only decides columns and color, exactly as the other
+    renderers do."""
+    enabled = _color_enabled()
+    lines: list[str] = []
+
+    scope = f" · agent {report.agent}" if report.agent is not None else ""
+    origin = f" · {source}" if source else ""
+    turn_word = "turn" if report.turns_analyzed == 1 else "turns"
+    lines.append(
+        f"ctxdiff check · {report.turns_analyzed} {turn_word}{scope}{origin}")
+
+    for a in report.assertions:
+        status = _paint("PASS", _GREEN, enabled) if a.passed else _paint("FAIL", _RED, enabled)
+        lines.append(f"{status}  {a.name:<{NAME_WIDTH}}  {a.summary}")
+        for detail in a.details:
+            lines.append(f"  {detail}")
+
+    lines.append("")
+    total = len(report.assertions)
+    if report.passed:
+        verdict = f"check passed · {total} assertion{'' if total == 1 else 's'}"
+        lines.append(_paint(verdict, _GREEN, enabled))
+    else:
+        failed = len(report.failed)
+        verdict = (f"check FAILED · {failed} of {total} "
+                   f"assertion{'' if total == 1 else 's'} failed")
+        lines.append(_paint(verdict, _RED, enabled))
+
+    return "\n".join(lines)
+
+
+def render_sessions_list(rows: list[tuple[str, str, str, str, int, str]],
+                         empty: str = "no .ctrace files in the current directory") -> str:
+    """Render `ctxdiff sessions`' listing (and its hidden `runs` alias). Each
+    row is (label, started_local, project, provider, turn_count, agents).
+
+    `label` is deliberately not named after any one thing it can be: a filename
+    when listing the `.ctrace` files in a directory, `<filename>#<short id>`
+    when one of those files holds several sessions, and a bare short session id
+    when listing a configured database (which has no filenames at all).
+
+    `started_local` arrives ALREADY formatted (see `select.format_local`) — this
+    module never touches a clock or a timezone, it only lays out columns.
+
+    Prints one line per row, or `empty` when there is nothing to list; the
+    caller supplies that message because "no .ctrace files in the current
+    directory" would be the wrong answer for a user whose traces live in
+    Postgres. `agents` is a comma-joined list of the distinct agent names, or
+    '-' when the session has no named agents (single-agent/pre-v2)."""
     if not rows:
-        return "no .ctrace files in the current directory"
+        return empty
     lines = [
-        f"{filename}  project={project}  provider={provider}  turns={n_calls}"
-        f"  agents={agents}"
-        for filename, project, provider, n_calls, agents in rows
+        f"{label}  {started}  project={project}  provider={provider}"
+        f"  turns={n_calls}  agents={agents}"
+        for label, started, project, provider, n_calls, agents in rows
+    ]
+    return "\n".join(lines)
+
+
+def render_agents_list(rows: list[tuple[str, int, int, str]],
+                       empty: str = "no agents in this project") -> str:
+    """Render `ctxdiff agents`' listing: one line per agent with how many
+    SESSIONS it appears in, how many calls it made in total, and its token
+    spend — all aggregated across every session in the project, which is the
+    whole point of the command (an agent's cost is a property of the project,
+    not of whichever run you happened to open).
+
+    Each row is (name, n_sessions, n_calls, tokens) where `tokens` is already a
+    string: the caller formats it as a thousands-separated PROVIDER-REPORTED
+    total (input + output), or '-' when not one of that agent's calls carried
+    usage — the same "never fake precision" rule the token report follows,
+    since printing `tokens=0` for unreported usage would read as free."""
+    if not rows:
+        return empty
+    lines = [
+        f"{name}  sessions={n_sessions}  calls={n_calls}  tokens={tokens}"
+        for name, n_sessions, n_calls, tokens in rows
     ]
     return "\n".join(lines)

@@ -4,66 +4,178 @@ Its single public method never raises — a debugging tool must not be able to
 crash the program it is debugging."""
 from __future__ import annotations
 
+import copy
 import logging
+import threading
+import types
+from dataclasses import dataclass
 from typing import Callable
 
 from ctxdiff.capture.base import Adapter
-from ctxdiff.models import Block, CallBlock, basic_label, content_hash
-from ctxdiff.store.ctrace import CTrace
+from ctxdiff.models import Block, CallBlock, RawBlock, basic_label, content_hash
+from ctxdiff.store.base import Store
 from ctxdiff.tokenize.counter import count_tokens
 
 _log = logging.getLogger("ctxdiff")
 
 
-class Recorder:
-    """Records calls into a CTrace using a provider adapter. Holds an optional
-    redaction hook applied to every block just before it is stored."""
+def build_block(raw: RawBlock, provider: str) -> Block:
+    """Turn one adapter-extracted `RawBlock` into the stored, content-addressed
+    `Block`: give it its identity and its token numbers.
 
-    def __init__(self, ctrace: CTrace, adapter: Adapter,
+    Two overrides, both defaulting to the original behavior (see `RawBlock`):
+
+      * IDENTITY is `content_hash(role, kind, hash_input or text)`. For an
+        ordinary block that is the text itself — unchanged, so every hash this
+        SDK has ever written stays valid. For an image block it is a digest of
+        the image BYTES, so two copies of the same picture are one block and a
+        1024×768 red square and a 1024×768 blue one are not.
+      * TOKENS come from the tokenizer over `text`, unless the adapter already
+        computed them — which it does only for images, where the truthful cost
+        is the provider's vision formula over the pixel dimensions and NOT the
+        tokenization of the `[image …]` descriptor standing in for them.
+
+    Factored out of `Recorder.build` so there is exactly ONE definition of what
+    a stored block is: the golden harness (`spec/golden/harness.py`) calls this
+    same function to materialize its fixtures, which is what lets the committed
+    goldens be evidence about the real capture path rather than about a
+    parallel reimplementation of it."""
+    if raw.token_count is not None:
+        token_count, token_method = raw.token_count, raw.token_method or "estimate"
+    else:
+        token_count, token_method = count_tokens(raw.text, provider)
+    hash_input = raw.hash_input if raw.hash_input is not None else raw.text
+    return Block(
+        content_hash=content_hash(raw.role, raw.kind, hash_input),
+        role=raw.role, kind=raw.kind, text=raw.text,
+        token_count=token_count, token_method=token_method,
+    )
+
+
+class SyntheticUsageResponse:
+    """Stands in for a completed `response` at RECORD time for a call whose
+    usage did NOT arrive on a response object — a stream (usage accumulated
+    across its chunks) or a LangChain callback run (usage handed over in
+    LangChain's own normalized shape). It carries nothing but those counts,
+    exposed as an ATTRIBUTE-based object rather than the raw dict, because
+    every adapter's `extract_usage` duck-types `response.<attr>.<field>` via
+    `getattr`.
+
+    Routing accumulated usage through THIS shape, into the SAME
+    `extract_usage` a non-streaming call already uses, is what keeps a
+    stored `usage` dict byte-for-byte identical no matter which route
+    produced the numbers — there is no second, parallel usage-shaping path to
+    keep in sync.
+
+    Exposed under BOTH `.usage` (OpenAI's/Anthropic's/Bedrock's
+    `extract_usage` reads `response.usage`) AND `.usage_metadata` (Gemini's
+    reads `response.usage_metadata` instead — confirmed the mismatch
+    empirically: without this, a Gemini stream's accumulated usage silently
+    vanished at record time even though accumulation itself worked
+    correctly). Both names point at the SAME namespace object, so whichever
+    attribute a given adapter happens to duck-type off of, it finds the right
+    data; neither adapter needs to know the other exists."""
+
+    def __init__(self, state: dict):
+        ns = types.SimpleNamespace(**state)
+        self.usage = ns
+        self.usage_metadata = ns
+
+
+@dataclass(frozen=True)
+class PersistJob:
+    """One fully-built, fully-SNAPSHOTTED call ready to be written to the store.
+
+    This is the hand-off between the two halves of recording (see `Recorder`):
+    `build()` produces it on the CALLING thread — so every field is derived from
+    the request/response AT CALL-COMPLETION TIME and owns its own immutable data
+    (frozen dataclass, plain dicts, CallBlocks whose text is already copied out),
+    with no lingering reference to the host's mutable `kwargs` — and `persist()`
+    consumes it on the single WRITER thread. Because the snapshot is taken before
+    the host can mutate its `messages`/`contents` list for the next turn (the
+    normal agent-loop pattern of appending to one list and calling again), a
+    deferred write can never record a later turn's contents against this seq."""
+    seq: int
+    params: dict
+    usage: dict | None
+    latency_ms: int | None
+    error: str | None
+    call_blocks: list[CallBlock]
+    agent: str | None
+    step: str | None
+    provider: str | None
+
+
+class Recorder:
+    """Records calls into a `Store` using a provider adapter. Holds an optional
+    redaction hook applied to every block just before it is stored.
+
+    The store is the PROTOCOL (`ctxdiff.store.base.Store`), not a concrete
+    class: whether the run is landing in a local `.ctrace`, Postgres or MySQL,
+    this code is identical — `persist()` calls the same `record_call`."""
+
+    def __init__(self, store: Store | None, adapter: Adapter,
                  redact: Callable[[Block], Block] | None):
         """Wire the three collaborators `record()` needs: the store to write
-        to, the provider-specific adapter that knows how to pull blocks/
-        params/usage out of raw request/response objects, and an optional
-        redaction hook. How: just stores the references; no I/O happens
-        until `record()` is called."""
-        self._ct = ctrace
+        to (any `Store` implementation, or None when store setup already failed
+        and capture is degraded fail-open), the provider-specific adapter that
+        knows how to pull blocks/params/usage out of raw request/response
+        objects, and an optional redaction hook. How: just stores the
+        references; no I/O happens until `record()` is called."""
+        self._ct = store
         self._adapter = adapter
         self._redact = redact
+        # One-time-warning state for persist failures (mirrors _Writer._degrade):
+        # a persistently-broken store must warn ONCE for the run, not once per
+        # call. Guarded by a lock because persist() runs on the writer thread.
+        self._persist_warn_lock = threading.Lock()
+        self._persist_warned = False
 
-    def record(self, seq: int, kwargs: dict, response: object | None,
-               latency_ms: int | None, error: str | None,
-               tagged: list[tuple[str, str]],
-               agent: str | None = None, step: str | None = None,
-               provider: str | None = None, quiet: bool = False) -> None:
-        """Build and store one call from its request kwargs and response. Every
-        step runs inside a catch-all: any failure is logged once and swallowed,
-        leaving the host application's own call path untouched (fail-open).
-        `tagged` is a list of (label, needle) pairs used to override labels.
-        `agent`/`step`/`provider` are the v2 attribution fields threaded through
-        to the store unchanged (they flow inside this guarded path so capturing
-        them can never break the host, per the fail-open contract). `quiet`
-        (default False; set only by a stream proxy's best-effort `__del__`
-        finalize — see trace.py) suppresses the trailing `exc_info=True`
-        warning log below on failure: at GC/interpreter-shutdown time (module
-        globals possibly already torn down, the store possibly already
-        closed) that log call is pure noise at best and must never itself
-        misbehave, so this one caller opts out of it rather than risk it."""
+    def build(self, seq: int, kwargs: dict, response: object | None,
+              latency_ms: int | None, error: str | None,
+              tagged: list[tuple[str, str]],
+              agent: str | None = None, step: str | None = None,
+              provider: str | None = None, quiet: bool = False) -> PersistJob | None:
+        """Phase 1 of recording — runs on the CALLING thread. What: turns a
+        (request, response) pair into a fully self-contained `PersistJob`
+        (blocks + params + usage + attribution), doing all the CPU work —
+        adapter extraction, token counting, hashing, labelling, redaction — and,
+        crucially, SNAPSHOTTING the request contents out of `kwargs` into owned,
+        immutable data right here, before returning to the host. That snapshot
+        is why recording can then be deferred to another thread without risk:
+        the host may reuse/mutate its `messages` list for the next turn the
+        instant this returns, but the block text was already copied out.
+
+        How: mirrors the old inline pipeline exactly (so a sequentially-driven
+        call produces a byte-identical stored row), but STOPS before touching
+        the store — persistence is `persist()`'s job. Fail-open: any failure is
+        logged once (unless `quiet`) and swallowed, returning None so the caller
+        simply skips this call instead of the host ever seeing an error.
+        `quiet` (set only by a stream proxy's best-effort `__del__` finalize —
+        see trace.py) suppresses the warning at GC/interpreter-shutdown time,
+        when logging is pure noise at best and can itself misbehave."""
         try:
             raw = self._adapter.extract_blocks(kwargs)
-            params = self._adapter.extract_params(kwargs)
+            # DEEP-COPY the params here, on the calling thread, before returning.
+            # `extract_params` is a shallow dict comprehension whose values still
+            # alias the host's kwargs objects; params is only json.dumps'd later,
+            # on the writer thread. A host that passes a mutable param (metadata,
+            # extra_body, stop, logit_bias, response_format) and mutates it
+            # before that deferred write would otherwise corrupt this stored row.
+            # deepcopy (not a json round-trip) so a non-JSON-serializable value
+            # can't raise here and defeat the snapshot — and if deepcopy itself
+            # ever raised, the surrounding fail-open guard still swallows it.
+            params = copy.deepcopy(self._adapter.extract_params(kwargs))
             usage = self._adapter.extract_usage(response) if response is not None else None
             provider = self._adapter.provider
 
             call_blocks: list[CallBlock] = []
             for position, rb in enumerate(raw):
-                # Count tokens for this text under the provider, then build the
-                # content-addressed Block.
-                token_count, token_method = count_tokens(rb.text, provider)
-                block = Block(
-                    content_hash=content_hash(rb.role, rb.kind, rb.text),
-                    role=rb.role, kind=rb.kind, text=rb.text,
-                    token_count=token_count, token_method=token_method,
-                )
+                # Count tokens and take the content hash for this block — see
+                # `build_block` for the two adapter-supplied overrides (an
+                # image hashes its bytes and carries a pre-computed vision
+                # estimate; everything else hashes and tokenizes its text).
+                block = build_block(rb, provider)
                 # Redact after hashing/counting but before storage. The hash is
                 # kept from the original text so identity/dedup is stable even if
                 # redaction is nondeterministic; only the stored text changes.
@@ -74,14 +186,68 @@ class Recorder:
                     block=block, position=position,
                     label=label, label_source=label_source))
 
-            self._ct.record_call(seq=seq, params=params, usage=usage,
-                                 latency_ms=latency_ms, error=error,
-                                 call_blocks=call_blocks,
-                                 agent=agent, step=step, provider=provider)
+            return PersistJob(seq=seq, params=params, usage=usage,
+                              latency_ms=latency_ms, error=error,
+                              call_blocks=call_blocks,
+                              agent=agent, step=step, provider=provider)
         except Exception:  # noqa: BLE001 — fail-open is the whole point
             if not quiet:
-                _log.warning("ctxdiff: failed to record call seq=%s (tracing skipped)",
+                _log.warning("ctxdiff: failed to build call seq=%s (tracing skipped)",
                              seq, exc_info=True)
+            return None
+
+    def persist(self, job: PersistJob, quiet: bool = False) -> None:
+        """Phase 2 of recording — runs on the single WRITER thread. What: writes
+        one already-built `PersistJob` to the store in a single transaction.
+        How: a thin pass-through to the store's `record_call`; because every
+        write for a run funnels through one writer thread, this is the ONLY
+        place the connection is used for writing, so SQLite's thread-affinity
+        (and a network driver's single-cursor-at-a-time expectation) holds even
+        though the connection was opened on a different thread. Fail-open: a
+        failed write is swallowed — a broken store must never take down the
+        writer loop or, by extension, the host — and warned AT MOST ONCE for the
+        run (see `_warn_persist_once`), so a persistently-broken store (disk
+        full, read-only mount) can't flood the host's logs one line per call."""
+        try:
+            self._ct.record_call(seq=job.seq, params=job.params, usage=job.usage,
+                                 latency_ms=job.latency_ms, error=job.error,
+                                 call_blocks=job.call_blocks,
+                                 agent=job.agent, step=job.step, provider=job.provider)
+        except Exception:  # noqa: BLE001 — fail-open is the whole point
+            if not quiet:
+                self._warn_persist_once(job.seq)
+
+    def _warn_persist_once(self, seq: int) -> None:
+        """Emit the persist-failure warning AT MOST ONCE for this recorder, then
+        stay silent — mirrors `_Writer._degrade`'s one-time mechanism. Why: a
+        store that fails every write (disk full, read-only mount) would, with a
+        per-call log, spam one warning line per recorded call; a lock-guarded
+        `_persist_warned` flag makes only the FIRST failure log (with traceback)
+        and every later one a no-op. Never host-facing regardless — this only
+        ever reaches the `ctxdiff` logger."""
+        with self._persist_warn_lock:
+            if self._persist_warned:
+                return
+            self._persist_warned = True
+        _log.warning("ctxdiff: failed to persist call seq=%s; further persist "
+                     "failures in this run will be silent (tracing degraded)",
+                     seq, exc_info=True)
+
+    def record(self, seq: int, kwargs: dict, response: object | None,
+               latency_ms: int | None, error: str | None,
+               tagged: list[tuple[str, str]],
+               agent: str | None = None, step: str | None = None,
+               provider: str | None = None, quiet: bool = False) -> None:
+        """Build AND persist one call inline, on the calling thread — the
+        combined, synchronous path (`build()` then `persist()`). Retained for
+        callers/tests that drive the whole pipeline in one step and don't route
+        through the writer thread; the live capture path in trace.py instead
+        calls `build()` on the host thread and hands `persist()` to the writer.
+        Fail-open throughout via the two halves' own guards."""
+        job = self.build(seq, kwargs, response, latency_ms, error, tagged,
+                         agent, step, provider, quiet)
+        if job is not None:
+            self.persist(job, quiet)
 
     def _safe_redact(self, block: Block) -> Block:
         """Apply the redaction hook, but never let a throwing redactor break

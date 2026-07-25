@@ -8,8 +8,9 @@
  * waste note and fix hint. No I/O, no color.
  */
 import { diffCalls, distinctAgents, filterCalls, type TurnDiff, type InlineSegment } from "./diff.js";
-import type { Call, CallBlock } from "../models.js";
-import type { CTrace } from "../store/ctrace.js";
+import { IMAGE_KIND } from "../images.js";
+import type { Block, Call, CallBlock } from "../models.js";
+import type { ReadableStore } from "../store/base.js";
 
 // --- value types -------------------------------------------------------------
 
@@ -45,16 +46,24 @@ export interface CacheReport {
 
 /** Collapse text to a single flattened, truncated line (whitespace → single
  * spaces, then hard-cut at `limit` with an ellipsis). Mirrors Python
- * `_flatten_snippet`. */
-function flattenSnippet(text: string, limit = 80): string {
+ * `flatten_snippet`. */
+export function flattenSnippet(text: string, limit = 80): string {
   const flat = text.split(/\s+/u).filter((s) => s.length > 0).join(" ");
   return flat.slice(0, limit) + (flat.length > limit ? "…" : "");
 }
 
 /** Shorter truncation for a differing substring inside a 'modified' break's
- * detail. Mirrors Python `_truncate`. Slices by code point (like Python). */
+ * detail. Mirrors Python `_truncate`. Slices by code point (like Python).
+ *
+ * Flattened first, exactly like `flattenSnippet`: this substring is CAPTURED
+ * TEXT, and `detail` is a single line of a report that ends up inside a
+ * markdown fence in the GitHub Action's job summary. A prompt (or a tool schema,
+ * or a diff hunk) carrying a newline followed by a run of backticks would close
+ * that fence and render contributor-controlled markdown — on a fork pull
+ * request, outside-contributor markdown. */
 function truncate(text: string, limit = 40): string {
-  const chars = Array.from(text);
+  const flat = text.split(/\s+/u).filter((s) => s.length > 0).join(" ");
+  const chars = Array.from(flat);
   return chars.slice(0, limit).join("") + (chars.length > limit ? "…" : "");
 }
 
@@ -84,6 +93,35 @@ function firstDiffSegment(inlineDiff: InlineSegment[]): [number, string, string]
     idx++;
   }
   return [offset, oldPart, newPart];
+}
+
+/** The first few hex characters of a block's content hash, ellipsized — enough
+ * to tell two blocks apart in one line of terminal output and to grep for in the
+ * store, without printing 64 characters of noise. Mirrors Python
+ * `_short_digest`. */
+function shortDigest(contentHash: string, chars = 6): string {
+  return contentHash.slice(0, chars) + "…";
+}
+
+/**
+ * Explain a same-slot IMAGE change by naming the two blocks rather than by
+ * character offset.
+ *
+ * An image block's `text` is a DESCRIPTOR (`[image 1024×768 · ~765 tok]`), not
+ * its content, so two different screenshots that share a size produce an inline
+ * text diff that is entirely 'equal'. Run through the character-offset
+ * explanation, that told the user their prefix "breaks on every turn" and then
+ * showed them `first difference at char 7: '' → ''` — a real, expensive break
+ * with a blank explanation. The digests are the only thing that actually
+ * differs, so they are what gets reported. Mirrors Python
+ * `_image_change_detail`.
+ */
+function imageChangeDetail(label: string, oldBlock: Block | null, newBlock: Block): string {
+  const oldHash = oldBlock ? shortDigest(oldBlock.contentHash) : "?";
+  return (
+    `modified ${label} block — a different image at the same position: ` +
+    `sha ${oldHash} → ${shortDigest(newBlock.contentHash)}`
+  );
 }
 
 /** Heuristic for 'a small volatile substring inside otherwise-stable text'
@@ -122,6 +160,14 @@ function attributeBreak(
     (e) => e.kind === "modified" && e.positionOld === position && e.positionNew === position,
   );
   if (modified) {
+    if (modified.block.kind === IMAGE_KIND) {
+      // An image's text is a stand-in, so a character offset into it explains
+      // nothing (and its all-'equal' inline diff would satisfy the dynamic-field
+      // heuristic vacuously — a swapped screenshot is never "a volatile
+      // substring in otherwise-stable text").
+      const detail = imageChangeDetail(modified.label, modified.oldBlock, modified.block);
+      return ["modified", modified.label, flattenSnippet(modified.block.text), detail, false];
+    }
     const [offset, oldPart, newPart] = firstDiffSegment(modified.inlineDiff ?? []);
     const detail =
       `modified ${modified.label} block — first difference at ` +
@@ -168,6 +214,52 @@ function attributeBreak(
   const label = side ? side.label : "unknown";
   const detail = `context diverges at position ${position} (not a simple modify/insert/evict/reorder)`;
   return ["changed", label, flattenSnippet(text), detail, false];
+}
+
+// --- break grouping (shared by `cache` and `check`) ------------------------------
+
+/**
+ * Group PrefixBreaks that describe the "same" underlying culprit — (agent,
+ * culpritKind, culpritLabel, divergentPosition) — into one list per distinct
+ * culprit, in first-seen order. `agent` is part of the key so two agents
+ * breaking the same way at the same slot stay SEPARATE warnings. Grouping
+ * deliberately ignores the per-pair `detail`/`culpritSnippet` text (a changing
+ * timestamp's before/after values differ every pair by definition): what makes
+ * two breaks "the same warning" is that the same agent's same slot keeps
+ * breaking the same way. Mirrors Python `group_breaks`.
+ *
+ * Public and living beside the analyzer rather than inside the renderer,
+ * because it is pure data reduction over CacheReport with no formatting in it,
+ * and BOTH consumers need exactly this reduction: `ctxdiff cache`'s warning
+ * list and `ctxdiff check --require-stable-prefix`'s violation list.
+ */
+export function groupBreaks(breaks: PrefixBreak[]): PrefixBreak[][] {
+  const groups = new Map<string, PrefixBreak[]>();
+  const order: string[] = [];
+  for (const b of breaks) {
+    const key = JSON.stringify([b.agent, b.culpritKind, b.culpritLabel, b.divergentPosition]);
+    let arr = groups.get(key);
+    if (!arr) {
+      arr = [];
+      groups.set(key, arr);
+      order.push(key);
+    }
+    arr.push(b);
+  }
+  return order.map((k) => groups.get(k)!);
+}
+
+/** The pair count a break's frequency should be reported AGAINST: when the
+ * break is attributed to a named agent and the run was analyzed per-agent, that
+ * agent's own pair count — a researcher breaking on both of its 2 pairs is
+ * "2/2", not "2/3" of a run that also includes a stable writer. Falls back to
+ * the run-wide count for an unlabeled break or a single-timeline run. Mirrors
+ * Python `pairs_denominator`. */
+export function pairsDenominator(report: CacheReport, brk: PrefixBreak): number {
+  if (brk.agent !== null && report.pairsByAgent) {
+    return report.pairsByAgent.get(brk.agent) ?? report.pairsAnalyzed;
+  }
+  return report.pairsAnalyzed;
 }
 
 // --- waste note + fix hint ------------------------------------------------------
@@ -288,7 +380,7 @@ function analyzeGroup(
  * smallest stable-prefix token count across every analyzed pair. Mirrors Python
  * `analyze_cache`.
  */
-export function analyzeCache(ct: CTrace, agent: string | null = null): CacheReport {
+export function analyzeCache(ct: ReadableStore, agent: string | null = null): CacheReport {
   const calls = filterCalls(ct.getCalls(), agent);
   const blocksByCallId = new Map<string, CallBlock[]>();
   for (const c of calls) blocksByCallId.set(c.id, ct.getCallBlocks(c.id));

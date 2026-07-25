@@ -1,0 +1,4 @@
+── turn 1 → turn 2 · 2 blocks changed · +61 −0 tokens ──
++ [history·assistant] 'Voici la traduction demandée, en conservant chaque grappe de graphèmes…'  +25 tok
++ [user·user] 'Encore : 👨\u200d👩\u200d👧\u200d👦 famille ZWJ, 🏳️\u200d🌈 drapeau composé, 🏴\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f drapeau à …'  +36 tok
+= 3 unchanged blocks · 95 tok

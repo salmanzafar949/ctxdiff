@@ -1,0 +1,5 @@
+── turn 2 → turn 3 · 3 blocks changed · +198 −0 tokens ──
++ [history·assistant] 'Отлично. Проверка токенизации кириллицы прошла успешно.'  +16 tok
++ [user·user] 'مرحبا بالعالم! اختبار الترميز العربي مع نص من اليمين إلى اليسار. עברית…'  +41 tok
++ [user·user] "Edge cases in one line: combining 'é å ñ' vs precomposed 'é å ñ'; l…"  +141 tok
+= 5 unchanged blocks · 169 tok

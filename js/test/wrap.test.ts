@@ -159,6 +159,161 @@ describe("wrap: streaming via create({stream:true})", () => {
   });
 });
 
+describe("wrap: streaming snapshots the request at call time", () => {
+  // Regression: the deferred streaming record used to read the host's LIVE
+  // request object at finalize (after the stream drained), so a host that
+  // mutated its own messages array mid-stream (rewrite the turn, append an
+  // assistant placeholder to fill while streaming, reuse it next turn) got
+  // blocks recorded that were NEVER sent in this call. The interceptor now
+  // deep-clones the request synchronously at call time, so finalize records
+  // exactly what went out. FAILS pre-fix (records MUTATED/INJECTED), passes now.
+  it("records what was SENT even if the host mutates the array before consuming the stream", async () => {
+    const path = tmpTrace();
+    const client = stubClient(() =>
+      sseResponse([
+        {
+          id: "1",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+        },
+        {
+          id: "1",
+          object: "chat.completion.chunk",
+          choices: [],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        },
+      ]),
+    );
+    const tracer = init("proj", { path });
+    const wrapped = tracer.wrap(client) as OpenAI;
+
+    // The host's LIVE array — the object it will mutate mid-stream.
+    const messages: { role: "user" | "assistant"; content: string }[] = [
+      { role: "user", content: "ORIGINAL" },
+    ];
+    // A tag whose needle points at the ORIGINAL text: proves needle-matching
+    // still resolves against the snapshot (not the mutated live ref).
+    tracer.tag("the-question", ["ORIGINAL"]);
+
+    const stream = await wrapped.chat.completions.create({
+      model: "gpt-4o",
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    // Host mutates its own request BEFORE consuming the stream.
+    messages[0].content = "MUTATED";
+    messages.push({ role: "assistant", content: "INJECTED" });
+
+    for await (const _chunk of stream) {
+      void _chunk;
+    }
+    tracer.close();
+
+    const r = CTrace.open(path);
+    const calls = r.getCalls();
+    expect(calls).toHaveLength(1);
+    const cbs = r.getCallBlocks(calls[0].id);
+    // Exactly what was sent — no MUTATED text, no INJECTED assistant block.
+    expect(cbs.map((cb) => cb.block.text)).toEqual(["ORIGINAL"]);
+    // tag() needle matched the snapshot's text.
+    expect(cbs[0].label).toBe("the-question");
+    expect(cbs[0].labelSource).toBe("tagged");
+    r.close();
+  });
+});
+
+describe("wrap: NON-streaming snapshots the request at call time too", () => {
+  // Regression, and the twin of the streaming case above. The snapshot used to
+  // be taken only `if (streaming)`, on the reasoning that a non-streaming call
+  // "records synchronously in `.then`, before the host resumes". That is not
+  // what `.then` does: it runs on a later microtask, AFTER an await boundary, so
+  // every other branch of the host's fan-out has already had its turn. A
+  // concurrent branch that appends to the SAME messages array while the request
+  // is in flight was therefore recorded into that call — content the model never
+  // saw, in a file whose only job is to be evidence of what was sent.
+  //
+  // The snapshot is now unconditional. This is provider-agnostic plumbing in
+  // trace.ts, so it is pinned here on OpenAI as well as on Bedrock (where the
+  // defect was found) — see wrap-bedrock.test.ts.
+  it("a concurrent mutation during the in-flight await is NOT recorded", async () => {
+    const path = tmpTrace();
+    // The host's shared, live array — the object a concurrent branch appends to.
+    const messages: { role: "user" | "assistant"; content: string }[] = [
+      { role: "user", content: "ORIGINAL" },
+    ];
+    // The stub resolves only after the concurrent branch has run: it yields to
+    // the event loop, which is exactly the window a real network call opens.
+    const client = stubClient(() =>
+      jsonResponse({
+        id: "cmpl-1",
+        object: "chat.completion",
+        model: "gpt-4o",
+        choices: [
+          { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+      }),
+    );
+    const tracer = init("proj", { path });
+    const wrapped = tracer.wrap(client) as OpenAI;
+
+    const inFlight = wrapped.chat.completions.create({ model: "gpt-4o", messages });
+    // A second async branch mutating the shared array WHILE the call is in
+    // flight — the normal shape of an agent fan-out sharing one history.
+    const mutator = (async () => {
+      await Promise.resolve();
+      messages.push({ role: "assistant", content: "INJECTED-DURING-FLIGHT" });
+      messages[0].content = "MUTATED-DURING-FLIGHT";
+    })();
+    await Promise.all([inFlight, mutator]);
+    tracer.close();
+
+    const r = CTrace.open(path);
+    const calls = r.getCalls();
+    expect(calls).toHaveLength(1);
+    const cbs = r.getCallBlocks(calls[0].id);
+    // Exactly the one block that went on the wire.
+    expect(cbs.map((cb) => cb.block.text)).toEqual(["ORIGINAL"]);
+    r.close();
+  });
+
+  it("falls back to the live request when it is not structured-cloneable", async () => {
+    const path = tmpTrace();
+    const client = stubClient(() =>
+      jsonResponse({
+        id: "cmpl-1",
+        object: "chat.completion",
+        model: "gpt-4o",
+        choices: [
+          { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+      }),
+    );
+    const tracer = init("proj", { path });
+    const wrapped = tracer.wrap(client) as OpenAI;
+
+    // A function-valued member makes structuredClone throw. Fail-open: capture
+    // degrades to the live reference rather than the call failing.
+    const params = {
+      model: "gpt-4o",
+      messages: [{ role: "user" as const, content: "hi" }],
+      onUncloneable: () => undefined,
+    };
+    const res = await wrapped.chat.completions.create(params as never);
+    expect(res.choices[0].message.content).toBe("ok");
+    tracer.close();
+
+    const r = CTrace.open(path);
+    const calls = r.getCalls();
+    expect(calls).toHaveLength(1);
+    expect(r.getCallBlocks(calls[0].id).map((cb) => cb.block.text)).toEqual(["hi"]);
+    r.close();
+  });
+});
+
 describe("wrap: .stream() convenience helper", () => {
   it("records the call with folded usage and delivers every chunk", async () => {
     const path = tmpTrace();

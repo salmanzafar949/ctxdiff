@@ -1,0 +1,14 @@
+⚠ warning: [agent:driver] [user·modified] breaks the prefix on every turn (1/1 pairs)
+  '[image 2000×1200 · ~1.1k tok]'
+  modified user block — a different image at the same position: sha 53097b… → 51c707…
+⚠ warning: [agent:reviewer] [user·modified] breaks the prefix on every turn (1/1 pairs)
+  '[image 640×480 · ~1k tok]'
+  modified user block — a different image at the same position: sha ee1b26… → b1d3bc…
+⚠ warning: [agent:auditor] [user·modified] breaks the prefix on every turn (1/1 pairs)
+  '[image 1024×768 · ~765 tok]'
+  modified user block — a different image at the same position: sha 46bf52… → bf121f…
+
+pairs analyzed within 3 agents (cross-agent hand-offs are never counted as breaks)
+stable prefix (min): 12 tokens
+re-billed: 3,965 tokens
+3965 tokens re-billed across 3 turns that a stable prefix would have served from cache (cached input is typically billed at a fraction of the full input price — check your provider's current rates)

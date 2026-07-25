@@ -1,0 +1,36 @@
+run total · in 8,250 tok · out 478 tok (6/6 calls reported usage)
+  driver · in 3,760 · out 152
+  reviewer · in 2,910 · out 236
+  auditor · in 1,580 · out 90
+
+agents: driver · 2 calls · 3,832 tok   reviewer · 2 calls · 1,765 tok   auditor · 2 calls · 1,554 tok
+
+turn 1 · 896 / 500 tok · ⚠ 179.2% (~approx) [driver·observe]
+  █████████████████████████████  user              871 tok   97.2%
+  █                              system             25 tok    2.8%
+  provider reports 1,310 prompt tokens · Δ +414
+
+turn 2 · 2,936 / 500 tok · ⚠ 587.2% (~approx) [driver·observe]
+  ██████████████████████████████ user            2,911 tok   99.1%
+                                 system             25 tok    0.9%
+  provider reports 2,450 prompt tokens · Δ -486
+
+turn 3 · 672 / 500 tok · ⚠ 134.4% (~approx) [reviewer·critique]
+  █████████████████████████████  user              654 tok   97.3%
+  █                              system             18 tok    2.7%
+  provider reports 1,490 prompt tokens · Δ +818
+
+turn 4 · 1,093 / 500 tok · ⚠ 218.6% (~approx) [reviewer·critique]
+  ██████████████████████████████ user            1,075 tok   98.4%
+                                 system             18 tok    1.6%
+  provider reports 1,420 prompt tokens · Δ +327
+
+turn 5 · 777 / 500 tok · ⚠ 155.4% (~approx) [auditor·compare]
+  ██████████████████████████████ user              765 tok   98.5%
+                                 system             12 tok    1.5%
+  provider reports 790 prompt tokens · Δ +13
+
+turn 6 · 777 / 500 tok · ⚠ 155.4% (~approx) [auditor·compare]
+  ██████████████████████████████ user              765 tok   98.5%
+                                 system             12 tok    1.5%
+  provider reports 790 prompt tokens · Δ +13

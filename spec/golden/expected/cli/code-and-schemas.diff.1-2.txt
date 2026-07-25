@@ -1,0 +1,5 @@
+── turn 1 → turn 2 · 3 blocks changed · +147 −0 tokens ──
++ [history·assistant] '{"function": {"arguments": "{\\"source\\": \\"print([fib(i) for i in rang…'  +45 tok
++ [tool_output·tool] 'stdout: [1, 1, 2, 3, 5, 8] stderr: (empty) exit: 0'  +28 tok
++ [user·user] 'Right — so the seed is wrong. Show me the one-line fix and the SQL we …'  +74 tok
+= 4 unchanged blocks · 486 tok

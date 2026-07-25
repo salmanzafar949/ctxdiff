@@ -1,0 +1,5 @@
+ctxdiff check · 3 turns · session c10000000000
+PASS  max-context-pct        peak 2.7% of 1,000 tok window at turn 3 · limit 12.5% (125 tok)
+PASS  max-growth-pct         peak growth 69.2% at turn 2 · limit 99.5%
+
+check passed · 2 assertions

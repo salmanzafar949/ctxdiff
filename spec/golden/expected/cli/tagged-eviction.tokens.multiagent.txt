@@ -1,0 +1,38 @@
+run total · in 206 tok · out 40 tok (5/5 calls reported usage)
+  researcher · in 150 · out 27
+  writer · in 56 · out 13
+
+agents: researcher · 3 calls · 97 tok   writer · 2 calls · 40 tok
+
+turn 1 · 24 tokens [researcher·gather]
+  █████████████████              rag                14 tok   58.3%
+  █████████████                  system             10 tok   41.7%
+  provider reports 40 prompt tokens · Δ +16
+
+turn 2 · 15 tokens [writer·compose]
+  ██████████████████             system              9 tok   60.0%
+  ████████████                   user                6 tok   40.0%
+  provider reports 22 prompt tokens · Δ +7
+
+turn 3 · 38 tokens [researcher·gather]
+  ███████████                    rag                14 tok   36.8%
+  ████████                       system             10 tok   26.3%
+  ███████                        history             9 tok   23.7%
+  ████                           user                5 tok   13.2%
+  provider reports 58 prompt tokens · Δ +20
+
+turn 4 · 25 tokens [writer·compose]
+  ████████████                   history            10 tok   40.0%
+  ███████████                    system              9 tok   36.0%
+  ███████                        user                6 tok   24.0%
+  provider reports 34 prompt tokens · Δ +9
+
+turn 5 · 35 tokens [researcher·gather]
+  █████████████████              history            20 tok   57.1%
+  █████████                      system             10 tok   28.6%
+  ████                           user                5 tok   14.3%
+  provider reports 52 prompt tokens · Δ +17
+
+⚠ [agent:researcher] the block you tagged 'rag' at turn 1 was evicted at turn 5
+  'Retrieved passage: Mars has two moons, Phobos and Deimos.'
+  [rag·user] 14 tok · entered at turn 1 · last present at turn 3 · never returned

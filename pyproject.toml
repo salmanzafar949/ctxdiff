@@ -5,23 +5,108 @@ build-backend = "hatchling.build"
 [project]
 name = "ctxdiff"
 version = "0.4.1"
-description = "git diff for your agent's context window — a context-window debugger for LLM agents"
+description = "Find what breaks your LLM agent's prompt cache and wastes its context — git diff for the context window"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Salman Zafar" }]
-dependencies = ["tiktoken>=0.7"]
+# PINNED TO AN EXACT VERSION, ON PURPOSE — do not relax to `>=`.
+#
+# ctxdiff ships two SDKs (PyPI `ctxdiff`, npm `ctxdiff`) that promise the same
+# trace renders to the same numbers in both. They get those numbers from two
+# INDEPENDENT reimplementations of the same `o200k_base` BPE table — tiktoken
+# here, gpt-tokenizer in js/package.json — on independent release cadences. A
+# `.ctrace` itself is safe either way (a block's content hash is sha256 over
+# role + kind + text; token counts are NOT hashed), but every rendered number
+# is downstream of a token count, so the day the two libraries disagree on one
+# encoding, `ctxdiff tokens`, the cache profiler's re-billed totals and the
+# HTML dashboard's percentages diverge between the SDKs. Floating this to
+# `>=0.7` means a transitive resolver bump can change published numbers with
+# no ctxdiff commit behind it — invisible until a user reports it.
+#
+# TO RE-PIN (a deliberate, reviewable act — never a drive-by bump):
+#   1. bump this version AND `gpt-tokenizer` in js/package.json (keep the two
+#      libraries' encodings in step; re-pinning one alone is what drift IS),
+#   2. update `tokenizers.*.pinned_version` in spec/golden/manifest.json,
+#   3. run `python spec/golden/regenerate.py` — it rewrites the committed
+#      expectations AND cross-checks that the JS SDK reproduces them,
+#   4. review the resulting diff under spec/golden/expected/. An EMPTY diff
+#      means the tokenizers still agree with the previous release. A non-empty
+#      diff is the tokenizer changing its mind about real text: understand
+#      which encoding moved before merging it.
+dependencies = ["tiktoken==0.13.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
-eval = ["openai>=1.0", "anthropic>=0.30", "langchain-openai", "langchain-core", "respx>=0.21", "httpx", "google-genai>=1.0", "boto3>=1.34"]
+# `PyYAML` is a TEST-only dependency: `tests/test_action.py` parses `action.yml`
+# (ctxdiff's published GitHub Action) and asserts its inputs still match the
+# `ctxdiff check` flags. A hand-rolled scan would pass on a file YAML itself
+# rejects — which is the exact failure a smoke test for an Action must catch,
+# since a syntax error there only surfaces when someone else's workflow run
+# fails. Runtime deps stay tiktoken-only; nothing under src/ imports yaml.
+#
+# `ctxdiff[mcp]` is pulled in here because `tests/test_mcp.py` SPAWNS the real
+# server over stdio and drives real MCP requests through the official client —
+# the only way to prove the tool list, the result cap and `--redact` hold end to
+# end. The tests skip cleanly when it is absent, so `pip install -e .` still has
+# a green suite; CI installs `.[dev,eval]` and therefore runs them.
+dev = ["pytest>=8", "PyYAML>=6", "ctxdiff[mcp]"]
+# Storage backends. The core stays dependency-light (tiktoken only) and both
+# drivers are imported LAZILY, at connect time, so these extras are optional in
+# the real sense: without them ctxdiff still runs, and a store configured for a
+# backend whose extra is missing prints an install hint instead of crashing.
+postgres = ["psycopg[binary]>=3.1"]
+# PyMySQL over mysqlclient: pure Python (no compiler or MySQL client headers at
+# install time) and the same `%s` paramstyle as psycopg 3, which is what lets
+# both adapters share one set of parameterized statements.
+mysql = ["PyMySQL>=1.1"]
+# The MCP server (`ctxdiff mcp`), on the official Model Context Protocol Python
+# SDK. Optional for the same reason the database drivers are: the core stays
+# tiktoken-only, `ctxdiff.mcp` itself imports no SDK (only
+# `ctxdiff/mcp/server.py` does, lazily, from `_cmd_mcp`), and `ctxdiff mcp` on
+# an install without the extra prints a one-line install hint instead of an
+# ImportError traceback. Floor rather than pin: unlike the tokenizer, nothing
+# about the SDK's version can change a NUMBER ctxdiff reports — it only carries
+# JSON that the analyzers produced.
+mcp = ["mcp>=1.2"]
+# The real SDKs the eval suite drives with stubbed HTTP. `langchain-anthropic`
+# and `langgraph` are here because the callback handler's two hardest claims
+# are only testable with them: that the provider is derived correctly for a
+# NON-OpenAI integration (langchain-anthropic), and that a real graph run —
+# which is how anyone actually builds an agent — propagates the callbacks and
+# is captured turn by turn (langgraph). Every test in tests/eval/ skips
+# cleanly when the extra is absent, so `pip install -e .` stays green.
+#
+# `langchain-google-genai` and `langchain-aws` are here for one reason: they
+# are the only way to check the handler's Gemini and Bedrock branches against
+# a REAL request body. Those were the two branches with no wire-body test, and
+# they were the two that shipped dropping every non-text content part (a
+# vision turn recorded one block instead of two) and merging several text
+# parts into one — a bug that is invisible to a test comparing ctxdiff to
+# another copy of ctxdiff's own opinion. Both are stubbed below the SDK
+# (respx for google-genai's httpx transport, botocore's `before-send` hook for
+# boto3), so neither test needs a cloud account or a network.
+#
+# `langchain-google-vertexai` is deliberately NOT here. `ChatVertexAI` takes
+# the IDENTICAL `gemini` branch of `to_wire` (its provider mapping is pinned
+# in tests/test_langchain_adapter.py), so it would add no branch coverage —
+# and it cannot be driven offline anyway: it talks gRPC to
+# aiplatform.googleapis.com through google-auth default credentials, which
+# neither respx nor a botocore hook can intercept (a probe with anonymous
+# credentials reached the real endpoint and came back 401). Paying
+# google-cloud-aiplatform + grpcio + pyarrow + numpy for a test that needs a
+# live project is not a trade this suite should make.
+eval = ["openai>=1.0", "anthropic>=0.30", "langchain-openai", "langchain-core", "langchain-anthropic", "langchain-google-genai", "langchain-aws", "langgraph", "respx>=0.21", "httpx", "google-genai>=1.0", "boto3>=1.34"]
 
 [project.scripts]
-ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · view · export · runs)
+ctxdiff = "ctxdiff.cli:main"   # the ctxdiff CLI (diff · tokens · cache · check · view · export · sessions · agents · demo)
 
 [tool.hatch.build.targets.sdist]
 # Keep the source tarball lean — no 2.4MB demo GIF, no tests/CI in the pip download.
-exclude = ["assets", "tests", ".github", "docs"]
+# `spec/golden` goes with `tests`: the golden corpus is only meaningful next to
+# the test suites that assert against it (tests/test_golden.py here,
+# js/test/golden.test.ts there), and neither ships. `spec/ctrace-schema.md` is
+# NOT excluded — the on-disk format is documentation a downloader may want.
+exclude = ["assets", "tests", ".github", "docs", "spec/golden", "action.yml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ctxdiff"]

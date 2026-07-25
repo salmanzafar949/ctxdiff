@@ -1,0 +1,2 @@
+researcher  sessions=2  calls=5  tokens=2,905
+writer  sessions=2  calls=3  tokens=2,140

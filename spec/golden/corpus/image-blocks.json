@@ -1,0 +1,368 @@
+{
+  "id": "image-blocks",
+  "title": "Image blocks: every provider shape, every degradation, and dedup",
+  "why": "The `image` block representation, end to end. Every shape ctxdiff captures is here — OpenAI chat `image_url` (data URI and remote URL, `detail: high` and `detail: low`), OpenAI Responses `input_image` (data URI and `file_id`), Anthropic `source` (base64, url, file), Gemini `inline_data` and `file_data` — alongside all four sniffable formats (PNG, JPEG, GIF, WebP) and both degradations (an unknown format, and a remote URL that must NEVER be fetched). What the goldens pin: the descriptor text, the vision-token estimate under each provider's published formula, `token_method` staying `estimate` so `tokens` reports the call as approximate, and dedup — the same PNG sent on turn 1 and again on turn 2 is ONE block, so the diff reports it unchanged and the cache profiler sees a stable prefix. A non-image `inline_data` (audio) sits next to the images to prove only image MIME types leave the stable-JSON `content_part` path. Turn 2 also carries a SECOND, different 1024×768 PNG: same descriptor text as the first, different bytes, so it must be a separate block that the diff reports as ADDED — proof that identity is the pixels, not the label. The `auditor` agent (turns 5 and 6) is the end-to-end witness for the harder half of that: the two SAME-SIZED, DIFFERENT screenshots sit at the SAME position in consecutive turns of ONE agent, so they render the identical descriptor and break the cache prefix with an inline text diff that is entirely 'equal'. That pair pins the explanation the cache profiler must give — the two block digests, since a character offset into a stand-in descriptor explains nothing.",
+  "sessions": [
+    {
+      "run_id": "c1000000000000000000000000000001",
+      "project": "vision-fleet",
+      "started_at": "2026-04-11T09:30:00+00:00",
+      "provider": "openai",
+      "models": [
+        "gpt-4o",
+        "claude-sonnet-4-20250514",
+        "gemini-2.5-flash"
+      ],
+      "calls": [
+        {
+          "call_id": "d1000000000000000000000000000001",
+          "seq": 1,
+          "agent": "driver",
+          "step": "observe",
+          "provider": "openai",
+          "params": {
+            "model": "gpt-4o",
+            "temperature": 0.0
+          },
+          "usage": {
+            "prompt_tokens": 1310,
+            "completion_tokens": 64,
+            "total_tokens": 1374
+          },
+          "latency_ms": 1120,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            [
+              "system",
+              "message",
+              "You are a computer-use agent. Look at each screenshot, decide the next click, and never invent UI you cannot see."
+            ],
+            [
+              "user",
+              "content_part",
+              "{\"text\": \"Here is the current screen. What should I click?\", \"type\": \"text\"}"
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAMACAIAAAA12IJaAAAAC0lEQVR4nGNgYAAAAAMAAbitOmMAAAAASUVORK5CYII=",
+                  "detail": "high"
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://cdn.example.com/reference/palette.png"
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://cdn.example.com/reference/legend.png",
+                  "detail": "low"
+                }
+              }
+            ]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000002",
+          "seq": 2,
+          "agent": "driver",
+          "step": "observe",
+          "provider": "openai",
+          "params": {
+            "model": "gpt-4o",
+            "temperature": 0.0
+          },
+          "usage": {
+            "prompt_tokens": 2450,
+            "completion_tokens": 88,
+            "total_tokens": 2538
+          },
+          "latency_ms": 1340,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            [
+              "system",
+              "message",
+              "You are a computer-use agent. Look at each screenshot, decide the next click, and never invent UI you cannot see."
+            ],
+            [
+              "user",
+              "content_part",
+              "{\"text\": \"Here is the current screen. What should I click?\", \"type\": \"text\"}"
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAMACAIAAAA12IJaAAAAC0lEQVR4nGNgYAAAAAMAAbitOmMAAAAASUVORK5CYII=",
+                  "detail": "high"
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAB9AAAASwCAIAAAAsRkbpAAAAC0lEQVR4nGNgYAAAAAMAAbitOmMAAAAASUVORK5CYII=",
+                "detail": "high"
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "input_image",
+                "file_id": "file-3d9a17c04be84e2fb0c5"
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/bmp;base64,Qk1GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/webp;base64,UklGRh0AAABXRUJQVlA4TBEAAAAvK8ExAAAAAAAAAAAAAAAAAA==",
+                  "detail": "high"
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAMACAIAAAA12IJaAAAAC0lEQVR4nGNggAIAAAkAAftSuKkAAAAASUVORK5CYII=",
+                  "detail": "high"
+                }
+              }
+            ]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000003",
+          "seq": 3,
+          "agent": "reviewer",
+          "step": "critique",
+          "provider": "anthropic",
+          "params": {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024
+          },
+          "usage": {
+            "input_tokens": 1490,
+            "output_tokens": 140
+          },
+          "latency_ms": 1610,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            [
+              "system",
+              "message",
+              "Review the driver's proposed click against the screenshot it was given."
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/jpeg",
+                  "data": "/9j/4AAQSkZJRgABAQAAAQABAAD/wAARCAJYAyADASIAAhEBAxEB/9k="
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image",
+                "source": {
+                  "type": "url",
+                  "url": "https://cdn.example.com/reference/palette.png"
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image",
+                "source": {
+                  "type": "file",
+                  "file_id": "file_011CQrsTuVwXyZ"
+                }
+              }
+            ],
+            [
+              "user",
+              "message",
+              "Did the driver click a control that is actually visible?"
+            ]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000004",
+          "seq": 4,
+          "agent": "reviewer",
+          "step": "critique",
+          "provider": "gemini",
+          "params": {
+            "model": "gemini-2.5-flash",
+            "temperature": 0.2
+          },
+          "usage": {
+            "prompt_token_count": 1420,
+            "candidates_token_count": 96,
+            "total_token_count": 1516
+          },
+          "latency_ms": 980,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            [
+              "system",
+              "message",
+              "Review the driver's proposed click against the screenshot it was given."
+            ],
+            [
+              "user",
+              "image",
+              {
+                "inline_data": {
+                  "mime_type": "image/gif",
+                  "data": "R0lGODlhgALgAfAAAAAAAAAAADs="
+                }
+              }
+            ],
+            [
+              "user",
+              "image",
+              {
+                "file_data": {
+                  "mime_type": "image/jpeg",
+                  "file_uri": "https://generativelanguage.googleapis.com/v1beta/files/7k2m9qx4"
+                }
+              }
+            ],
+            [
+              "user",
+              "content_part",
+              "{\"inline_data\": {\"data\": \"UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=\", \"mime_type\": \"audio/wav\"}}"
+            ],
+            [
+              "user",
+              "content_part",
+              "{\"text\": \"Narrate what changed between the two frames.\"}"
+            ]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000005",
+          "seq": 5,
+          "agent": "auditor",
+          "step": "compare",
+          "provider": "openai",
+          "params": {
+            "model": "gpt-4o",
+            "temperature": 0.0
+          },
+          "usage": {
+            "prompt_tokens": 790,
+            "completion_tokens": 42,
+            "total_tokens": 832
+          },
+          "latency_ms": 870,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            [
+              "system",
+              "message",
+              "Audit consecutive screenshots for pixel drift the driver may have missed."
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAMACAIAAAA12IJaAAAAC0lEQVR4nGNgYAAAAAMAAbitOmMAAAAASUVORK5CYII=",
+                  "detail": "high"
+                }
+              }
+            ]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000006",
+          "seq": 6,
+          "agent": "auditor",
+          "step": "compare",
+          "provider": "openai",
+          "params": {
+            "model": "gpt-4o",
+            "temperature": 0.0
+          },
+          "usage": {
+            "prompt_tokens": 790,
+            "completion_tokens": 48,
+            "total_tokens": 838
+          },
+          "latency_ms": 910,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            [
+              "system",
+              "message",
+              "Audit consecutive screenshots for pixel drift the driver may have missed."
+            ],
+            [
+              "user",
+              "image",
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAMACAIAAAA12IJaAAAAC0lEQVR4nGNggAIAAAkAAftSuKkAAAAASUVORK5CYII=",
+                  "detail": "high"
+                }
+              }
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

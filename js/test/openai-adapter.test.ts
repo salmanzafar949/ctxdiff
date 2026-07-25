@@ -33,11 +33,14 @@ describe("OpenAIAdapter chat completions", () => {
           role: "user",
           content: [
             { type: "text", text: "look" },
-            { type: "image_url", image_url: { url: "http://x" } },
+            { type: "input_audio", input_audio: { data: "AAA=", format: "wav" } },
           ],
         },
       ],
     });
+    // Both parts keep the stable-JSON `content_part` path. An `image_url` part
+    // is the one that leaves it — it becomes an 'image' block instead; see
+    // test/images.test.ts.
     expect(blocks.map((b) => b.kind)).toEqual(["content_part", "content_part"]);
     expect(blocks[0].text).toBe('{"text": "look", "type": "text"}');
   });

@@ -1,0 +1,6 @@
+ctxdiff check · 1 turn · agent writer · session e7f8a9b0c1d2
+PASS  max-context            peak 52 tok (~approx) at turn 4 · limit 200
+PASS  require-stable-prefix  fewer than 2 turns — no pairs to check
+PASS  max-growth             fewer than 2 turns — no growth to measure
+
+check passed · 3 assertions

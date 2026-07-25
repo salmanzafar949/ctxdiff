@@ -1,7 +1,7 @@
 {
   "name": "ctxdiff",
   "version": "0.1.0",
-  "description": "git diff for your agent's context window — a local-first context-window debugger for LLM agents. Wrap your OpenAI/Anthropic/Gemini client in one line and record every call's context into a shareable .ctrace, then diff turns, profile prompt-cache breaks, and open a self-contained HTML dashboard. Cross-compatible with the Python ctxdiff SDK.",
+  "description": "Find what breaks your LLM agent's prompt cache and wastes its context — git diff for the context window. A local-first context-window debugger for LLM agents. Wrap your OpenAI/Anthropic/Gemini/Bedrock client in one line and record every call's context into a shareable .ctrace, then diff turns, profile prompt-cache breaks, and open a self-contained HTML dashboard. Cross-compatible with the Python ctxdiff SDK.",
   "type": "module",
   "license": "Apache-2.0",
   "author": "Salman Zafar (https://salmanzafar.dev)",
@@ -20,6 +20,8 @@
     "anthropic",
     "claude",
     "gemini",
+    "bedrock",
+    "aws",
     "context",
     "context-engineering",
     "debugger",
@@ -56,18 +58,31 @@
   "scripts": {
     "build": "tsup && node scripts/fix-node-sqlite.mjs && tsc --emitDeclarationOnly --outDir dist",
     "test": "vitest run",
+    "test:golden": "vitest run test/golden.test.ts",
+    "golden:regen": "node ../spec/golden/run-regenerate.mjs",
     "typecheck": "tsc --noEmit"
   },
+  "//gpt-tokenizer": [
+    "PINNED TO AN EXACT VERSION, ON PURPOSE - do not restore the ^ caret.",
+    "ctxdiff ships two SDKs (npm `ctxdiff`, PyPI `ctxdiff`) that promise the same trace renders to the same numbers in both. They get those numbers from two INDEPENDENT reimplementations of the same o200k_base BPE table - gpt-tokenizer here, tiktoken in ../pyproject.toml - on independent release cadences. A .ctrace itself is safe either way (a block's content hash is sha256 over role + kind + text; token counts are NOT hashed), but every rendered number is downstream of a token count, so the day the two libraries disagree on one encoding, `ctxdiff tokens`, the cache profiler's re-billed totals and the HTML dashboard's percentages diverge between the SDKs. A caret range lets `npm install` in a fresh clone pull a newer minor that changes published numbers with no ctxdiff commit behind it - invisible until a user reports it.",
+    "TO RE-PIN (a deliberate, reviewable act - never a drive-by bump): 1. bump this version AND `tiktoken` in ../pyproject.toml (keep the two libraries' encodings in step; re-pinning one alone is what drift IS), 2. update tokenizers.*.pinned_version in ../spec/golden/manifest.json, 3. run `npm run golden:regen` (or `python spec/golden/regenerate.py` from the repo root) - it rewrites the committed expectations AND cross-checks that both SDKs reproduce them, 4. review the diff under spec/golden/expected/. An EMPTY diff means the tokenizers still agree with the previous release. A non-empty diff is the tokenizer changing its mind about real text: understand which encoding moved before merging it."
+  ],
   "dependencies": {
-    "gpt-tokenizer": "^3.4.0"
+    "gpt-tokenizer": "3.4.0"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.30",
+    "@aws-sdk/client-bedrock-runtime": ">=3",
     "@google/genai": ">=0.3",
-    "openai": ">=4"
+    "mysql2": ">=3",
+    "openai": ">=4",
+    "pg": ">=8"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "@aws-sdk/client-bedrock-runtime": {
       "optional": true
     },
     "@google/genai": {
@@ -75,15 +90,31 @@
     },
     "openai": {
       "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.114.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1095.0",
     "@google/genai": "^2.13.0",
+    "@langchain/aws": "^1.4.3",
+    "@langchain/core": "^1.2.3",
+    "@langchain/google-genai": "^2.2.0",
+    "@langchain/langgraph": "^1.4.8",
+    "@langchain/openai": "^1.5.5",
     "@types/node": "^26.1.1",
+    "@types/pg": "^8.20.0",
+    "mysql2": "^3.23.1",
     "openai": "^6.49.0",
+    "pg": "^8.22.0",
     "tsup": "^8.5.1",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "zod": "^4.4.3"
   }
 }

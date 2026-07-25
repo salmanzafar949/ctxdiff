@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+from ctxdiff.images import image_raw_block
 from ctxdiff.models import RawBlock
 
 # Request keys that carry block *content* rather than sampling params for the
@@ -113,6 +114,13 @@ class OpenAIAdapter:
             if isinstance(content, list):
                 out = []
                 for part in content:
+                    # An `input_image` part becomes an 'image' block whose text
+                    # is a short descriptor and whose identity is the image
+                    # bytes — never the base64 payload. See ctxdiff.images.
+                    image = image_raw_block(role, part, self.provider)
+                    if image is not None:
+                        out.append(image)
+                        continue
                     if isinstance(part, dict) and part.get("type") in _RESPONSES_TEXT_PART_TYPES:
                         text = part.get("text", "")
                     else:
@@ -161,6 +169,13 @@ class OpenAIAdapter:
             has_calls = bool(tool_calls) or bool(function_call)
             if isinstance(content, list):
                 for part in content:
+                    # An `image_url` part becomes an 'image' block whose text
+                    # is a short descriptor and whose identity is the image
+                    # bytes — never the base64 data URI. See ctxdiff.images.
+                    image = image_raw_block(role, part, self.provider)
+                    if image is not None:
+                        blocks.append(image)
+                        continue
                     blocks.append(RawBlock(
                         role=role, kind="content_part",
                         text=part if isinstance(part, str)

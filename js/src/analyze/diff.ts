@@ -8,7 +8,7 @@
 import { SequenceMatcher } from "./sequence-matcher.js";
 import type { Block, CallBlock } from "../models.js";
 import type { Call } from "../models.js";
-import type { CTrace } from "../store/ctrace.js";
+import type { ReadableStore } from "../store/base.js";
 
 // --- agent-awareness helpers -------------------------------------------------
 
@@ -22,7 +22,7 @@ export function filterCalls(calls: Call[], agent: string | null): Call[] {
 
 /** Load every call from `ct` and filter to `agent` (null = whole run). Mirrors
  * Python `agent_calls`. */
-export function agentCalls(ct: CTrace, agent: string | null): Call[] {
+export function agentCalls(ct: ReadableStore, agent: string | null): Call[] {
   return filterCalls(ct.getCalls(), agent);
 }
 
@@ -311,17 +311,31 @@ export function diffCalls(
  * Resolve two turn numbers (call.seq) to their calls in `ct`, load each call's
  * blocks, and delegate to `diffCalls`. Throws a clear Error if either turn has
  * no matching call. Mirrors Python `diff_turns`.
+ *
+ * `labels` spells the two turns as the USER typed them, for the not-found
+ * message only. Python's `--turn` is an arbitrary-precision int, so it echoes
+ * `1000000000000000000000` verbatim; the same value as a JS number renders
+ * `1e+21`, which is not what anyone typed. Callers that already hold the raw
+ * text (the CLI does) pass it; anything else gets the numbers, unchanged.
  */
-export function diffTurns(ct: CTrace, turnOld: number, turnNew: number): TurnDiff {
+export function diffTurns(
+  ct: ReadableStore,
+  turnOld: number,
+  turnNew: number,
+  labels?: [string, string],
+): TurnDiff {
   const calls = ct.getCalls();
   const bySeq = new Map<number, Call>(calls.map((c) => [c.seq, c]));
-  const missing = [turnOld, turnNew].filter((s) => !bySeq.has(s));
+  const shown = labels ?? [String(turnOld), String(turnNew)];
+  const missing = [turnOld, turnNew]
+    .map((s, i) => ({ seq: s, text: shown[i] }))
+    .filter((t) => !bySeq.has(t.seq));
   if (missing.length) {
     const available = calls.map((c) => c.seq).sort((a, b) => a - b);
     // Python list repr: `[1, 2, 3]` (space after each comma), not JSON's `[1,2,3]`.
-    const pyList = (arr: number[]) => "[" + arr.join(", ") + "]";
+    const pyList = (arr: Array<number | string>) => "[" + arr.join(", ") + "]";
     throw new Error(
-      `turn(s) ${pyList(missing)} not found in this run ` +
+      `turn(s) ${pyList(missing.map((t) => t.text))} not found in this run ` +
         `(available turns: ${pyList(available)})`,
     );
   }

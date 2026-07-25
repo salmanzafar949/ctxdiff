@@ -23,8 +23,9 @@ from ctxdiff.analyze.differ import (
     distinct_agents,
     filter_calls,
 )
+from ctxdiff.images import IMAGE_KIND
 from ctxdiff.models import CallBlock
-from ctxdiff.store.ctrace import Call, CTrace
+from ctxdiff.store.base import Call, Store
 
 # --- value types -------------------------------------------------------------
 
@@ -98,7 +99,7 @@ class CacheReport:
 # --- snippet formatting -------------------------------------------------------
 
 
-def _flatten_snippet(text: str, limit: int = 80) -> str:
+def flatten_snippet(text: str, limit: int = 80) -> str:
     """Collapse a block's text to a single flattened, truncated line for
     display (newlines/repeated whitespace -> single spaces, then hard-cut at
     `limit` chars with an ellipsis marker). Kept plain (no quoting/repr) —
@@ -112,8 +113,17 @@ def _truncate(text: str, limit: int = 40) -> str:
     """Shorter truncation for the differing substring embedded in a
     'modified' break's `detail` string — the point there is to show just
     enough of the change to recognize it (e.g. a timestamp), not the whole
-    block."""
-    return text[:limit] + ("…" if len(text) > limit else "")
+    block.
+
+    Flattened first, exactly like `flatten_snippet`: this substring is
+    CAPTURED TEXT, and `detail` is a single line of a report that ends up
+    inside a markdown fence in the GitHub Action's job summary. A prompt (or a
+    tool schema, or a diff hunk) carrying a newline followed by a run of
+    backticks would close that fence and render contributor-controlled markdown
+    — on a fork pull request, outside-contributor markdown. One line in, one
+    line out, at the source rather than at each display."""
+    flat = " ".join(text.split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
 # --- first-difference extraction (from the differ's inline diff) --------------
@@ -145,6 +155,29 @@ def _first_diff_segment(inline_diff: list[tuple[str, str]]) -> tuple[int, str, s
             new_part += seg
         idx += 1
     return offset, old_part, new_part
+
+
+def _short_digest(content_hash: str, chars: int = 6) -> str:
+    """The first few hex characters of a block's content hash, ellipsized —
+    enough to tell two blocks apart in one line of terminal output and to grep
+    for in the store, without printing 64 characters of noise."""
+    return content_hash[:chars] + "…"
+
+
+def _image_change_detail(label: str, old_block, new_block) -> str:
+    """Explain a same-slot IMAGE change by naming the two blocks rather than by
+    character offset.
+
+    An image block's `text` is a DESCRIPTOR (`[image 1024×768 · ~765 tok]`), not
+    its content, so two different screenshots that share a size produce an
+    inline text diff that is entirely 'equal'. Run through the character-offset
+    explanation, that told the user their prefix "breaks on every turn" and then
+    showed them `first difference at char 7: '' → ''` — a real, expensive break
+    with a blank explanation. The digests are the only thing that actually
+    differs, so they are what gets reported."""
+    old_hash = _short_digest(old_block.content_hash) if old_block is not None else "?"
+    return (f"modified {label} block — a different image at the same position: "
+            f"sha {old_hash} → {_short_digest(new_block.content_hash)}")
 
 
 def _is_dynamic_change(inline_diff: list[tuple[str, str]]) -> bool:
@@ -195,11 +228,19 @@ def _attribute_break(
         None,
     )
     if modified is not None:
+        if modified.block.kind == IMAGE_KIND:
+            # An image's text is a stand-in, so a character offset into it
+            # explains nothing (and its all-'equal' inline diff would satisfy
+            # the dynamic-field heuristic vacuously — a swapped screenshot is
+            # never "a volatile substring in otherwise-stable text").
+            detail = _image_change_detail(modified.label, modified.old_block, modified.block)
+            return ("modified", modified.label, flatten_snippet(modified.block.text),
+                    detail, False)
         offset, old_part, new_part = _first_diff_segment(modified.inline_diff or [])
         detail = (f"modified {modified.label} block — first difference at "
                   f"char {offset}: '{_truncate(old_part)}' → '{_truncate(new_part)}'")
         is_dynamic = _is_dynamic_change(modified.inline_diff or [])
-        return ("modified", modified.label, _flatten_snippet(modified.block.text),
+        return ("modified", modified.label, flatten_snippet(modified.block.text),
                 detail, is_dynamic)
 
     added = next(
@@ -209,7 +250,7 @@ def _attribute_break(
     if added is not None:
         detail = (f"block inserted at position {position} — {added.label}/"
                   f"{added.block.role} block not present in the previous turn")
-        return ("added", added.label, _flatten_snippet(added.block.text), detail, False)
+        return ("added", added.label, flatten_snippet(added.block.text), detail, False)
 
     evicted = next(
         (e for e in turn_diff.entries if e.kind == "evicted" and e.position_old == position),
@@ -218,7 +259,7 @@ def _attribute_break(
     if evicted is not None:
         detail = (f"block evicted at position {position} — {evicted.label}/"
                   f"{evicted.block.role} block from the previous turn is missing here")
-        return ("evicted", evicted.label, _flatten_snippet(evicted.block.text), detail, False)
+        return ("evicted", evicted.label, flatten_snippet(evicted.block.text), detail, False)
 
     # A pure position swap: the differ's move-reconciliation folds both sides
     # of the swap into 'unchanged' entries (same content_hash, just a
@@ -237,7 +278,7 @@ def _attribute_break(
         detail = (f"block reordered — {reordered.label}/{reordered.block.role} moved "
                   f"from position {reordered.position_old} to {reordered.position_new}, "
                   f"breaking the byte-for-byte prefix match at position {position}")
-        return ("reordered", reordered.label, _flatten_snippet(reordered.block.text),
+        return ("reordered", reordered.label, flatten_snippet(reordered.block.text),
                 detail, False)
 
     # Final fallback: some other structural shape neither classified above
@@ -250,10 +291,45 @@ def _attribute_break(
     text = side.block.text if side else ""
     label = side.label if side else "unknown"
     detail = f"context diverges at position {position} (not a simple modify/insert/evict/reorder)"
-    return ("changed", label, _flatten_snippet(text), detail, False)
+    return ("changed", label, flatten_snippet(text), detail, False)
 
 
 # --- waste note + fix hint ------------------------------------------------------
+
+
+def group_breaks(breaks: list[PrefixBreak]) -> list[list[PrefixBreak]]:
+    """Group PrefixBreaks that describe the "same" underlying culprit —
+    (agent, culprit_kind, culprit_label, divergent_position) — into one list
+    per distinct culprit, in first-seen order. `agent` is part of the key so
+    two agents breaking the same way at the same slot stay SEPARATE warnings
+    (each carries its own agent chip). Grouping deliberately ignores the
+    per-pair `detail`/`culprit_snippet` text (a changing timestamp's exact
+    before/after values differ every pair by definition) — what makes two
+    breaks "the same warning" is that the same agent's same slot keeps
+    breaking the same way, not that the literal diff text is identical.
+
+    Public and living beside the analyzer rather than inside a renderer,
+    because it is pure data reduction over CacheReport with no formatting in
+    it, and BOTH consumers need exactly this reduction: `ctxdiff cache`'s
+    warning list and `ctxdiff check --require-stable-prefix`'s violation list.
+    Two copies could drift into collapsing different things and reporting
+    different break counts for one trace."""
+    groups: dict[tuple[str | None, str, str, int], list[PrefixBreak]] = {}
+    for b in breaks:
+        key = (b.agent, b.culprit_kind, b.culprit_label, b.divergent_position)
+        groups.setdefault(key, []).append(b)
+    return list(groups.values())
+
+
+def pairs_denominator(report: CacheReport, brk: PrefixBreak) -> int:
+    """The pair count a break's frequency should be reported AGAINST: when the
+    break is attributed to a named agent and the run was analyzed per-agent,
+    that agent's own pair count — a researcher breaking on both of its 2 pairs
+    is "2/2", not "2/3" of a run that also includes a stable writer. Falls back
+    to the run-wide count for an unlabeled break or a single-timeline run."""
+    if brk.agent is not None and report.pairs_by_agent:
+        return report.pairs_by_agent.get(brk.agent, report.pairs_analyzed)
+    return report.pairs_analyzed
 
 
 def _waste_note(rebilled_tokens_total: int, pairs_analyzed: int) -> str:
@@ -384,7 +460,7 @@ def _analyze_group(
     return breaks, dynamic_flags, stable_tokens_per_pair, rebilled_total
 
 
-def analyze_cache(ct: CTrace, agent: str | None = None) -> CacheReport:
+def analyze_cache(ct: Store, agent: str | None = None) -> CacheReport:
     """Analyze a run for cache-prefix stability (spec §6.4), agent-aware.
 
     Grouping semantics (the correctness fix this feature exposes): cache

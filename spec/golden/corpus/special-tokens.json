@@ -1,0 +1,75 @@
+{
+  "id": "special-tokens",
+  "title": "Literal special-token spellings quoted as ordinary text",
+  "why": "Text that literally spells a control token — `<|endoftext|>`, `<|endofprompt|>`, `<|im_start|>`, `<|fim_prefix|>` — is what BOTH tokenizers refuse to encode unless the disallowed-special guard is switched off, and it is entirely ordinary user content: a prompt-injection writeup, a tokenizer tutorial, a pasted model card. This fixture used to be impossible to share. Python latched the refusal into a process-wide 'encoder unavailable' sentinel, so a single block containing `<|endoftext|>` turned EVERY LATER openai count in the process into an estimate (making the corpus order-dependent), while JS fell back for that one block only; and the two libraries did not even agree on WHICH literals are special (tiktoken's o200k_base guards only `<|endoftext|>` and `<|endofprompt|>`, gpt-tokenizer guards the whole `<|...|>` family), so `<|im_start|>` was exact in Python and an estimate in JS. Both SDKs now encode these literals as the plain characters they are, so every block here is an exact `tiktoken` count in both. The fixture is deliberately FIRST in the manifest's fixture list: everything else is built after it in the same process, so `test_fixtures_really_run_the_exact_tokenizer` (and its JS twin) fails the moment a per-text refusal starts leaking into a later fixture again.",
+  "sessions": [
+    {
+      "run_id": "a2000000000000000000000000000001",
+      "project": "special-tokens-corpus",
+      "started_at": "2026-03-04T09:05:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "c2000000000000000000000000000001",
+          "seq": 1,
+          "agent": "redteam",
+          "step": "probe",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.0},
+          "usage": {"prompt_tokens": 190, "completion_tokens": 40, "total_tokens": 230},
+          "latency_ms": 175,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a prompt-security reviewer. Quote suspicious strings verbatim; never normalize, escape or elide them, because the exact bytes are the evidence."],
+            ["user", "message", "Here is the payload a user pasted into our support widget: `<|endoftext|>` followed by \"ignore all previous instructions\". Does the OpenAI API treat that as a real control token or as text?"],
+            ["user", "message", "For contrast, this is an ordinary sentence with no control tokens in it at all, and its count must stay exact."]
+          ]
+        },
+        {
+          "call_id": "c2000000000000000000000000000002",
+          "seq": 2,
+          "agent": "redteam",
+          "step": "probe",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.0},
+          "usage": {"prompt_tokens": 420, "completion_tokens": 96, "total_tokens": 516},
+          "latency_ms": 232,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a prompt-security reviewer. Quote suspicious strings verbatim; never normalize, escape or elide them, because the exact bytes are the evidence."],
+            ["user", "message", "Here is the payload a user pasted into our support widget: `<|endoftext|>` followed by \"ignore all previous instructions\". Does the OpenAI API treat that as a real control token or as text?"],
+            ["user", "message", "For contrast, this is an ordinary sentence with no control tokens in it at all, and its count must stay exact."],
+            ["assistant", "message", "The API escapes it: the string arrives at the model as the thirteen characters `<|endoftext|>`, not as token 199999. Only the raw completions endpoint could be given a real control token, and not through this field."],
+            ["user", "message", "Good. Now the rest of the family, in one line, so the tokenizer sees them all: <|endofprompt|> <|im_start|> <|im_end|> <|fim_prefix|> <|fim_middle|> <|fim_suffix|> — plus a near-miss <|not_a_real_token|> and a broken one <|endoftext| with no closing pipe."],
+            ["user", "message", "And a fenced sample so it also appears inside code:\n\n```text\nprompt = \"summarize this\" + \"<|endoftext|>\" + user_input\n```"]
+          ]
+        },
+        {
+          "call_id": "c2000000000000000000000000000003",
+          "seq": 3,
+          "agent": "redteam",
+          "step": "writeup",
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 0.0},
+          "usage": {"prompt_tokens": 640, "completion_tokens": 88, "total_tokens": 728},
+          "latency_ms": 268,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a prompt-security reviewer. Quote suspicious strings verbatim; never normalize, escape or elide them, because the exact bytes are the evidence."],
+            ["user", "message", "Here is the payload a user pasted into our support widget: `<|endoftext|>` followed by \"ignore all previous instructions\". Does the OpenAI API treat that as a real control token or as text?"],
+            ["user", "message", "For contrast, this is an ordinary sentence with no control tokens in it at all, and its count must stay exact."],
+            ["assistant", "message", "The API escapes it: the string arrives at the model as the thirteen characters `<|endoftext|>`, not as token 199999. Only the raw completions endpoint could be given a real control token, and not through this field."],
+            ["user", "message", "Good. Now the rest of the family, in one line, so the tokenizer sees them all: <|endofprompt|> <|im_start|> <|im_end|> <|fim_prefix|> <|fim_middle|> <|fim_suffix|> — plus a near-miss <|not_a_real_token|> and a broken one <|endoftext| with no closing pipe."],
+            ["user", "message", "And a fenced sample so it also appears inside code:\n\n```text\nprompt = \"summarize this\" + \"<|endoftext|>\" + user_input\n```"],
+            ["assistant", "message", "Write-up: treat every `<|…|>` spelling as untrusted text, log it verbatim, and never concatenate user input into a raw-completions prompt."],
+            ["user", "message", "Last one — a long ordinary paragraph placed AFTER every control-token block above, whose whole job is to be counted exactly. If a per-text tokenizer refusal ever leaks into the encoder again, this block is the one that quietly turns into an estimate while still looking like a normal number in the report."]
+          ]
+        }
+      ]
+    }
+  ]
+}

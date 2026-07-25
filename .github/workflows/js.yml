@@ -30,10 +30,12 @@ on:
     branches: [main]
     paths:
       - "js/**"
+      - "spec/golden/**"
       - ".github/workflows/js.yml"
   pull_request:
     paths:
       - "js/**"
+      - "spec/golden/**"
       - ".github/workflows/js.yml"
   workflow_dispatch:
 
@@ -51,8 +53,54 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: js/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The cross-language conformance tests (js/test/conformance.test.ts) skip
+      # themselves unless <repo>/venv/bin/python exists — and `venv/` is
+      # gitignored, so on a bare runner every parity assertion silently
+      # no-op'd and a JS/Python format regression could merge green. Build the
+      # venv the tests look for and install the Python SDK into it so those
+      # tests actually RUN. `working-directory: .` overrides the job-level
+      # `js` default: the venv must live at the REPO ROOT, where the tests
+      # resolve it (`resolve(process.cwd(), "..")`).
+      - name: Install the Python SDK into ./venv (for cross-language conformance)
+        working-directory: .
+        run: |
+          python -m venv venv
+          ./venv/bin/pip install -e .
+      # Hard gate, not a nicety. Everything below that compares the two SDKs
+      # degrades to a silent no-op without this interpreter, so its absence must
+      # end the job here with a message naming the cause — rather than 200 green
+      # ticks that quietly checked nothing.
+      - name: Assert the conformance venv exists (a missing one must FAIL, not skip)
+        working-directory: .
+        run: |
+          test -x ./venv/bin/python || {
+            echo "::error::./venv/bin/python is missing — the cross-language conformance and golden checks cannot run."
+            exit 1
+          }
+          ./venv/bin/python -c "import ctxdiff; print('python ctxdiff', ctxdiff.__version__)"
       - run: npm ci
       - run: npm run build
+      # The cross-SDK golden corpus, run FIRST and by itself so its verdict is a
+      # named line in the CI log rather than three of four hundred dots. It
+      # rebuilds every fixture in spec/golden/corpus/ with THIS SDK's tokenizer
+      # and compares against the committed expectations under
+      # spec/golden/expected/ — the same files the Python suite compares against.
+      # Nothing here can skip: a missing expectation throws, and the pinned
+      # gpt-tokenizer version is asserted rather than assumed.
+      - name: Golden corpus — JS side must reproduce the committed numbers
+        run: npm run test:golden
+      # ...and the PYTHON side of the very same goldens, using the venv built
+      # above. This is what makes a JS pull request that regenerates the corpus
+      # safe to merge: without it, a contributor could rewrite the shared
+      # expectations to match a JS-only drift and this workflow would happily
+      # agree with itself. Requiring both SDKs to reproduce the committed
+      # numbers, in the workflow where the change lands, is the whole point.
+      - name: Golden corpus — Python side must reproduce the SAME numbers
+        working-directory: .
+        run: ./venv/bin/python spec/golden/regenerate.py --check --no-js
       - run: npm test
 
   publish:

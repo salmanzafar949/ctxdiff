@@ -1,0 +1,4 @@
+ctxdiff check · 2 turns · agent writer · session e90000000000
+PASS  no-tagged-eviction     no tagged blocks in this run — nothing to lose (tag load-bearing content with tracer.tag)
+
+check passed · 1 assertion

@@ -59,9 +59,11 @@ def test_extract_blocks_handles_contents_list_with_dict_parts_and_role_mapping()
 
 
 def test_extract_blocks_content_part_non_text_part_serializes_stable_json():
-    """A part that is neither a plain string nor a dict with a 'text' key is
-    serialized to stable (sort_keys) JSON so it stays diffable."""
-    kwargs = {"contents": [{"role": "user", "parts": [{"inline_data": {"mime_type": "image/png", "data": "xyz"}}]}]}
+    """A part that is neither a plain string, nor a dict with a 'text' key, nor
+    an image is serialized to stable (sort_keys) JSON so it stays diffable.
+    Non-image `inline_data` (audio here) deliberately keeps this path: only an
+    image MIME type is rerouted to an image block (see test_images.py)."""
+    kwargs = {"contents": [{"role": "user", "parts": [{"inline_data": {"mime_type": "audio/wav", "data": "xyz"}}]}]}
     blocks = GeminiAdapter().extract_blocks(kwargs)
     assert blocks[0].kind == "content_part"
     assert "inline_data" in blocks[0].text

@@ -1,0 +1,5 @@
+── turn 1 → turn 2 · 3 blocks changed · +99 −0 tokens ──
++ [history·assistant] '{"function": {"arguments": "{\\"selector\\": \\"</script> </ script>\\", \\…'  +43 tok
++ [tool_output·tool] '{"call_id": "call_v1", "output": "<div class=\\"panel\\"><script>alert(\'…'  +36 tok
++ [user·user] 'Now transcribe the literal text you saw, including the </script> seque…'  +20 tok
+= 5 unchanged blocks · 404 tok

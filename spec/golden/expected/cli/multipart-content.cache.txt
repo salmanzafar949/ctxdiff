@@ -1,0 +1,1 @@
+✓ prefix stable across all 1 turn pairs — minimum stable prefix 404 tokens

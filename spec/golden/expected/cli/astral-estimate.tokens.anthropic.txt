@@ -1,0 +1,12 @@
+run total · in 325 tok · out 114 tok (2/2 calls reported usage)
+
+turn 1 · 51 tokens (~approx) [reviewer·audit]
+  ████████████████               user               28 tok   54.9%
+  ██████████████                 system             23 tok   45.1%
+  provider reports 120 prompt tokens · Δ +69
+
+turn 2 · 104 tokens (~approx) [reviewer·audit]
+  █████████████████              user               58 tok   55.8%
+  ███████                        system             23 tok   22.1%
+  ███████                        history            23 tok   22.1%
+  provider reports 205 prompt tokens · Δ +101

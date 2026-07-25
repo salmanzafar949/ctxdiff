@@ -43,6 +43,30 @@ The eval suite drives the **real** `openai` / `anthropic` / `langchain` SDKs wit
 
 ---
 
+## The cross-SDK golden corpus
+
+`ctxdiff` ships two SDKs — Python and [JS/TS](js/) — that promise the same trace renders to the **same numbers** in both. They get those numbers from two *different* tokenizers (`tiktoken` and `gpt-tokenizer`), independent reimplementations of the same `o200k_base` table on independent release schedules. `spec/golden/` is the mechanism that keeps the promise honest: a committed set of scenario fixtures plus the exact CLI output and dashboard hashes both SDKs must reproduce.
+
+Both suites run it automatically — `pytest` runs `tests/test_golden.py`, `npm test` runs `js/test/golden.test.ts` — and **nothing in either skips**: a missing expectation or a tokenizer that doesn't match the pin is a failure, not a skip.
+
+**If a change of yours moves a rendered number, regenerate the goldens and include the diff in the PR:**
+
+```bash
+python spec/golden/regenerate.py            # rewrite, then verify the JS SDK agrees
+python spec/golden/regenerate.py --check    # verify only (what CI runs)
+cd js && npm run golden:regen               # the same thing from the JS toolchain
+```
+
+There is exactly one regenerator. It writes what the Python SDK renders and then runs the JS golden suite against the result, refusing to exit 0 if the two disagree — so a regenerated golden is only blessed once **both** SDKs produce it.
+
+A regeneration is a *claim* that the new numbers are correct; the diff is the evidence. Reviewers will read it, so explain in the PR what moved and why.
+
+**Both tokenizers are pinned to exact versions** (`pyproject.toml` and `js/package.json`) and the pins are mirrored in `spec/golden/manifest.json` so the tests can assert the environment rather than assume it. Re-pinning is deliberate: bump **both** libraries together, update the manifest, regenerate, and review. An empty diff means the new releases still agree; a non-empty one means a tokenizer changed its mind about real text — understand which encoding moved before merging.
+
+Full rationale, the corpus contents, the full-text-vs-hash decision and the known cross-SDK divergences: **[spec/golden/README.md](spec/golden/README.md)**.
+
+---
+
 ## Project layout
 
 ```
@@ -54,6 +78,7 @@ src/ctxdiff/
 └── capture/           # provider adapters (openai, anthropic) + fail-open recorder
 tests/                 # unit tests (mirrors src/)
 tests/eval/            # real-SDK integration tests (opt-in via the eval extra)
+spec/golden/           # the cross-SDK golden corpus — shared by BOTH SDKs
 ```
 
 Each module has one clear responsibility. Capture is deliberately dumb — it records what was sent, verbatim — and all interpretation (labeling, and the future diff/token/cache analyzers) lives downstream in pure functions over the store.
@@ -78,6 +103,7 @@ These are the project's core guarantees. A change that weakens one will be sent 
 - **Wire-level truth.** Adapters record what was actually sent; they don't editorialize. Interpretation is a separate, re-runnable layer.
 - **Honest numbers.** Estimated token counts are always labeled `token_method="estimate"`, never presented as exact.
 - **Redaction before disk.** Any new field that stores payload text must pass through the redaction hook before being written.
+- **Cross-SDK parity.** The Python and JS SDKs render the same trace to the same bytes. If you change a renderer, an analyzer or a tokenizer pin, change both sides and regenerate the [golden corpus](#the-cross-sdk-golden-corpus) — a PR that leaves the two SDKs disagreeing will not merge.
 
 ### Code style
 

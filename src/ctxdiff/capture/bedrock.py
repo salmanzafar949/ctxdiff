@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 
+from ctxdiff.images import image_raw_block
 from ctxdiff.models import RawBlock
 
 # Request keys excluded from params verbatim: "system"/"messages"/"toolConfig"
@@ -30,7 +31,27 @@ class BedrockAdapter:
     """Normalize Bedrock Converse requests into the block model."""
 
     provider = "bedrock"
-    create_path = ("converse",)
+    create_path = ("converse",)  # kept for backward compat
+    # `converse_stream` is a SEPARATE method (not a `stream=True` kwarg on
+    # `converse`, unlike OpenAI/Anthropic) taking the IDENTICAL request shape —
+    # so every extractor above serves both unchanged — and returning an
+    # event-stream instead of a completed response. trace.py's
+    # `_ClientProxy.__getattr__` recognizes the shape by the path's LAST
+    # segment ENDING WITH "stream" but not being exactly "stream" (which
+    # instead means the Anthropic/OpenAI `.stream()` MANAGER helpers) and
+    # routes it through the existing `_StreamProxy` machinery, the same as
+    # Gemini's `generate_content_stream`.
+    create_paths = (("converse",), ("converse_stream",))
+    # WHERE the iterator lives in what `converse_stream(...)` returns.
+    # Confirmed empirically against real botocore 1.43.55 (Step-0 probe):
+    # unlike every other provider's streaming method — which returns the
+    # stream itself — this one returns a plain RESPONSE DICT that merely
+    # CONTAINS the stream: `{"ResponseMetadata": {...}, "stream":
+    # <botocore.eventstream.EventStream>}`. Declaring the key here lets
+    # trace.py's `_wrap_stream_result` proxy the inner iterator and hand the
+    # host back its envelope otherwise untouched, rather than wrapping the
+    # dict (which isn't iterable) and silently capturing nothing.
+    stream_envelope_key = "stream"
 
     def extract_blocks(self, kwargs: dict) -> list[RawBlock]:
         """Flatten a request into ordered RawBlocks: `system` first (one
@@ -61,6 +82,14 @@ class BedrockAdapter:
         for msg in kwargs.get("messages") or []:
             role = msg.get("role", "user")
             for part in msg.get("content") or []:
+                # An `{"image": {"format": ..., "source": {"bytes": ...}}}`
+                # part becomes an 'image' block whose text is a short
+                # descriptor and whose identity is the image bytes; see
+                # ctxdiff.images.
+                image = image_raw_block(role, part, self.provider)
+                if image is not None:
+                    blocks.append(image)
+                    continue
                 if isinstance(part, dict) and "text" in part:
                     text = part["text"]
                 else:
@@ -104,3 +133,38 @@ class BedrockAdapter:
             "outputTokens": get("outputTokens"),
             "totalTokens": get("totalTokens"),
         }
+
+    def accumulate_stream_usage(self, chunk: object, state: dict) -> None:
+        """Fold usage from ONE `converse_stream` event into `state`.
+
+        Confirmed empirically against real botocore 1.43.55 event-stream
+        parsing (Step-0 probe): a Converse stream emits `messageStart` →
+        `contentBlockDelta`* → `contentBlockStop` → `messageStop` → and,
+        LAST, a single `metadata` event carrying the whole exchange's counts
+        at `chunk["metadata"]["usage"]` — Bedrock reports input and output
+        together, once, at the end (unlike Anthropic's split across two
+        events, and with no caller opt-in to arrange, unlike OpenAI chat's
+        `stream_options`). So this is a plain overwrite from that one event
+        and a no-op for every other event type.
+
+        DICT-first, not getattr: botocore parses each event straight into
+        plain dicts/lists — there is no typed event object here, the same
+        reason `extract_usage` reads a `converse` response with `.get`. The
+        counts are written into `state` under the SAME key names
+        `extract_usage` returns for a non-streaming call, so the synthetic
+        response trace.py builds from `state` reads back identically (its
+        `.usage` is an attribute namespace, which `extract_usage`'s getattr
+        fallback handles). Wrapped in a catch-all exactly like the other
+        adapters': a malformed/unexpected event must never interrupt the
+        caller's own iteration."""
+        try:
+            if not isinstance(chunk, dict):
+                return
+            metadata = chunk.get("metadata")
+            usage = metadata.get("usage") if isinstance(metadata, dict) else None
+            if isinstance(usage, dict):
+                state["inputTokens"] = usage.get("inputTokens")
+                state["outputTokens"] = usage.get("outputTokens")
+                state["totalTokens"] = usage.get("totalTokens")
+        except Exception:  # noqa: BLE001 — never break the caller's iteration
+            pass

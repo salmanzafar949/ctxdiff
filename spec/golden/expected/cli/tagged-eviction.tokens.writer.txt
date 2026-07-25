@@ -1,0 +1,12 @@
+writer total · in 56 tok · out 13 tok (2/2 calls reported usage)
+
+turn 2 · 15 tokens [writer·compose]
+  ██████████████████             system              9 tok   60.0%
+  ████████████                   user                6 tok   40.0%
+  provider reports 22 prompt tokens · Δ +7
+
+turn 4 · 25 tokens [writer·compose]
+  ████████████                   history            10 tok   40.0%
+  ███████████                    system              9 tok   36.0%
+  ███████                        user                6 tok   24.0%
+  provider reports 34 prompt tokens · Δ +9

@@ -1,0 +1,65 @@
+{
+  "id": "round-numbers",
+  "title": "Whole-number floats and exact usage reconciliation",
+  "why": "Python's `json.dumps` writes an integral float as `100.0`; JavaScript's `JSON.stringify` writes `100`. The JS viewer therefore has to wrap every percentage in `PyFloat` (see `js/src/viewer/pyjson.ts`) to reproduce Python's spelling in the embedded payload, and the CLI has to format `100.0%` the same way on both sides. Turn 1 has a single block, so its share is exactly 100.0%; turn 2 has two labels; turn 3's provider usage is set to the block total so reconciliation prints an exact zero delta. Any regression in the float-spelling shim shows up here as a one-character diff.",
+  "sessions": [
+    {
+      "run_id": "c1000000000000000000000000000001",
+      "project": "round-numbers",
+      "started_at": "2026-03-06T07:30:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "d1000000000000000000000000000001",
+          "seq": 1,
+          "agent": "solo",
+          "step": null,
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+          "latency_ms": 100,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a calculator. Answer with a number and nothing else."]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000002",
+          "seq": 2,
+          "agent": "solo",
+          "step": null,
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 60, "completion_tokens": 4, "total_tokens": 64},
+          "latency_ms": 110,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a calculator. Answer with a number and nothing else."],
+            ["user", "message", "alpha beta gamma delta epsilon zeta eta theta"]
+          ]
+        },
+        {
+          "call_id": "d1000000000000000000000000000003",
+          "seq": 3,
+          "agent": "solo",
+          "step": null,
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 27, "completion_tokens": 7, "total_tokens": 34},
+          "latency_ms": 120,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You are a calculator. Answer with a number and nothing else."],
+            ["user", "message", "alpha beta gamma delta epsilon zeta eta theta"],
+            ["assistant", "message", "42"],
+            ["user", "message", "Now double it."]
+          ]
+        }
+      ]
+    }
+  ]
+}

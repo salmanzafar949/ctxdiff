@@ -10,7 +10,7 @@
 import { distinctAgents, filterCalls } from "./diff.js";
 import { pyRound1 } from "./pyround.js";
 import type { Call, CallBlock } from "../models.js";
-import type { CTrace } from "../store/ctrace.js";
+import type { ReadableStore } from "../store/base.js";
 
 // --- value types -------------------------------------------------------------
 
@@ -23,7 +23,18 @@ export interface LabelSlice {
   pct: number;
 }
 
-/** One call's full token attribution. Mirrors Python `CallTokens`. */
+/**
+ * One call's full token attribution. Mirrors Python `CallTokens`.
+ *
+ * `unmeasuredBlocks` counts the blocks in this call whose cost is not merely
+ * estimated but UNKNOWN: non-empty content that the 'estimate' method priced at
+ * zero. The estimator never returns zero for non-empty text (it rounds up to at
+ * least one token), so the only way to land here is a block that declined to
+ * guess at all — an image whose bytes we refused to fetch, a `file_id`
+ * reference, a format the sniffer does not recognize. Those cost the provider
+ * real tokens this total does not contain, which makes `totalTokens` a FLOOR
+ * rather than a measurement for such a call.
+ */
 export interface CallTokens {
   seq: number;
   totalTokens: number;
@@ -33,6 +44,7 @@ export interface CallTokens {
   reconciliationDelta: number | null;
   agent: string | null;
   step: string | null;
+  unmeasuredBlocks: number;
 }
 
 /** Cross-run schema-bloat summary. Mirrors Python `BloatReport`. */
@@ -163,15 +175,26 @@ export function registeredToolNames(allCallsWithBlocks: CallBlock[][]): Set<stri
  * even), note whether any block used the 'estimate' method, and reconcile
  * against provider usage. Slices are sorted biggest-first. Mirrors Python
  * `analyze_call`.
+ *
+ * The same pass counts UNMEASURED blocks — an 'estimate' block that priced
+ * non-empty content at zero tokens. `estimateCount` rounds any non-empty text
+ * up to at least one token, so a zero there is never a small estimate: it is
+ * the image pipeline saying "this cost cannot be known". Counting them here, in
+ * the one place a call's blocks are already walked, is what lets `ctxdiff
+ * check` refuse to certify a budget against a total it knows is a floor.
  */
 export function analyzeCall(call: Call, callBlocks: CallBlock[]): CallTokens {
   const labelTokens = new Map<string, number>();
   const labelCounts = new Map<string, number>();
   let approximate = false;
+  let unmeasured = 0;
   for (const cb of callBlocks) {
     labelTokens.set(cb.label, (labelTokens.get(cb.label) ?? 0) + cb.block.tokenCount);
     labelCounts.set(cb.label, (labelCounts.get(cb.label) ?? 0) + 1);
-    if (cb.block.tokenMethod === "estimate") approximate = true;
+    if (cb.block.tokenMethod === "estimate") {
+      approximate = true;
+      if (cb.block.tokenCount === 0 && cb.block.text) unmeasured += 1;
+    }
   }
 
   let totalTokens = 0;
@@ -200,6 +223,7 @@ export function analyzeCall(call: Call, callBlocks: CallBlock[]): CallTokens {
     reconciliationDelta: reconciliationDelta(call.usage, totalTokens),
     agent: call.agent,
     step: call.step,
+    unmeasuredBlocks: unmeasured,
   };
 }
 
@@ -344,7 +368,7 @@ export function detectBloat(allCallsWithBlocks: CallBlock[][]): BloatReport | nu
  * tokens, run bloat detection once across the analyzed calls, and compute the
  * per-agent token breakdown. Mirrors Python `analyze_run`.
  */
-export function analyzeRun(ct: CTrace, agent: string | null = null): RunTokens {
+export function analyzeRun(ct: ReadableStore, agent: string | null = null): RunTokens {
   const calls = filterCalls(ct.getCalls(), agent);
   const allCallsWithBlocks = calls.map((c) => ct.getCallBlocks(c.id));
   const callTokens = calls.map((call, i) => analyzeCall(call, allCallsWithBlocks[i]));

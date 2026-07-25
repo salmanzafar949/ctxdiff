@@ -1,0 +1,159 @@
+{
+  "id": "astral-estimate",
+  "title": "Astral-plane text on the ESTIMATE providers (bedrock, anthropic, gemini)",
+  "why": "The corpus had astral characters only on the `unicode` fixture, which is openai — the one provider counted EXACTLY. Every other provider is counted by the ~4-characters-per-token heuristic, and the two SDKs disagreed on what a 'character' is: Python's `len()` counts code points, JS's `text.length` counts UTF-16 code units, so every character outside the BMP counted double in JS. A Converse system block of `Répondez en français 🇫🇷` rendered 7 tokens in the JS SDK and 6 in Python — same trace, same content hash, different numbers in `ctxdiff tokens`, in the cache profiler's re-billed totals and in the dashboard's percentages. The goldens could not catch it because nothing in the corpus put an astral character in front of the estimator. This fixture does, on all three estimate providers and in every shape that reaches it: emoji, ZWJ sequences, regional-indicator and tag-sequence flags, skin-tone modifiers, math alphanumerics, CJK extension B/G, and astral text inside a tool schema's JSON. Blocks are deliberately sized so the divide, not the `max(1, …)` floor, decides the count.",
+  "sessions": [
+    {
+      "run_id": "b1a2c3d4e5f6000000000000000000b1",
+      "project": "astral-estimate",
+      "started_at": "2026-03-05T07:40:00+00:00",
+      "provider": "bedrock",
+      "models": ["anthropic.claude-3-5-sonnet-20240620-v1:0"],
+      "calls": [
+        {
+          "call_id": "d0000000000000000000000000000001",
+          "seq": 1,
+          "agent": "translator",
+          "step": "draft",
+          "provider": "bedrock",
+          "params": {"modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0", "maxTokens": 512, "temperature": 0.0},
+          "usage": {"inputTokens": 96, "outputTokens": 40, "totalTokens": 136},
+          "latency_ms": 310,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"description\": \"Render one emoji sequence as a 🇫🇷/🇯🇵 bilingual gloss, preserving 👨‍👩‍👧‍👦 ZWJ joins.\", \"inputSchema\": {\"json\": {\"properties\": {\"sequence\": {\"type\": \"string\"}}, \"required\": [\"sequence\"], \"type\": \"object\"}}, \"name\": \"gloss_emoji\"}"],
+            ["system", "message", "Répondez en français 🇫🇷"],
+            ["user", "content_part", "Traduisez ceci sans normaliser : 🚀 ship it 🎉 — la fusée et les confettis comptent chacun pour un seul caractère."]
+          ]
+        },
+        {
+          "call_id": "d0000000000000000000000000000002",
+          "seq": 2,
+          "agent": "translator",
+          "step": "draft",
+          "provider": "bedrock",
+          "params": {"modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0", "maxTokens": 512, "temperature": 0.0},
+          "usage": {"inputTokens": 178, "outputTokens": 52, "totalTokens": 230},
+          "latency_ms": 355,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"description\": \"Render one emoji sequence as a 🇫🇷/🇯🇵 bilingual gloss, preserving 👨‍👩‍👧‍👦 ZWJ joins.\", \"inputSchema\": {\"json\": {\"properties\": {\"sequence\": {\"type\": \"string\"}}, \"required\": [\"sequence\"], \"type\": \"object\"}}, \"name\": \"gloss_emoji\"}"],
+            ["system", "message", "Répondez en français 🇫🇷"],
+            ["user", "content_part", "Traduisez ceci sans normaliser : 🚀 ship it 🎉 — la fusée et les confettis comptent chacun pour un seul caractère."],
+            ["assistant", "content_part", "Voici la traduction demandée, en conservant chaque grappe de graphèmes telle quelle : 🚀 en avant 🎉."],
+            ["user", "content_part", "Encore : 👨‍👩‍👧‍👦 famille ZWJ, 🏳️‍🌈 drapeau composé, 🏴󠁧󠁢󠁳󠁣󠁴󠁿 drapeau à séquence de balises, 🤦🏽‍♀️ modificateur de teint, 👍🏿 modificateur isolé."]
+          ]
+        },
+        {
+          "call_id": "d0000000000000000000000000000003",
+          "seq": 3,
+          "agent": "translator",
+          "step": "review",
+          "provider": "bedrock",
+          "params": {"modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0", "maxTokens": 512, "temperature": 0.0},
+          "usage": {"inputTokens": 264, "outputTokens": 61, "totalTokens": 325},
+          "latency_ms": 402,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"description\": \"Render one emoji sequence as a 🇫🇷/🇯🇵 bilingual gloss, preserving 👨‍👩‍👧‍👦 ZWJ joins.\", \"inputSchema\": {\"json\": {\"properties\": {\"sequence\": {\"type\": \"string\"}}, \"required\": [\"sequence\"], \"type\": \"object\"}}, \"name\": \"gloss_emoji\"}"],
+            ["system", "message", "Répondez en français 🇫🇷"],
+            ["user", "content_part", "Traduisez ceci sans normaliser : 🚀 ship it 🎉 — la fusée et les confettis comptent chacun pour un seul caractère."],
+            ["assistant", "content_part", "Voici la traduction demandée, en conservant chaque grappe de graphèmes telle quelle : 🚀 en avant 🎉."],
+            ["user", "content_part", "Encore : 👨‍👩‍👧‍👦 famille ZWJ, 🏳️‍🌈 drapeau composé, 🏴󠁧󠁢󠁳󠁣󠁴󠁿 drapeau à séquence de balises, 🤦🏽‍♀️ modificateur de teint, 👍🏿 modificateur isolé."],
+            ["assistant", "content_part", "Chaque séquence est restituée à l'identique : 👨‍👩‍👧‍👦 🏳️‍🌈 🏴󠁧󠁢󠁳󠁣󠁴󠁿 🤦🏽‍♀️ 👍🏿."],
+            ["user", "content_part", "Dernier lot, uniquement hors du plan multilingue de base : 𝕌𝕟𝕚𝕔𝕠𝕕𝕖 𝓶𝓪𝓽𝓱 𝔞𝔩𝔭𝔥𝔞, idéogrammes 𠜎 𤭢 𰻞, et une longue file de fusées 🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀."]
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": "b7e8f9a0b1c2000000000000000000b2",
+      "project": "astral-estimate",
+      "started_at": "2026-03-05T09:12:00+00:00",
+      "provider": "anthropic",
+      "models": ["claude-sonnet-4"],
+      "calls": [
+        {
+          "call_id": "d0000000000000000000000000000011",
+          "seq": 1,
+          "agent": "reviewer",
+          "step": "audit",
+          "provider": "anthropic",
+          "params": {"model": "claude-sonnet-4", "max_tokens": 1024},
+          "usage": {"input_tokens": 120, "output_tokens": 48},
+          "latency_ms": 480,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You audit tokenizer output. Never normalize; report what you were given, byte for byte 🔍."],
+            ["user", "message", "Count these without collapsing anything: 𝕌𝕟𝕚𝕔𝕠𝕕𝕖 𝓶𝓪𝓽𝓱 𝔞𝔩𝔭𝔥𝔞 — every glyph there is a separate astral code point."]
+          ]
+        },
+        {
+          "call_id": "d0000000000000000000000000000012",
+          "seq": 2,
+          "agent": "reviewer",
+          "step": "audit",
+          "provider": "anthropic",
+          "params": {"model": "claude-sonnet-4", "max_tokens": 1024},
+          "usage": {"input_tokens": 205, "output_tokens": 66},
+          "latency_ms": 512,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You audit tokenizer output. Never normalize; report what you were given, byte for byte 🔍."],
+            ["user", "message", "Count these without collapsing anything: 𝕌𝕟𝕚𝕔𝕠𝕕𝕖 𝓶𝓪𝓽𝓱 𝔞𝔩𝔭𝔥𝔞 — every glyph there is a separate astral code point."],
+            ["assistant", "message", "Each math alphanumeric is one code point above U+FFFF; none of them is a composed cluster."],
+            ["user", "message", "Now the extension blocks, which sit above U+20000: 𠜎 𤭢 𰻞 𠮷 𪚥 — plus one BMP control string 日本語のトークン化テスト for comparison."]
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": "b3c4d5e6a7f8000000000000000000b3",
+      "project": "astral-estimate",
+      "started_at": "2026-03-05T11:03:00+00:00",
+      "provider": "gemini",
+      "models": ["gemini-2.0-flash"],
+      "calls": [
+        {
+          "call_id": "d0000000000000000000000000000021",
+          "seq": 1,
+          "agent": "captioner",
+          "step": "caption",
+          "provider": "gemini",
+          "params": {"model": "gemini-2.0-flash", "temperature": 0.2},
+          "usage": {"prompt_token_count": 88, "candidates_token_count": 31, "total_token_count": 119},
+          "latency_ms": 290,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "Caption in one sentence. Keep every emoji exactly as sent 🎯."],
+            ["user", "content_part", "Caption this sequence: 🧑🏻‍🚀 🧑🏼‍🚀 🧑🏽‍🚀 🧑🏾‍🚀 🧑🏿‍🚀 — five astronauts, five skin-tone modifiers, all astral."]
+          ]
+        },
+        {
+          "call_id": "d0000000000000000000000000000022",
+          "seq": 2,
+          "agent": "captioner",
+          "step": "caption",
+          "provider": "gemini",
+          "params": {"model": "gemini-2.0-flash", "temperature": 0.2},
+          "usage": {"prompt_token_count": 171, "candidates_token_count": 44, "total_token_count": 215},
+          "latency_ms": 318,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "Caption in one sentence. Keep every emoji exactly as sent 🎯."],
+            ["user", "content_part", "Caption this sequence: 🧑🏻‍🚀 🧑🏼‍🚀 🧑🏽‍🚀 🧑🏾‍🚀 🧑🏿‍🚀 — five astronauts, five skin-tone modifiers, all astral."],
+            ["assistant", "content_part", "Cinq astronautes, chacun avec son propre modificateur de teint, alignés côte à côte."],
+            ["user", "content_part", "Et celle-ci : 🇫🇷🇯🇵🇧🇷🇰🇷🇮🇳🇩🇪 — six drapeaux, douze indicateurs régionaux, zéro caractère du plan multilingue de base."]
+          ]
+        }
+      ]
+    }
+  ]
+}

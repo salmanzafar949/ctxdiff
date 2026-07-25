@@ -14,6 +14,7 @@
 import type { Adapter } from "./base.js";
 import type { RawBlock } from "../models.js";
 import { stableStringify } from "../models.js";
+import { imageRawBlock } from "../images.js";
 
 // Request keys that carry block *content* rather than sampling params.
 const CHAT_CONTENT_KEYS = new Set(["messages", "tools"]);
@@ -107,6 +108,11 @@ export class OpenAIAdapter implements Adapter {
       const content = item["content"];
       if (Array.isArray(content)) {
         return content.map((part) => {
+          // An `input_image` part becomes an 'image' block whose text is a
+          // short descriptor and whose identity is the image bytes — never the
+          // base64 payload. See src/images.ts.
+          const image = imageRawBlock(role, part, this.provider);
+          if (image !== null) return image;
           let text: string;
           if (
             isRecord(part) &&
@@ -167,6 +173,14 @@ export class OpenAIAdapter implements Adapter {
 
       if (Array.isArray(content)) {
         for (const part of content) {
+          // An `image_url` part becomes an 'image' block whose text is a short
+          // descriptor and whose identity is the image bytes — never the base64
+          // data URI. See src/images.ts.
+          const image = imageRawBlock(role, part, this.provider);
+          if (image !== null) {
+            blocks.push(image);
+            continue;
+          }
           blocks.push({
             role,
             kind: "content_part",

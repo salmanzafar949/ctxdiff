@@ -16,7 +16,7 @@ const cliPath = resolve(process.cwd(), "dist", "cli.js");
 const hasBuild = existsSync(cliPath);
 
 let dir: string;
-let fx: { multiturn: string; multiagent: string; dynamic: string; bidi: string };
+let fx: ReturnType<typeof makeFixtures>;
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "ctxdiff-cli-smoke-"));
@@ -60,6 +60,29 @@ describe.skipIf(!hasBuild)("ctxdiff CLI (dist/cli.js) smoke", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("multiturn.ctrace");
     expect(r.out).toContain("provider=openai");
+  });
+
+  it("sessions lists each session with a local timestamp column", () => {
+    const r = run(["sessions"], dir);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("multiturn.ctrace");
+    // Two sessions in the project fixture => each row is <file>#<short id>.
+    expect(r.out).toContain("project.ctrace#");
+    expect(r.out).toMatch(/ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2} /);
+  });
+
+  it("agents aggregates the project's agents across sessions", () => {
+    const r = run(["agents", "--project", fx.project]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("researcher  sessions=2  calls=4");
+    expect(r.out).toContain("writer  sessions=2  calls=2");
+  });
+
+  it("an ambiguous project exits 2 and lists the sessions to pick from", () => {
+    const r = run(["tokens", "--project", fx.project]);
+    expect(r.code).toBe(2);
+    expect(r.out).toBe("");
+    expect(r.err).toContain("pass --session to pick one");
   });
 
   it("diff with the wrong --turn count is a usage error (exit 2)", () => {
@@ -130,6 +153,39 @@ describe.skipIf(!hasBuild)("ctxdiff CLI (dist/cli.js) smoke", () => {
     expect(p.endsWith(".html")).toBe(true);
     expect(existsSync(p)).toBe(true);
     rmSync(p, { force: true });
+  });
+
+  it("export --agent preselects the level; an unknown one exits 2 with the list", () => {
+    // `--agent` on the dashboard commands PRESELECTS which of the three levels
+    // the page opens on rather than filtering what the file contains — the HTML
+    // still covers the whole project either way.
+    const outHtml = join(dir, "smoke-agent.html");
+    const ok = run(["export", "--run", fx.multiagent, "--agent", "researcher", "--out", outHtml]);
+    expect(ok.code).toBe(0);
+    const html = readFileSync(outHtml, "utf-8");
+    expect(html).toContain('"start": {"level": 3, "agent": "researcher"');
+    expect(html).toContain('"name": "writer"'); // the other agent is still there
+
+    const bad = run(["view", "--no-open", "--run", fx.multiagent, "--agent", "nobody"]);
+    expect(bad.code).toBe(2);
+    expect(bad.err).toContain("no agent 'nobody' in this project");
+    expect(bad.err).toContain("researcher");
+  });
+
+  it("demo's dashboard lands on the agent listing (two agents in the sample)", () => {
+    const demoCtrace = join(dir, "smoke-demo-levels.ctrace");
+    const r = run(["demo", "--no-open", "--out", demoCtrace]);
+    expect(r.code).toBe(0);
+    const htmlPath = r.out
+      .split("\n")
+      .find((l) => l.startsWith("dashboard"))!
+      .split("->")[1]
+      .trim();
+    const html = readFileSync(htmlPath, "utf-8");
+    expect(html).toContain('"start": {"level": 1, "agent": null, "session": null}');
+    expect(html).toContain('"name": "researcher"');
+    expect(html).toContain('"name": "writer"');
+    expect(html).not.toMatch(/https?:\/\//);
   });
 
   it("demo --no-open --out writes a sample trace + dashboard (exit 0)", () => {

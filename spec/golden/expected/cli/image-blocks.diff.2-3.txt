@@ -1,0 +1,11 @@
+── turn 2 → turn 3 · 10 blocks changed · +672 −2936 tokens ──
+~ [system·system] [-You-]{+Review+} [-ar-]{+th+}e [-a-]{+driver's proposed+} c[-omputer-use-]{+lick+} ag[-e-]{+ai+}n[-t. Look a-]{+s+}t {+th+}e[-ach-] screenshot[-,-] [-dec-]i[-de the nex-]t [-cl-]{+was g+}i[-ck, and never in-]ven[-t UI you cannot see-].
+− [user·user] '{"text": "Here is the current screen. What should I click?", "type": "…'  −21 tok
++ [user·user] '[image 800×600 · ~640 tok]'  +640 tok
+~ [user·user] [image[- 1024×768 · ~765 tok-]]
+~ [user·user] [image[- 2000×1200 · ~1.1k tok-]]
+− [user·user] '[image]'  −0 tok
++ [user·user] 'Did the driver click a control that is actually visible?'  +14 tok
+− [user·user] '[image]'  −0 tok
+− [user·user] '[image 300×200 · ~255 tok]'  −255 tok
+− [user·user] '[image 1024×768 · ~765 tok]'  −765 tok

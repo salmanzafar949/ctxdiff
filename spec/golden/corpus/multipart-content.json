@@ -1,0 +1,57 @@
+{
+  "id": "multipart-content",
+  "title": "Multi-part content: images, audio, tool calls and tool results",
+  "why": "A vision/multimodal request reaching the store. The IMAGE part is now an `image` block \u2014 text `[image 64\u00d764 \u00b7 ~255 tok]`, identity the sha256 of the decoded PNG, cost OpenAI's published tiling formula \u2014 so the base64 data URI is neither stored nor tokenized. This fixture previously froze the opposite: the blob was JSON-serialized into the block text and counted as 220 prose tokens by tiktoken. The same bytes are sent on both turns, so the diff must report the image as UNCHANGED \u2014 one block, referenced twice. Everything AROUND it still exercises the stable-JSON `content_part` path that images left: an audio part, a long opaque file id, a nested tool-call argument string and a `function_call_output`. The fixture also carries `</script>` and a lone `</` inside block text, which the HTML exporter must escape \u2014 so the HTML hash covers the escaping path too.",
+  "sessions": [
+    {
+      "run_id": "a1000000000000000000000000000001",
+      "project": "vision-corpus",
+      "started_at": "2026-03-05T16:00:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o"],
+      "calls": [
+        {
+          "call_id": "b1000000000000000000000000000001",
+          "seq": 1,
+          "agent": "inspector",
+          "step": null,
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 1.0},
+          "usage": {"prompt_tokens": 1180, "completion_tokens": 95, "total_tokens": 1275},
+          "latency_ms": 890,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You describe screenshots for accessibility. Report only what is visibly rendered; never guess at markup you cannot see."],
+            ["user", "content_part", "{\"text\": \"What does this dashboard screenshot show? Read the <script> tag label literally if one is visible.\", \"type\": \"text\"}"],
+            ["user", "image", {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsFCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR", "detail": "high"}}],
+            ["user", "content_part", "{\"input_audio\": {\"data\": \"UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=\", \"format\": \"wav\"}, \"type\": \"input_audio\"}"],
+            ["user", "content_part", "{\"file\": {\"file_id\": \"file-9f2b7c1d4e8a5063bb127e4f90ac3d5182\"}, \"type\": \"file\"}"]
+          ]
+        },
+        {
+          "call_id": "b1000000000000000000000000000002",
+          "seq": 2,
+          "agent": "inspector",
+          "step": null,
+          "provider": "openai",
+          "params": {"model": "gpt-4o", "temperature": 1.0},
+          "usage": {"prompt_tokens": 1460, "completion_tokens": 130, "total_tokens": 1590},
+          "latency_ms": 940,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "You describe screenshots for accessibility. Report only what is visibly rendered; never guess at markup you cannot see."],
+            ["user", "content_part", "{\"text\": \"What does this dashboard screenshot show? Read the <script> tag label literally if one is visible.\", \"type\": \"text\"}"],
+            ["user", "image", {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH6AMFEAAVUmVhZHkAAAAgY0hSTQAAeiUAAIA2AAD1AgAAgOsAAHUXAADqYAAAOpgAABdvkl/FRgAAAtdJREFUeNrsm79rFEEUxz+72SSXaBQRRBQLQRAsLGwsBLGwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsFCwsLCwsLCwsLCwsLCwsLCwsLBQEBRBBBERQUQQEUFEEEFEEBFERBARRAQREUREEBFBRAQREUREEBFERBARQUQEERFERBARQUQEERFERBARQUQEERFERBAR", "detail": "high"}}],
+            ["user", "content_part", "{\"input_audio\": {\"data\": \"UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=\", \"format\": \"wav\"}, \"type\": \"input_audio\"}"],
+            ["user", "content_part", "{\"file\": {\"file_id\": \"file-9f2b7c1d4e8a5063bb127e4f90ac3d5182\"}, \"type\": \"file\"}"],
+            ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"selector\\\": \\\"</script> </ script>\\\", \\\"strict\\\": true}\", \"name\": \"read_dom\"}, \"id\": \"call_v1\", \"type\": \"function\"}"],
+            ["tool", "content_part", "{\"call_id\": \"call_v1\", \"output\": \"<div class=\\\"panel\\\"><script>alert('xss')</script></div>\", \"type\": \"function_call_output\"}"],
+            ["user", "message", "Now transcribe the literal text you saw, including the </script> sequence, without interpreting it."]
+          ]
+        }
+      ]
+    }
+  ]
+}

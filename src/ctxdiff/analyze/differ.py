@@ -8,7 +8,7 @@ import difflib
 from dataclasses import dataclass
 
 from ctxdiff.models import Block, CallBlock
-from ctxdiff.store.ctrace import Call, CTrace
+from ctxdiff.store.base import Call, Store
 
 # --- agent-awareness helpers -------------------------------------------------
 
@@ -24,7 +24,7 @@ def filter_calls(calls: list[Call], agent: str | None) -> list[Call]:
     return [c for c in calls if c.agent == agent]
 
 
-def agent_calls(ct: CTrace, agent: str | None) -> list[Call]:
+def agent_calls(ct: Store, agent: str | None) -> list[Call]:
     """Convenience wrapper: load every call from `ct` and delegate to
     filter_calls. `agent=None` returns the whole run; a name returns that
     agent's calls in global seq order."""
@@ -283,7 +283,7 @@ def diff_calls(old: list[CallBlock], new: list[CallBlock],
                      tokens_added=tokens_added, tokens_evicted=tokens_evicted)
 
 
-def diff_turns(ct: CTrace, turn_old: int, turn_new: int) -> TurnDiff:
+def diff_turns(ct: Store, turn_old: int, turn_new: int) -> TurnDiff:
     """Convenience wrapper: resolve two turn numbers (call.seq) to their calls
     in `ct`, load each call's blocks, and delegate to diff_calls. Raises
     ValueError with a clear message if either turn has no matching call in

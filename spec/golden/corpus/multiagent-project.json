@@ -1,0 +1,170 @@
+{
+  "id": "multiagent-project",
+  "title": "A multi-agent, multi-session project database",
+  "why": "Covers the surfaces that only exist once a `.ctrace` holds more than one run: the `sessions` listing (labels, local-time rendering, per-session agent lists), the `agents` rollup across sessions, per-agent token attribution, cross-agent cache analysis (a hand-off must never be counted as a prefix break), and a developer-tagged `rag` block whose label comes from `basic_label`'s tag path rather than its role. Session 2 injects a live clock into the system block, which is the classic prefix-break misconfiguration.",
+  "sessions": [
+    {
+      "run_id": "e1a2b3c4d5e6000000000000000000f1",
+      "project": "research-pipeline",
+      "started_at": "2026-03-03T09:05:00+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o", "claude-sonnet-4"],
+      "calls": [
+        {
+          "call_id": "f0000000000000000000000000000001",
+          "seq": 1,
+          "agent": "researcher",
+          "step": "search",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 520, "completion_tokens": 60, "total_tokens": 580},
+          "latency_ms": 240,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Search the public web and return ranked snippets with source URLs.\", \"name\": \"search_web\", \"parameters\": {\"properties\": {\"query\": {\"type\": \"string\"}, \"top_k\": {\"default\": 5, \"type\": \"integer\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are the researcher. Gather primary sources, quote them verbatim, and never assert a number you have not seen in a source."],
+            ["user", "message", "How do the major providers price prompt-cache reads relative to full input tokens?"]
+          ]
+        },
+        {
+          "call_id": "f0000000000000000000000000000002",
+          "seq": 2,
+          "agent": "researcher",
+          "step": "verify",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 760, "completion_tokens": 85, "total_tokens": 845},
+          "latency_ms": 291,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Search the public web and return ranked snippets with source URLs.\", \"name\": \"search_web\", \"parameters\": {\"properties\": {\"query\": {\"type\": \"string\"}, \"top_k\": {\"default\": 5, \"type\": \"integer\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are the researcher. Gather primary sources, quote them verbatim, and never assert a number you have not seen in a source."],
+            ["user", "message", "How do the major providers price prompt-cache reads relative to full input tokens?"],
+            ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"query\\\": \\\"prompt cache read pricing\\\", \\\"top_k\\\": 5}\", \"name\": \"search_web\"}, \"id\": \"call_a1\", \"type\": \"function\"}"],
+            ["tool", "message", "1. Provider docs: cached prefix reads are billed at a fraction of the standard input rate; the exact fraction varies by provider and tier.\n2. Provider docs: a cache entry is keyed on an exact prefix match, so a single changed byte early in the prompt invalidates the whole entry.\n3. Provider docs: cache entries expire after a short idle window."]
+          ]
+        },
+        {
+          "call_id": "f0000000000000000000000000000003",
+          "seq": 3,
+          "agent": "writer",
+          "step": "synthesize",
+          "provider": "anthropic",
+          "params": {"model": "claude-sonnet-4"},
+          "usage": {"input_tokens": 410, "output_tokens": 220},
+          "latency_ms": 640,
+          "error": null,
+          "tags": [["rag", "FINDINGS:"]],
+          "blocks": [
+            ["system", "message", "You are the writer. Turn the researcher's findings into a five-line summary a VP can act on. No hedging."],
+            ["user", "message", "FINDINGS:\n- Cached prefix reads are billed at a fraction of the standard input rate.\n- A cache entry is keyed on an exact prefix match; one changed early byte invalidates it.\n- Cache entries expire after a short idle window."]
+          ]
+        },
+        {
+          "call_id": "f0000000000000000000000000000004",
+          "seq": 4,
+          "agent": "writer",
+          "step": "synthesize",
+          "provider": "anthropic",
+          "params": {"model": "claude-sonnet-4"},
+          "usage": {"input_tokens": 690, "output_tokens": 180},
+          "latency_ms": 705,
+          "error": null,
+          "tags": [["rag", "FINDINGS:"]],
+          "blocks": [
+            ["system", "message", "You are the writer. Turn the researcher's findings into a five-line summary a VP can act on. No hedging."],
+            ["user", "message", "FINDINGS:\n- Cached prefix reads are billed at a fraction of the standard input rate.\n- A cache entry is keyed on an exact prefix match; one changed early byte invalidates it.\n- Cache entries expire after a short idle window."],
+            ["assistant", "message", "Draft: prompt caching pays for itself only when the prefix is byte-stable across turns."],
+            ["user", "message", "Tighten it to five lines and lead with the action."]
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": "e7f8a9b0c1d2000000000000000000f2",
+      "project": "research-pipeline",
+      "started_at": "2026-03-04T14:22:30+00:00",
+      "provider": "openai",
+      "models": ["gpt-4o", "claude-sonnet-4"],
+      "calls": [
+        {
+          "call_id": "f0000000000000000000000000000011",
+          "seq": 1,
+          "agent": "researcher",
+          "step": "search",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 540, "completion_tokens": 62, "total_tokens": 602},
+          "latency_ms": 233,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "Current session time: 2026-03-04T14:22:31Z"],
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Search the public web and return ranked snippets with source URLs.\", \"name\": \"search_web\", \"parameters\": {\"properties\": {\"query\": {\"type\": \"string\"}, \"top_k\": {\"default\": 5, \"type\": \"integer\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are the researcher. Gather primary sources, quote them verbatim, and never assert a number you have not seen in a source."],
+            ["user", "message", "Re-run last week's pricing question against the current docs."]
+          ]
+        },
+        {
+          "call_id": "f0000000000000000000000000000012",
+          "seq": 2,
+          "agent": "researcher",
+          "step": "verify",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": {"prompt_tokens": 790, "completion_tokens": 88, "total_tokens": 878},
+          "latency_ms": 302,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "Current session time: 2026-03-04T14:22:48Z"],
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Search the public web and return ranked snippets with source URLs.\", \"name\": \"search_web\", \"parameters\": {\"properties\": {\"query\": {\"type\": \"string\"}, \"top_k\": {\"default\": 5, \"type\": \"integer\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are the researcher. Gather primary sources, quote them verbatim, and never assert a number you have not seen in a source."],
+            ["user", "message", "Re-run last week's pricing question against the current docs."],
+            ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"query\\\": \\\"prompt cache read pricing 2026\\\", \\\"top_k\\\": 5}\", \"name\": \"search_web\"}, \"id\": \"call_b1\", \"type\": \"function\"}"],
+            ["tool", "message", "1. Provider docs: cached prefix reads are billed at a fraction of the standard input rate; the exact fraction varies by provider and tier.\n2. Provider docs: a cache entry is keyed on an exact prefix match, so a single changed byte early in the prompt invalidates the whole entry."]
+          ]
+        },
+        {
+          "call_id": "f0000000000000000000000000000013",
+          "seq": 3,
+          "agent": "researcher",
+          "step": "verify",
+          "provider": "openai",
+          "params": {"model": "gpt-4o"},
+          "usage": null,
+          "latency_ms": 118,
+          "error": null,
+          "tags": [],
+          "blocks": [
+            ["system", "message", "Current session time: 2026-03-04T14:23:09Z"],
+            ["system", "tool_schema", "{\"function\": {\"description\": \"Search the public web and return ranked snippets with source URLs.\", \"name\": \"search_web\", \"parameters\": {\"properties\": {\"query\": {\"type\": \"string\"}, \"top_k\": {\"default\": 5, \"type\": \"integer\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}"],
+            ["system", "message", "You are the researcher. Gather primary sources, quote them verbatim, and never assert a number you have not seen in a source."],
+            ["user", "message", "Re-run last week's pricing question against the current docs."],
+            ["assistant", "content_part", "{\"function\": {\"arguments\": \"{\\\"query\\\": \\\"prompt cache read pricing 2026\\\", \\\"top_k\\\": 5}\", \"name\": \"search_web\"}, \"id\": \"call_b1\", \"type\": \"function\"}"],
+            ["tool", "message", "1. Provider docs: cached prefix reads are billed at a fraction of the standard input rate; the exact fraction varies by provider and tier.\n2. Provider docs: a cache entry is keyed on an exact prefix match, so a single changed byte early in the prompt invalidates the whole entry."],
+            ["user", "message", "Anything changed since last week?"]
+          ]
+        },
+        {
+          "call_id": "f0000000000000000000000000000014",
+          "seq": 4,
+          "agent": "writer",
+          "step": "synthesize",
+          "provider": "anthropic",
+          "params": {"model": "claude-sonnet-4"},
+          "usage": {"input_tokens": 430, "output_tokens": 210},
+          "latency_ms": 611,
+          "error": null,
+          "tags": [["rag", "FINDINGS:"]],
+          "blocks": [
+            ["system", "message", "You are the writer. Turn the researcher's findings into a five-line summary a VP can act on. No hedging."],
+            ["user", "message", "FINDINGS:\n- Nothing material changed since last week; the prefix-stability rule still dominates cost."]
+          ]
+        }
+      ]
+    }
+  ]
+}

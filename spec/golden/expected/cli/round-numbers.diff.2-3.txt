@@ -1,0 +1,4 @@
+── turn 2 → turn 3 · 2 blocks changed · +5 −0 tokens ──
++ [history·assistant] '42'  +1 tok
++ [user·user] 'Now double it.'  +4 tok
+= 2 unchanged blocks · 22 tok
