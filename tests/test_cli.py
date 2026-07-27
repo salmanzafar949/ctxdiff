@@ -731,3 +731,39 @@ def test_export_agent_preselects_the_level_and_a_bad_one_exits_2(tmp_path, capsy
     err = capsys.readouterr().err
     assert "no agent 'nobody' in this project" in err
     assert "researcher" in err
+
+
+def test_tokens_streamed_without_usage_names_the_remedy(tmp_path, capsys):
+    """When the missing usage is diagnosable — OpenAI-chat streams sent
+    without stream_options.include_usage — the summary must NAME the
+    caller-side fix, not stop at 'no provider usage reported' (dogfood
+    finding 2026-07-27: a real app streamed every call and saw only a dead
+    end)."""
+    path = str(tmp_path / "demo.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="gpt-4o")
+    blocks = [_cb("system prompt", 0, "system", "system"),
+              _cb("hi", 1, "user", "user")]
+    ct.record_call(seq=1, params={"model": "gpt-4o", "stream": True,
+                                  "messages": [{"role": "user", "content": "hi"}]},
+                   usage=None, latency_ms=10, error=None, call_blocks=blocks)
+    ct.close()
+
+    main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert "no provider usage reported" in out
+    assert "1 streamed call recorded no usage" in out
+    assert 'stream_options={"include_usage": true}' in out
+
+
+def test_tokens_non_streamed_missing_usage_gets_no_remedy_hint(tmp_path, capsys):
+    """Missing usage on NON-streamed calls has no caller-side fix to name —
+    the summary must stay exactly as before, with no hint line."""
+    path = str(tmp_path / "demo.ctrace")
+    _make_trace(path)   # records usage=None on every call, non-streamed params
+
+    main(["tokens", "--run", path])
+
+    out = capsys.readouterr().out
+    assert "no provider usage reported" in out
+    assert "streamed call" not in out

@@ -495,3 +495,57 @@ def test_analyze_run_combines_per_call_tokens_and_bloat(tmp_path):
     assert run_tokens.bloat.calls_analyzed == 2
     for c in run_tokens.calls:
         assert c.reconciliation_delta == 120 - c.total_tokens
+
+
+# --- usage_totals: the streamed-without-include_usage diagnosis ---------------
+
+
+def _stream_call(seq, params, usage=None):
+    return Call(id=f"c-{seq}", run_id="run", seq=seq, params=params,
+                usage=usage, latency_ms=10, error=None)
+
+
+def test_usage_totals_flags_openai_streams_missing_include_usage():
+    """A no-usage call whose recorded params are OpenAI-chat-shaped and
+    streamed WITHOUT stream_options.include_usage is the one diagnosable,
+    caller-fixable cause of missing usage — counted so the renderer can name
+    the remedy instead of dead-ending at 'no provider usage reported'."""
+    calls = [
+        _stream_call(1, {"model": "gpt-4o", "stream": True,
+                         "messages": [{"role": "user", "content": "hi"}]}),
+        _stream_call(2, {"model": "gpt-4o", "stream": True,
+                         "messages": [{"role": "user", "content": "yo"}]}),
+    ]
+    totals = usage_totals(calls)
+    assert totals.calls_with_usage == 0
+    assert totals.streamed_without_usage == 2
+
+
+def test_usage_totals_streamed_flag_skips_calls_that_did_report_usage():
+    """A streamed call that DID report usage (caller opted in, or the compat
+    endpoint sent it anyway) needs no remedy and must not be counted."""
+    calls = [_stream_call(
+        1,
+        {"model": "gpt-4o", "stream": True,
+         "stream_options": {"include_usage": True},
+         "messages": [{"role": "user", "content": "hi"}]},
+        usage={"prompt_tokens": 5, "completion_tokens": 2},
+    )]
+    totals = usage_totals(calls)
+    assert totals.streamed_without_usage == 0
+
+
+def test_usage_totals_streamed_flag_ignores_non_streamed_and_non_chat_shapes():
+    """Non-streamed calls and non-OpenAI-chat wire shapes (no `messages`
+    list) can be missing usage for reasons no caller-side option fixes —
+    they must not trigger the hint."""
+    calls = [
+        # Non-streamed, no usage: not diagnosable as the include_usage case.
+        _stream_call(1, {"model": "gpt-4o",
+                         "messages": [{"role": "user", "content": "hi"}]}),
+        # Streamed but not chat-shaped (e.g. Gemini native contents).
+        _stream_call(2, {"model": "gemini-2.5-flash", "stream": True,
+                         "contents": [{"parts": [{"text": "hi"}]}]}),
+    ]
+    totals = usage_totals(calls)
+    assert totals.streamed_without_usage == 0
