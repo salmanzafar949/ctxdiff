@@ -42,6 +42,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Callable
+from urllib.parse import urlparse
 
 from ctxdiff.capture.anthropic import AnthropicAdapter
 from ctxdiff.capture.bedrock import BedrockAdapter
@@ -167,6 +168,55 @@ def _detect_provider(client: object) -> str:
     raise ValueError(
         f"ctxdiff: unrecognized client module '{module}'; "
         f"supported providers: {sorted(_ADAPTERS)}")
+
+
+# Hosts whose OpenAI-COMPATIBLE endpoints we can NAME. An OpenAI-SDK client
+# pointed at one of these is really talking to that vendor, and recording
+# `provider=openai` for Gemini traffic is confidently-wrong attribution — the
+# trust-killer class of bug for a debugger (dogfood finding 2026-07-27).
+_OPENAI_COMPAT_HOSTS = {
+    "generativelanguage.googleapis.com": "gemini",
+    "api.anthropic.com": "anthropic",
+}
+
+
+def _openai_compat_label(client: object) -> str:
+    """Refine the ATTRIBUTION label for an OpenAI-SDK client by its base_url
+    host. The ADAPTER stays 'openai' regardless — the wire shape genuinely is
+    OpenAI's, and capture mechanics key off the adapter — this only changes
+    the `provider` string stamped on the run/calls (the same nullable
+    attribution field the LangChain handler already sets per call).
+
+    Mapping is deliberately conservative: hosts in `_OPENAI_COMPAT_HOSTS` get
+    their vendor's name; OpenAI's own hosts and Azure OpenAI keep 'openai'
+    (Azure has always recorded 'openai' — relabeling it here would churn
+    existing users' traces for no diagnostic gain); any OTHER host (Ollama,
+    vLLM, OpenRouter, LiteLLM proxies, ...) is labeled 'openai-compatible' —
+    truthful without guessing a vendor from an address we don't recognize.
+    A side benefit for the named vendors: their blocks now go through the
+    estimate token path instead of tiktoken counts being marked exact for
+    models tiktoken does not tokenize. Fail-open: any surprise reading
+    base_url returns 'openai' unchanged."""
+    try:
+        base = getattr(client, "base_url", None)
+        if base is None:
+            return "openai"
+        # openai-python exposes base_url as an httpx.URL (has .host); tolerate
+        # a plain string too, since we only need the hostname either way.
+        host = (getattr(base, "host", "") or "").lower()
+        if not host:
+            host = (urlparse(str(base)).hostname or "").lower()
+        if not host:
+            return "openai"
+        if host in _OPENAI_COMPAT_HOSTS:
+            return _OPENAI_COMPAT_HOSTS[host]
+        if host == "api.openai.com" or host.endswith(".openai.com"):
+            return "openai"
+        if host.endswith(".openai.azure.com") or host.endswith(".azure.com"):
+            return "openai"
+        return "openai-compatible"
+    except Exception:  # noqa: BLE001 — labeling must never break wrap()
+        return "openai"
 
 
 class _DeferredStore:
@@ -705,7 +755,15 @@ class Tracer:
         first-seen provider on `run.provider` for backward compatibility."""
         provider = _detect_provider(client)
         adapter = _ADAPTERS[provider]()
-        self._ensure_store(provider)
+        # ATTRIBUTION label vs ADAPTER: an OpenAI-SDK client may really be
+        # talking to Gemini/Anthropic/an OSS server through their OpenAI-
+        # compatible endpoints. The adapter (wire mechanics) stays keyed to
+        # `provider`; the label recorded on the run and stamped per call is
+        # refined from the client's base_url host so the trace names the
+        # vendor actually being called. Non-openai providers pass through
+        # unchanged (their SDK IS the vendor).
+        label = _openai_compat_label(client) if provider == "openai" else provider
+        self._ensure_store(label)
         recorder = Recorder(self._ct, adapter, self._redact)
         if self._recorder is None:
             # Keep the first recorder reachable as t._recorder (see __init__).
@@ -718,7 +776,7 @@ class Tracer:
         # in the plural form from here on.
         paths = getattr(adapter, "create_paths", None) or (adapter.create_path,)
         return _ClientProxy(client, (), self, paths,
-                            recorder, agent, provider, adapter)
+                            recorder, agent, label, adapter)
 
     def langchain_handler(self, agent: str | None = None):
         """Return a LangChain callback handler that records every chat-model
@@ -1146,7 +1204,7 @@ class _ClientProxy:
         # sync client root.
         if (name in _TRANSPARENT_ROOT_HOPS
                 and path == ()
-                and provider == "gemini"):
+                and getattr(adapter, "provider", None) == "gemini"):
             return _ClientProxy(attr, path, tracer, create_paths,
                                 recorder, agent, provider, adapter)
         return attr

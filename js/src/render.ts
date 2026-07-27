@@ -270,13 +270,27 @@ export function renderEvictions(report: EvictionReport): string | null {
  * `render_usage_summary`. */
 export function renderUsageSummary(usage: UsageTotals, agent: string | null = null): string {
   const scope = agent !== null ? `${agent} total` : "run total";
-  if (usage.callsWithUsage === 0) return `${scope} · no provider usage reported`;
+  // The remedy line for the one diagnosable cause of missing usage: OpenAI-
+  // style streams that never opted into a usage chunk. Printed wherever the
+  // count is non-zero (fully-missing AND partial-coverage runs alike) —
+  // "no provider usage reported" with no stated cause was a dead end that
+  // sent users source-diving (dogfood finding 2026-07-27). ctxdiff will not
+  // inject the option itself, so naming the caller-side fix IS the fix.
+  let hint = "";
+  if (usage.streamedWithoutUsage > 0) {
+    const n = usage.streamedWithoutUsage;
+    hint =
+      `\n  ↳ ${n} streamed call${n !== 1 ? "s" : ""} recorded no usage — ` +
+      `OpenAI-style streams only report usage when the request includes ` +
+      `stream_options={"include_usage": true}`;
+  }
+  if (usage.callsWithUsage === 0) return `${scope} · no provider usage reported${hint}`;
   const coverage =
     `(${usage.callsWithUsage}/${usage.callsTotal} ` +
     `call${usage.callsTotal !== 1 ? "s" : ""} reported usage)`;
   const lines = [
     `${scope} · in ${comma(usage.inputTokens)} tok · ` +
-      `out ${comma(usage.outputTokens)} tok ${coverage}`,
+      `out ${comma(usage.outputTokens)} tok ${coverage}${hint}`,
   ];
   if (usage.byAgent) {
     for (const [name, [inp, outp]] of usage.byAgent) {

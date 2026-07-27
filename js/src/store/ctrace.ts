@@ -545,6 +545,22 @@ export class CTrace {
     } catch {
       /* best-effort model roll-up; retried by the next call with this model */
     }
+    // PASSIVE checkpoint after every committed call: under WAL, committed
+    // pages live in the `-wal` sidecar until a checkpoint copies them into
+    // the main file — and a long-lived process (a server that never calls
+    // close()) can leave the `.ctrace` a near-empty shell indefinitely, so
+    // anyone copying/sharing the bare file mid-run ships an empty trace
+    // (dogfood finding 2026-07-27). PASSIVE transfers whatever it can WITHOUT
+    // ever blocking concurrent readers or writers (unlike close()'s
+    // TRUNCATE), which is what makes it safe on the hot path; per-LLM-call
+    // frequency makes the cost negligible. Best-effort like the roll-up
+    // above: the call is already committed, so a checkpoint failure must
+    // never surface as a failed record. Mirrors Python `record_call`.
+    try {
+      this.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+    } catch {
+      /* durability is done; the checkpoint is a bonus */
+    }
     return callId;
   }
 

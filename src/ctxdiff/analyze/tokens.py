@@ -92,6 +92,15 @@ class UsageTotals:
     calls_with_usage: int
     calls_total: int
     by_agent: dict[str, tuple[int, int]] | None
+    # How many of the no-usage calls are DIAGNOSABLE as OpenAI-style streams
+    # sent without `stream_options: {"include_usage": true}` — the one case
+    # where the missing usage has a one-line caller-side fix. Recognized off
+    # the recorded params (wire shape, not provider label): a `messages` list
+    # plus a truthy `stream` and no `include_usage`. ctxdiff never injects the
+    # option itself (wire-truth), so the honest move is to NAME the remedy in
+    # the renderer instead of leaving "no provider usage reported" as a dead
+    # end (dogfood finding 2026-07-27).
+    streamed_without_usage: int = 0
 
 
 @dataclass(frozen=True)
@@ -299,11 +308,23 @@ def usage_totals(calls: list[Call]) -> UsageTotals:
     with_usage = 0
     per_in: dict[str, int] = {}
     per_out: dict[str, int] = {}
+    streamed_without_usage = 0
     for c in calls:
         in_v = _first_present(c.usage, _PROMPT_TOKEN_KEYS)
         out_v = _first_present(c.usage, _OUTPUT_TOKEN_KEYS)
         if in_v is None and out_v is None:
-            continue  # this call reported no recognizable provider usage
+            # No recognizable provider usage. Before skipping, check whether
+            # this is the fixable case: an OpenAI-chat-shaped streamed request
+            # (`messages` + `stream`) that never asked for usage via
+            # `stream_options.include_usage` — OpenAI's streams only emit a
+            # usage chunk when the caller opts in, and ctxdiff won't inject
+            # the option. Counted here so the renderer can print the remedy.
+            p = c.params or {}
+            opts = p.get("stream_options") or {}
+            if (p.get("stream") and isinstance(p.get("messages"), list)
+                    and not (isinstance(opts, dict) and opts.get("include_usage"))):
+                streamed_without_usage += 1
+            continue  # skipped from sums; still counted in calls_total
         with_usage += 1
         input_total += in_v or 0
         output_total += out_v or 0
@@ -323,7 +344,7 @@ def usage_totals(calls: list[Call]) -> UsageTotals:
     return UsageTotals(
         input_tokens=input_total, output_tokens=output_total,
         calls_with_usage=with_usage, calls_total=len(calls),
-        by_agent=by_agent,
+        by_agent=by_agent, streamed_without_usage=streamed_without_usage,
     )
 
 

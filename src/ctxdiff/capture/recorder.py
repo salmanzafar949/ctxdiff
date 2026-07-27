@@ -167,7 +167,19 @@ class Recorder:
             # ever raised, the surrounding fail-open guard still swallows it.
             params = copy.deepcopy(self._adapter.extract_params(kwargs))
             usage = self._adapter.extract_usage(response) if response is not None else None
-            provider = self._adapter.provider
+            # The caller's `provider` is the ATTRIBUTION label decided at
+            # wrap() time — e.g. 'gemini' for an OpenAI-SDK client pointed at
+            # Gemini's OpenAI-compatible endpoint — and wins when supplied;
+            # the adapter's own name is only the fallback for callers that
+            # don't attribute. Safe because nothing mechanical below keys off
+            # this string: extraction already ran above via the adapter, and
+            # `build_block` treats an unrecognized provider as
+            # estimate-tokenized (which is MORE honest for a non-OpenAI model
+            # than tiktoken counts marked exact). Overwriting it here was the
+            # dogfood bug (2026-07-27) that stamped provider=openai on every
+            # compat-endpoint call.
+            if provider is None:
+                provider = self._adapter.provider
 
             call_blocks: list[CallBlock] = []
             for position, rb in enumerate(raw):

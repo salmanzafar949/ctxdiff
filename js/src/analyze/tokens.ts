@@ -62,6 +62,15 @@ export interface UsageTotals {
   callsWithUsage: number;
   callsTotal: number;
   byAgent: Map<string, [number, number]> | null;
+  /** How many of the no-usage calls are DIAGNOSABLE as OpenAI-style streams
+   * sent without `stream_options: {"include_usage": true}` — the one case
+   * where the missing usage has a one-line caller-side fix. Recognized off
+   * the recorded params (wire shape, not provider label): a `messages` list
+   * plus a truthy `stream` and no `include_usage`. ctxdiff never injects the
+   * option itself (wire-truth), so the honest move is to NAME the remedy in
+   * the renderer instead of leaving "no provider usage reported" as a dead
+   * end (dogfood finding 2026-07-27). Mirrors Python. */
+  streamedWithoutUsage: number;
 }
 
 /** A whole run's token attribution. Mirrors Python `RunTokens`. */
@@ -269,10 +278,28 @@ export function usageTotals(calls: Call[]): UsageTotals {
   let withUsage = 0;
   const perIn = new Map<string, number>();
   const perOut = new Map<string, number>();
+  let streamedWithoutUsage = 0;
   for (const c of calls) {
     const inV = firstPresent(c.usage, PROMPT_TOKEN_KEYS);
     const outV = firstPresent(c.usage, OUTPUT_TOKEN_KEYS);
-    if (inV === null && outV === null) continue;
+    if (inV === null && outV === null) {
+      // No recognizable provider usage. Before skipping, check whether this
+      // is the fixable case: an OpenAI-chat-shaped streamed request
+      // (`messages` + `stream`) that never asked for usage via
+      // `stream_options.include_usage` — OpenAI's streams only emit a usage
+      // chunk when the caller opts in, and ctxdiff won't inject the option.
+      // Counted here so the renderer can print the remedy.
+      const p = c.params ?? {};
+      const opts = (p["stream_options"] ?? {}) as Record<string, unknown>;
+      if (
+        Boolean(p["stream"]) &&
+        Array.isArray(p["messages"]) &&
+        !(typeof opts === "object" && opts !== null && Boolean(opts["include_usage"]))
+      ) {
+        streamedWithoutUsage += 1;
+      }
+      continue; // skipped from sums; still counted in callsTotal
+    }
     withUsage += 1;
     inputTotal += inV ?? 0;
     outputTotal += outV ?? 0;
@@ -299,6 +326,7 @@ export function usageTotals(calls: Call[]): UsageTotals {
     callsWithUsage: withUsage,
     callsTotal: calls.length,
     byAgent,
+    streamedWithoutUsage,
   };
 }
 

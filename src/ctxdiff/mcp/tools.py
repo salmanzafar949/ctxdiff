@@ -245,7 +245,16 @@ def list_runs(source: Source) -> list[RunRef]:
         filename = _backend_filename(source.backend)
         rows = [(s, filename, None) for s in sessions]
     else:
-        for path in sorted(glob.glob(os.path.join(source.directory, "*.ctrace"))):
+        # RECURSIVE on purpose (dogfood finding 2026-07-27): a project often
+        # holds its traces one level down (`app/py/*.ctrace`, `app/js/*.ctrace`),
+        # and a top-level-only glob made `--runs-dir <project>` silently see
+        # NOTHING — indistinguishable from "no traces exist". `**` includes the
+        # top level itself, so flat layouts behave exactly as before; when the
+        # same filename appears in two subdirectories the label is the path
+        # RELATIVE to the runs dir (not the bare basename), so the two stay
+        # distinguishable in the listing and addressable by `run`.
+        pattern = os.path.join(source.directory, "**", "*.ctrace")
+        for path in sorted(glob.glob(pattern, recursive=True)):
             try:
                 ct = CTrace.open(path)
             except Exception:  # noqa: BLE001 — skip unreadable files, don't hide the rest
@@ -254,7 +263,8 @@ def list_runs(source: Source) -> list[RunRef]:
                 sessions = ct.list_sessions()
             finally:
                 ct.close()
-            rows.extend((s, os.path.basename(path), path) for s in sessions)
+            label = os.path.relpath(path, source.directory)
+            rows.extend((s, label, path) for s in sessions)
     return _label_rows(rows)
 
 

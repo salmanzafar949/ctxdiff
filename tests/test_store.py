@@ -285,3 +285,34 @@ def test_append_into_v1_file_upgrades_and_preserves_attribution(tmp_path):
     legacy = r.get_calls("run1")
     assert len(legacy) == 1 and legacy[0].agent is None
     r.close()
+
+
+def test_main_file_stays_fresh_without_close_for_live_sharing(tmp_path):
+    """Long-lived-process regression (dogfood finding 2026-07-27): under WAL,
+    committed calls used to sit in the `-wal` sidecar until close()'s
+    TRUNCATE checkpoint — so a server that never closes left the bare
+    `.ctrace` a near-empty shell, and copying JUST that file mid-run shipped
+    an empty trace. record_call now runs a PASSIVE checkpoint after every
+    committed call, so a copy of the main file alone — taken while the store
+    is still open — must already contain the calls."""
+    import shutil
+    path = str(tmp_path / "live.ctrace")
+    ct = CTrace.create(path, project="agent", provider="openai", model="gpt-4o")
+    blocks = [_call_block("hello world", 0)]
+    ct.record_call(seq=1, params={"model": "gpt-4o"}, usage=None,
+                   latency_ms=10, error=None, call_blocks=blocks)
+    ct.record_call(seq=2, params={"model": "gpt-4o"}, usage=None,
+                   latency_ms=10, error=None, call_blocks=blocks)
+
+    # Copy ONLY the main file — deliberately NOT close()ing first and NOT
+    # copying the -wal/-shm sidecars: exactly what a user sharing a trace
+    # from a still-running server does.
+    copy = str(tmp_path / "shared.ctrace")
+    shutil.copyfile(path, copy)
+    ct.close()
+
+    reader = CTrace.open(copy)
+    try:
+        assert len(reader.get_calls()) == 2
+    finally:
+        reader.close()

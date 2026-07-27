@@ -114,6 +114,7 @@ export class Recorder {
     tagged: [string, string][];
     agent?: string | null;
     step?: string | null;
+    provider?: string | null;
     quiet?: boolean;
   }): void {
     const job = this.build(args);
@@ -141,6 +142,7 @@ export class Recorder {
     tagged: [string, string][];
     agent?: string | null;
     step?: string | null;
+    provider?: string | null;
     quiet?: boolean;
   }): PersistJob | null {
     const {
@@ -152,13 +154,23 @@ export class Recorder {
       tagged,
       agent = null,
       step = null,
+      provider: providerArg = null,
       quiet = false,
     } = args;
     try {
       const raw = this.adapter.extractBlocks(kwargs);
       const params = this.adapter.extractParams(kwargs);
       const usage = response != null ? this.adapter.extractUsage(response) : null;
-      const provider = this.adapter.provider;
+      // The caller's `provider` is the ATTRIBUTION label decided at wrap()
+      // time — e.g. "gemini" for an OpenAI-SDK client pointed at Gemini's
+      // OpenAI-compatible endpoint — and wins when supplied; the adapter's
+      // own name is only the fallback for callers that don't attribute. Safe
+      // because nothing mechanical below keys off this string: extraction
+      // already ran above via the adapter, and `buildBlock` treats an
+      // unrecognized provider as estimate-tokenized (which is MORE honest
+      // for a non-OpenAI model than gpt-tokenizer counts marked exact).
+      // Mirrors Python `Recorder.build` (dogfood finding 2026-07-27).
+      const provider = providerArg ?? this.adapter.provider;
 
       const callBlocks: CallBlock[] = [];
       raw.forEach((rb, position) => {

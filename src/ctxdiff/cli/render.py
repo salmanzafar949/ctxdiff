@@ -271,12 +271,24 @@ def render_usage_summary(usage: UsageTotals, agent: str | None = None) -> str:
     ('5/6 calls reported usage'), then one line per agent when a multi-agent
     breakdown is available (never the case under an --agent filter)."""
     scope = f"{agent} total" if agent is not None else "run total"
+    # The remedy line for the one diagnosable cause of missing usage: OpenAI-
+    # style streams that never opted into a usage chunk. Printed wherever the
+    # count is non-zero (fully-missing AND partial-coverage runs alike) —
+    # "no provider usage reported" with no stated cause was a dead end that
+    # sent users source-diving (dogfood finding 2026-07-27). ctxdiff will not
+    # inject the option itself, so naming the caller-side fix IS the fix.
+    hint = ""
+    if usage.streamed_without_usage:
+        n = usage.streamed_without_usage
+        hint = (f"\n  ↳ {n} streamed call{'s' if n != 1 else ''} recorded no "
+                f"usage — OpenAI-style streams only report usage when the "
+                f"request includes stream_options={{\"include_usage\": true}}")
     if usage.calls_with_usage == 0:
-        return f"{scope} · no provider usage reported"
+        return f"{scope} · no provider usage reported{hint}"
     coverage = (f"({usage.calls_with_usage}/{usage.calls_total} "
                 f"call{'s' if usage.calls_total != 1 else ''} reported usage)")
     lines = [f"{scope} · in {usage.input_tokens:,} tok · "
-             f"out {usage.output_tokens:,} tok {coverage}"]
+             f"out {usage.output_tokens:,} tok {coverage}{hint}"]
     if usage.by_agent:
         for name, (inp, outp) in usage.by_agent.items():
             lines.append(f"  {name} · in {inp:,} · out {outp:,}")

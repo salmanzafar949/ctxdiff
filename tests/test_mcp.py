@@ -1100,7 +1100,12 @@ def test_a_run_handle_stays_short_when_nothing_collides(runs_dir, tmp_path):
     listing = json.loads(mcp_tools.ctxdiff_runs(source, TextPolicy()))
     assert listing["runs"][0]["run"] == "agent.ctrace"
 
-    path = str(tmp_path / "many.ctrace")
+    # An isolated directory for the many-session file: discovery is recursive
+    # now, so scanning tmp_path itself would also surface the `runs_dir`
+    # fixture's trace one level down and pollute this listing.
+    many_dir = tmp_path / "many-dir"
+    many_dir.mkdir()
+    path = str(many_dir / "many.ctrace")
     for i in range(3):
         ct = CTrace.open_or_create_session(
             path, project="many", provider="openai", model="gpt-4o",
@@ -1110,7 +1115,7 @@ def test_a_run_handle_stays_short_when_nothing_collides(runs_dir, tmp_path):
                        call_blocks=[_cb("hi", 0, token_count=3)])
         ct.close()
     listing = json.loads(mcp_tools.ctxdiff_runs(
-        mcp_tools.Source(directory=str(tmp_path), backend=None), TextPolicy()))
+        mcp_tools.Source(directory=str(many_dir), backend=None), TextPolicy()))
     for row in listing["runs"]:
         assert row["run"] == f"many.ctrace#{row['session']}"
         assert len(row["session"]) == 12
@@ -1202,3 +1207,29 @@ def test_mcp_is_an_advertised_subcommand_with_both_server_flags(capsys):
     help_text = capsys.readouterr().out
     assert "--runs-dir" in help_text
     assert "--redact" in help_text
+
+
+@requires_mcp
+def test_ctxdiff_runs_discovers_traces_in_subdirectories(tmp_path):
+    """Recursive discovery (dogfood finding 2026-07-27): projects routinely
+    keep traces one level down (`app/py/*.ctrace`, `app/js/*.ctrace`), and a
+    top-level-only glob made `--runs-dir <project>` silently list NOTHING —
+    indistinguishable from "no traces exist". Nested traces must be found,
+    labeled by their path RELATIVE to the runs dir so same-named files in two
+    subdirectories stay distinguishable, and a flat layout must keep its
+    plain-basename labels exactly as before."""
+    d = tmp_path / "project"
+    (d / "py").mkdir(parents=True)
+    (d / "js").mkdir()
+    _make_trace(str(d / "flat.ctrace"))          # top level: label unchanged
+    _make_trace(str(d / "py" / "agent.ctrace"))  # nested: labeled py/agent.ctrace
+    _make_trace(str(d / "js" / "agent.ctrace"))  # same name, other subdir
+
+    _, _, (result,) = drive("--runs-dir", str(d), calls=[("ctxdiff_runs", {})])
+    body = json.loads(text_of(result))
+
+    assert body["count"] == 3
+    labels = sorted(r["run"] for r in body["runs"])
+    assert labels == ["flat.ctrace",
+                      os.path.join("js", "agent.ctrace"),
+                      os.path.join("py", "agent.ctrace")]
