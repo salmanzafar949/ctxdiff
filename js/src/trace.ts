@@ -173,6 +173,49 @@ const REGISTRY: ProviderEntry[] = [
   { provider: "bedrock", detect: detectBedrock, make: () => new BedrockAdapter() },
 ];
 
+/**
+ * Hosts whose OpenAI-COMPATIBLE endpoints we can NAME. An OpenAI-SDK client
+ * pointed at one of these is really talking to that vendor, and recording
+ * `provider=openai` for Gemini traffic is confidently-wrong attribution — the
+ * trust-killer class of bug for a debugger (dogfood finding 2026-07-27).
+ */
+const OPENAI_COMPAT_HOSTS: Record<string, string> = {
+  "generativelanguage.googleapis.com": "gemini",
+  "api.anthropic.com": "anthropic",
+};
+
+/**
+ * Refine the ATTRIBUTION label for an OpenAI-SDK client by its baseURL host.
+ * The ADAPTER stays "openai" regardless — the wire shape genuinely is
+ * OpenAI's, and capture mechanics key off the adapter — this only changes the
+ * `provider` string stamped on the run/calls (the same nullable attribution
+ * field the LangChain handler already sets per call).
+ *
+ * Mapping is deliberately conservative, mirroring Python
+ * `_openai_compat_label`: hosts in `OPENAI_COMPAT_HOSTS` get their vendor's
+ * name; OpenAI's own hosts and Azure OpenAI keep "openai" (Azure has always
+ * recorded "openai" — relabeling would churn existing users' traces for no
+ * diagnostic gain); any OTHER host (Ollama, vLLM, OpenRouter, LiteLLM
+ * proxies, ...) is labeled "openai-compatible" — truthful without guessing a
+ * vendor from an address we don't recognize. A side benefit for the named
+ * vendors: their blocks go through the estimate token path instead of
+ * gpt-tokenizer counts being marked exact for models it does not tokenize.
+ * Fail-open: any surprise reading baseURL returns "openai" unchanged.
+ */
+function openaiCompatLabel(client: unknown): string {
+  try {
+    const base = (client as { baseURL?: unknown }).baseURL;
+    if (typeof base !== "string" || base === "") return "openai";
+    const host = new URL(base).hostname.toLowerCase();
+    if (host in OPENAI_COMPAT_HOSTS) return OPENAI_COMPAT_HOSTS[host];
+    if (host === "api.openai.com" || host.endsWith(".openai.com")) return "openai";
+    if (host.endsWith(".openai.azure.com") || host.endsWith(".azure.com")) return "openai";
+    return "openai-compatible";
+  } catch {
+    return "openai"; // labeling must never break wrap()
+  }
+}
+
 /** Options for `init`. */
 export interface InitOptions {
   /** Per-block scrubber applied before storage. */
@@ -864,7 +907,15 @@ export class Tracer {
         return client;
       }
       const adapter = entry.make();
-      this.ensureStore(entry.provider);
+      // ATTRIBUTION label vs ADAPTER: an OpenAI-SDK client may really be
+      // talking to Gemini/Anthropic/an OSS server through their OpenAI-
+      // compatible endpoints. The adapter (wire mechanics) stays keyed to
+      // the registry entry; the label recorded on the run and stamped per
+      // call is refined from the client's baseURL host so the trace names
+      // the vendor actually being called. Non-openai providers pass through
+      // unchanged (their SDK IS the vendor).
+      const label = entry.provider === "openai" ? openaiCompatLabel(client) : entry.provider;
+      this.ensureStore(label);
       const store: Store | null = this.ct ?? this.deferred;
       const recorder = store ? new Recorder(store, adapter, this.redact) : null;
       if (recorder !== null && this.firstRecorder === null) {
@@ -874,7 +925,7 @@ export class Tracer {
         tracer: this,
         recorder,
         agent: opts.agent ?? null,
-        provider: entry.provider,
+        provider: label,
         adapter,
         createPaths: adapter.createPaths,
       };
@@ -1192,11 +1243,15 @@ export class Tracer {
     error: string | null;
     recorder: Recorder | null;
     agent: string | null;
+    provider?: string | null;
     tags: [string, string][];
     step: string | null;
     quiet?: boolean;
   }): void {
-    const { kwargs, response, latencyMs, error, recorder, agent, tags, step, quiet = false } = args;
+    const {
+      kwargs, response, latencyMs, error, recorder, agent, tags, step,
+      provider = null, quiet = false,
+    } = args;
     this.seq += 1;
     if (recorder === null) return;
     const seq = this.seq;
@@ -1212,6 +1267,7 @@ export class Tracer {
           tagged: tags,
           agent,
           step,
+          provider,
           quiet,
         });
         return;
@@ -1229,6 +1285,7 @@ export class Tracer {
         tagged: tags,
         agent,
         step,
+        provider,
         quiet,
       });
       if (job === null) return;
@@ -1431,6 +1488,7 @@ function makeInterceptor(
         error: errName(exc),
         recorder: ctx.recorder,
         agent: ctx.agent,
+        provider: ctx.provider,
         tags,
         step,
       });
@@ -1451,6 +1509,7 @@ function makeInterceptor(
             error: null,
             recorder: ctx.recorder,
             agent: ctx.agent,
+            provider: ctx.provider,
             tags,
             step,
           });
@@ -1465,6 +1524,7 @@ function makeInterceptor(
             error: errName(exc),
             recorder: ctx.recorder,
             agent: ctx.agent,
+            provider: ctx.provider,
             tags,
             step,
           });
@@ -1485,6 +1545,7 @@ function makeInterceptor(
       error: null,
       recorder: ctx.recorder,
       agent: ctx.agent,
+      provider: ctx.provider,
       tags,
       step,
     });
@@ -1593,6 +1654,7 @@ function wrapStream(
       error: null,
       recorder: ctx.recorder,
       agent: ctx.agent,
+      provider: ctx.provider,
       tags,
       step,
     });
@@ -1628,6 +1690,7 @@ function wrapStream(
         error,
         recorder: ctx.recorder,
         agent: ctx.agent,
+        provider: ctx.provider,
         tags,
         step,
       });
