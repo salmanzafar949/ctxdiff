@@ -52,11 +52,10 @@ Reading the output:
 
 ## MCP (for clients without a shell)
 
-`pip install 'ctxdiff[mcp]'` then register `ctxdiff mcp --runs-dir /path/to/traces` (stdio). Tools include `ctxdiff_explain(run, turn)` — one call answering "why did it break at turn N". `--redact` withholds raw text when the client's model is remote. Note: `--runs-dir` is **not recursive** — point it at the exact directory containing `.ctrace` files. With a shell available, prefer the CLI above.
+`pip install 'ctxdiff[mcp]'` then register `ctxdiff mcp --runs-dir /path/to/project` (stdio). Tools include `ctxdiff_explain(run, turn)` — one call answering "why did it break at turn N". Discovery is recursive (≥0.5.1), so pointing at a project root finds traces in subdirectories. `--redact` withholds raw text when the client's model is remote. With a shell available, prefer the CLI above.
 
 ## Gotchas (from real dogfooding)
 
-1. **Streaming + OpenAI chat API records no usage unless the caller passes `stream_options: {"include_usage": true}`** — ctxdiff never injects it (wire-truth). Add it to get exact token counts on streamed calls.
-2. **OpenAI-compatible endpoints** (Gemini/Anthropic/Ollama via `base_url`) are recorded as `provider=openai`. Tag reality yourself: `tracer.wrap(client, agent="gemini")`.
-3. **Long-lived servers that never `close()`**: data sits in the SQLite `-wal` sidecar; the bare `.ctrace` file may be a near-empty shell until any ctxdiff CLI read checkpoints it. Run any read command (e.g. `ctxdiff sessions`) before copying/sharing a trace from a still-running process.
-4. Only request-side context is stored (that's the point); response text lives in your app's own logs.
+1. **Streaming + OpenAI chat API records no usage unless the caller passes `stream_options: {"include_usage": true}`** — ctxdiff never injects it (wire-truth), and `ctxdiff tokens` prints this exact remedy when it detects the case (≥0.5.1/0.2.2). Add the option to get exact token counts on streamed calls.
+2. Only request-side context is stored (that's the point); response text lives in your app's own logs.
+3. On versions BEFORE 0.5.1 (py) / 0.2.2 (js) only: compat-endpoint traffic was labeled `provider=openai` (now auto-labeled by base_url host) and a never-`close()`d server could leave the bare `.ctrace` file stale until a CLI read (now checkpointed continuously, ≤1s lag). If a trace looks wrong in those ways, upgrade.

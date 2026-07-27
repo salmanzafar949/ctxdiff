@@ -1,7 +1,7 @@
 {
   "name": "ctxdiff",
   "displayName": "ctxdiff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Debug LLM agent context: capture every call with a one-line wrap, then diff turns, attribute tokens, find prompt-cache breaks and dead tool schemas.",
   "author": { "name": "Salman Zafar" },
   "skills": "./skills/",
