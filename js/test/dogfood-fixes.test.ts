@@ -215,7 +215,11 @@ describe("live-store WAL freshness", () => {
 
     const reader = CTrace.open(copy);
     try {
-      expect(reader.getCalls()).toHaveLength(2);
+      // The checkpoint is throttled (≥1 per second), so the copy may lag the
+      // WAL by up to that interval — the guarantee under test is that the
+      // bare file is never the pre-fix EMPTY SHELL: the first call always
+      // checkpoints, so at least one call must be visible.
+      expect(reader.getCalls().length).toBeGreaterThanOrEqual(1);
     } finally {
       reader.close();
     }

@@ -44,6 +44,14 @@ from ctxdiff.store.schema import DDL, SCHEMA_VERSION
 # that, so a brief contention degrades fail-open (drop + warn upstream) rather
 # than raising into the host or hanging.
 _BUSY_TIMEOUT_MS = 5000
+# Minimum seconds between the passive WAL checkpoints record_call runs (see
+# there). Real agents call an LLM at most a few times a second, so a 1s
+# throttle costs nothing in practice — but synthetic writers (test fixtures,
+# bulk imports) hammer thousands of back-to-back calls, and checkpointing
+# every one of them measurably slows exactly those (a CI golden-fixture hook
+# blew its timeout the day this shipped unthrottled). The bare file may lag
+# the WAL by up to this interval; close() still guarantees a full TRUNCATE.
+_CHECKPOINT_INTERVAL_S = 1.0
 _WRITE_MAX_ATTEMPTS = 6      # total tries before giving up (fail-open upstream)
 _WRITE_BACKOFF_START = 0.05  # seconds; doubles each retry, capped by _WRITE_BACKOFF_MAX
 _WRITE_BACKOFF_MAX = 0.5
@@ -76,6 +84,10 @@ class CTrace:
             "SELECT models FROM run WHERE id = ?", (run_id,)).fetchone()
         self._models: list[str] = json.loads(row[0]) if row else []
         self._models_seen = set(self._models)
+        # Monotonic timestamp of the last passive checkpoint; zero means
+        # "never", so the FIRST record_call always checkpoints (which is what
+        # keeps a freshly-created file immediately copyable).
+        self._last_checkpoint = 0.0
 
     # --- construction ------------------------------------------------------
 
@@ -386,21 +398,26 @@ class CTrace:
             self.note_model(params.get("model") or params.get("modelId"))
         except Exception:  # noqa: BLE001 — roll-up is best-effort; call is saved
             pass
-        # PASSIVE checkpoint after every committed call: under WAL, committed
-        # pages live in the `-wal` sidecar until a checkpoint copies them into
-        # the main file — and a long-lived process (a server that never calls
-        # close()) can leave the `.ctrace` a near-empty shell indefinitely, so
-        # anyone copying/sharing the bare file mid-run ships an empty trace
-        # (dogfood finding 2026-07-27). PASSIVE transfers whatever it can
-        # WITHOUT ever blocking concurrent readers or writers (unlike close()'s
-        # TRUNCATE), which is what makes it safe on the hot path; per-LLM-call
-        # frequency makes the cost negligible. Best-effort like the roll-up
-        # above: the call is already committed, so a checkpoint failure must
-        # never surface as a failed record.
-        try:
-            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        except Exception:  # noqa: BLE001 — durability is done; checkpoint is a bonus
-            pass
+        # PASSIVE checkpoint, throttled to one per _CHECKPOINT_INTERVAL_S:
+        # under WAL, committed pages live in the `-wal` sidecar until a
+        # checkpoint copies them into the main file — and a long-lived process
+        # (a server that never calls close()) can leave the `.ctrace` a
+        # near-empty shell indefinitely, so anyone copying/sharing the bare
+        # file mid-run ships an empty trace (dogfood finding 2026-07-27).
+        # PASSIVE transfers whatever it can WITHOUT ever blocking concurrent
+        # readers or writers (unlike close()'s TRUNCATE), which is what makes
+        # it safe on the hot path; the time throttle is what makes it safe for
+        # synthetic writers that hammer thousands of back-to-back calls (test
+        # fixtures, imports) where per-call fsyncs measurably drag. Best-effort
+        # like the roll-up above: the call is already committed, so a
+        # checkpoint failure must never surface as a failed record.
+        now = time.monotonic()
+        if now - self._last_checkpoint >= _CHECKPOINT_INTERVAL_S:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                self._last_checkpoint = now
+            except Exception:  # noqa: BLE001 — durability is done; checkpoint is a bonus
+                pass
         return call_id
 
     def note_model(self, model: str | None) -> None:
