@@ -49,6 +49,13 @@ const BUSY_TIMEOUT_MS = 250; // kept small: this BLOCKS the Node event loop
 const WRITE_MAX_ATTEMPTS = 3; // total tries before giving up (fail-open upstream)
 const WRITE_BACKOFF_START_MS = 50; // doubles each retry, capped by _MAX
 const WRITE_BACKOFF_MAX_MS = 500;
+// Minimum ms between the passive WAL checkpoints recordCall runs (see there).
+// Real agents call an LLM at most a few times a second, so a 1s throttle
+// costs nothing in practice — but synthetic writers (test fixtures, bulk
+// imports) hammer thousands of back-to-back calls, and checkpointing every
+// one measurably drags exactly those. The bare file may lag the WAL by up to
+// this interval; close() still guarantees a full TRUNCATE.
+const CHECKPOINT_INTERVAL_MS = 1000;
 
 /** The v2 attribution columns on `call`. A file physically written by a v1
  * ctxdiff lacks them; appending a v2 session ADDs them (see `upgradeCallTable`). */
@@ -144,6 +151,7 @@ export function parseStartedAt(value: string): Date {
 
 export class CTrace {
   private db: DatabaseSync;
+  private lastCheckpointMs: number;
   private runId: string;
   private hasV2Cols: boolean;
   private models: string[];
@@ -162,6 +170,10 @@ export class CTrace {
    */
   private constructor(db: DatabaseSync, runId: string) {
     this.db = db;
+    // Monotonic-ish timestamp (ms) of the last passive checkpoint; zero means
+    // "never", so the FIRST recordCall always checkpoints (which is what
+    // keeps a freshly-created file immediately copyable).
+    this.lastCheckpointMs = 0;
     this.runId = runId;
     const cols = new Set(
       (db.prepare("PRAGMA table_info(call)").all() as { name: string }[]).map(
@@ -545,21 +557,28 @@ export class CTrace {
     } catch {
       /* best-effort model roll-up; retried by the next call with this model */
     }
-    // PASSIVE checkpoint after every committed call: under WAL, committed
-    // pages live in the `-wal` sidecar until a checkpoint copies them into
-    // the main file — and a long-lived process (a server that never calls
-    // close()) can leave the `.ctrace` a near-empty shell indefinitely, so
-    // anyone copying/sharing the bare file mid-run ships an empty trace
-    // (dogfood finding 2026-07-27). PASSIVE transfers whatever it can WITHOUT
-    // ever blocking concurrent readers or writers (unlike close()'s
-    // TRUNCATE), which is what makes it safe on the hot path; per-LLM-call
-    // frequency makes the cost negligible. Best-effort like the roll-up
-    // above: the call is already committed, so a checkpoint failure must
-    // never surface as a failed record. Mirrors Python `record_call`.
-    try {
-      this.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
-    } catch {
-      /* durability is done; the checkpoint is a bonus */
+    // PASSIVE checkpoint, throttled to one per CHECKPOINT_INTERVAL_MS: under
+    // WAL, committed pages live in the `-wal` sidecar until a checkpoint
+    // copies them into the main file — and a long-lived process (a server
+    // that never calls close()) can leave the `.ctrace` a near-empty shell
+    // indefinitely, so anyone copying/sharing the bare file mid-run ships an
+    // empty trace (dogfood finding 2026-07-27). PASSIVE transfers whatever it
+    // can WITHOUT ever blocking concurrent readers or writers (unlike
+    // close()'s TRUNCATE), which is what makes it safe on the hot path; the
+    // time throttle is what makes it safe for synthetic writers that hammer
+    // thousands of back-to-back calls (test fixtures, imports) where per-call
+    // fsyncs measurably drag — the JS golden-fixture CI hook blew its timeout
+    // the day this shipped unthrottled. Best-effort like the roll-up above:
+    // the call is already committed, so a checkpoint failure must never
+    // surface as a failed record. Mirrors Python `record_call`.
+    const nowMs = Date.now();
+    if (nowMs - this.lastCheckpointMs >= CHECKPOINT_INTERVAL_MS) {
+      try {
+        this.db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+        this.lastCheckpointMs = nowMs;
+      } catch {
+        /* durability is done; the checkpoint is a bonus */
+      }
     }
     return callId;
   }
