@@ -1412,16 +1412,53 @@ Regenerate whenever a change is *supposed* to move a number, and put the resulti
 
 ---
 
-## Claude Code plugin
+## Use ctxdiff from your coding agent
 
-This repo doubles as a [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces) shipping a **ctxdiff skill** — it teaches Claude when to reach for ctxdiff (agent misbehaving at turn N, token costs, cache breaks), how to wrap each SDK, how to read the analyzer output, and the sharp edges to avoid.
+The [skill](plugins/ctxdiff/skills/ctxdiff/SKILL.md) teaches a coding agent when to reach for ctxdiff (agent misbehaving at turn N, token costs, cache breaks), how to wrap each SDK, how to read the analyzer output, and the sharp edges to avoid. `SKILL.md` is an open format, so the same file serves every tool that reads it; the [MCP server](#mcp-server) covers agents without a shell.
+
+### Claude Code
+
+This repo doubles as a [plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
 
 ```
 /plugin marketplace add salmanzafar949/ctxdiff
 /plugin install ctxdiff@ctxdiff
 ```
 
-After that, Claude Code loads the skill automatically whenever an agent-debugging task comes up. Pairs well with the [MCP server](#mcp-server) for trace queries from clients without a shell.
+Claude Code then loads the skill automatically whenever an agent-debugging task comes up.
+
+### OpenAI Codex CLI
+
+Codex reads the same `SKILL.md` format from `~/.codex/skills/` (personal) or `.codex/skills/` (per-project):
+
+```sh
+mkdir -p ~/.codex/skills/ctxdiff
+curl -fsSL https://raw.githubusercontent.com/salmanzafar949/ctxdiff/main/plugins/ctxdiff/skills/ctxdiff/SKILL.md \
+  -o ~/.codex/skills/ctxdiff/SKILL.md
+```
+
+Skills activate automatically when the task matches, or explicitly with `$ctxdiff`.
+
+### Cursor
+
+Cursor's first-class hook is MCP. One-click install of the ctxdiff MCP server (requires [uv](https://docs.astral.sh/uv/); serves every `.ctrace` under the project directory — discovery is recursive as of 0.5.1):
+
+[**Add ctxdiff to Cursor**](cursor://anysphere.cursor-deeplink/mcp/install?name=ctxdiff&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyItLWZyb20iLCJjdHhkaWZmW21jcF0iLCJjdHhkaWZmIiwibWNwIiwiLS1ydW5zLWRpciIsIi4iXX0=)
+
+Or add it to `.cursor/mcp.json` yourself:
+
+```json
+{
+  "mcpServers": {
+    "ctxdiff": {
+      "command": "uvx",
+      "args": ["--from", "ctxdiff[mcp]", "ctxdiff", "mcp", "--runs-dir", "."]
+    }
+  }
+}
+```
+
+Cursor builds that read the open skill format can also use the Codex instructions above verbatim.
 
 ## License
 
