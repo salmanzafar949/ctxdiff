@@ -386,6 +386,21 @@ class CTrace:
             self.note_model(params.get("model") or params.get("modelId"))
         except Exception:  # noqa: BLE001 — roll-up is best-effort; call is saved
             pass
+        # PASSIVE checkpoint after every committed call: under WAL, committed
+        # pages live in the `-wal` sidecar until a checkpoint copies them into
+        # the main file — and a long-lived process (a server that never calls
+        # close()) can leave the `.ctrace` a near-empty shell indefinitely, so
+        # anyone copying/sharing the bare file mid-run ships an empty trace
+        # (dogfood finding 2026-07-27). PASSIVE transfers whatever it can
+        # WITHOUT ever blocking concurrent readers or writers (unlike close()'s
+        # TRUNCATE), which is what makes it safe on the hot path; per-LLM-call
+        # frequency makes the cost negligible. Best-effort like the roll-up
+        # above: the call is already committed, so a checkpoint failure must
+        # never surface as a failed record.
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:  # noqa: BLE001 — durability is done; checkpoint is a bonus
+            pass
         return call_id
 
     def note_model(self, model: str | None) -> None:
