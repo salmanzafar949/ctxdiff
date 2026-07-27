@@ -1,0 +1,20 @@
+{
+  "name": "ctxdiff",
+  "owner": {
+    "name": "Salman Zafar",
+    "url": "https://github.com/salmanzafar949"
+  },
+  "description": "ctxdiff — git diff for your LLM agent's context window. Skill teaching Claude to capture, diff and analyze what your model actually saw.",
+  "plugins": [
+    {
+      "name": "ctxdiff",
+      "source": "./plugins/ctxdiff",
+      "displayName": "ctxdiff",
+      "description": "Debug LLM agent context: capture every call with a one-line wrap, then diff turns, attribute tokens, find prompt-cache breaks and dead tool schemas.",
+      "version": "0.1.0",
+      "author": { "name": "Salman Zafar" },
+      "repository": "https://github.com/salmanzafar949/ctxdiff",
+      "homepage": "https://github.com/salmanzafar949/ctxdiff"
+    }
+  ]
+}
