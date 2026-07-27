@@ -1412,6 +1412,17 @@ Regenerate whenever a change is *supposed* to move a number, and put the resulti
 
 ---
 
+## Claude Code plugin
+
+This repo doubles as a [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces) shipping a **ctxdiff skill** — it teaches Claude when to reach for ctxdiff (agent misbehaving at turn N, token costs, cache breaks), how to wrap each SDK, how to read the analyzer output, and the sharp edges to avoid.
+
+```
+/plugin marketplace add salmanzafar949/ctxdiff
+/plugin install ctxdiff@ctxdiff
+```
+
+After that, Claude Code loads the skill automatically whenever an agent-debugging task comes up. Pairs well with the [MCP server](#mcp-server) for trace queries from clients without a shell.
+
 ## License
 
 [Apache-2.0](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE).
