@@ -15,7 +15,7 @@ startup and every later `trace.init()` follows:
 ...or set `CTXDIFF_STORE` and change no code at all. Tables are created if they
 don't exist; there is no migration step.
 """
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # __version__ must exist before this import: trace.py transitively imports
 # ctxdiff.store.ctrace, which does `from ctxdiff import __version__` at load time.
