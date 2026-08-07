@@ -8,7 +8,7 @@ version = "0.5.1"
 description = "Find what breaks your LLM agent's prompt cache and wastes its context — git diff for the context window"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "Salman Zafar" }]
 # PINNED TO AN EXACT VERSION, ON PURPOSE — do not relax to `>=`.
 #

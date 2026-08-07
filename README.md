@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/ctxdiff.svg?logo=pypi&logoColor=white)](https://pypi.org/project/ctxdiff/)
 [![npm](https://img.shields.io/npm/v/ctxdiff.svg?logo=npm&logoColor=white)](https://www.npmjs.com/package/ctxdiff)
 [![CI](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml/badge.svg)](https://github.com/salmanzafar949/ctxdiff/actions/workflows/publish.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Node 22+](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg?logo=node.js&logoColor=white)](https://nodejs.org)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/salmanzafar949/ctxdiff/blob/main/CONTRIBUTING.md)
@@ -1462,4 +1462,4 @@ Cursor builds that read the open skill format can also use the Codex instruction
 
 ## License
 
-[Apache-2.0](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE).
+`ctxdiff` is free and open source software, released under the [MIT License](https://github.com/salmanzafar949/ctxdiff/blob/main/LICENSE).
