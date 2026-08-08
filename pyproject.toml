@@ -8,7 +8,7 @@ version = "0.5.1"
 description = "Find what breaks your LLM agent's prompt cache and wastes its context — git diff for the context window"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "Salman Zafar" }]
 # PINNED TO AN EXACT VERSION, ON PURPOSE — do not relax to `>=`.
 #
@@ -66,8 +66,10 @@ mysql = ["PyMySQL>=1.1"]
 # an install without the extra prints a one-line install hint instead of an
 # ImportError traceback. Floor rather than pin: unlike the tokenizer, nothing
 # about the SDK's version can change a NUMBER ctxdiff reports — it only carries
-# JSON that the analyzers produced.
-mcp = ["mcp>=1.2"]
+# JSON that the analyzers produced. The `<2` ceiling is an API guard, not a
+# numeric one: mcp 2.0 removed `mcp.server.fastmcp`, which `server.py` imports,
+# so 2.x needs a code migration before the floor can move.
+mcp = ["mcp>=1.2,<2"]
 # The real SDKs the eval suite drives with stubbed HTTP. `langchain-anthropic`
 # and `langgraph` are here because the callback handler's two hardest claims
 # are only testable with them: that the provider is derived correctly for a
